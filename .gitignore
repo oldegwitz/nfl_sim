@@ -1,0 +1,13 @@
+# Lista blanca (Orden 4): solo código y documentación del motor.
+# venv/, datos/, salidas/, CSV, JSON (incluida la futura cuenta de servicio), logs fuera.
+*
+!*/
+!.gitignore
+!*.py
+!*.sh
+!*.md
+!requirements*.txt
+venv/
+datos/
+salidas/
+__pycache__/

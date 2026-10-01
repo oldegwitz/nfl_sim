@@ -1,0 +1,5 @@
+# Motor nfl_sim — versiones fijadas (probadas con Python 3.12.3, 1-oct-2026)
+numpy==2.5.3
+polars==1.44.2
+numba==0.68.0
+nflreadpy==0.1.5
