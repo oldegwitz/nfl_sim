@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cargar_gemini.sh — activa el agente Gemini en SOMBRA (decisión 35A). SIN sudo.
+# cargar_gemini.sh (v2) — activa el agente Gemini en SOMBRA (decisión 35A). SIN sudo.
 #   · Pide la llave de la API de Gemini (Google AI Studio) sin mostrarla y sin dejarla en el historial.
 #   · La guarda en ~/nfl_sim/credenciales/gemini.key (600; credenciales/ es 700 y queda fuera de Git).
 #   · Agrega a semana.ini la sección [gemini] (modelo y tope de consultas por día) si no existe.
@@ -14,10 +14,18 @@ INI="$SIM/semana.ini"
 [ -x "$SIM/venv/bin/python" ] || { echo "ALTO: no encuentro $SIM/venv"; exit 1; }
 mkdir -p "$SIM/credenciales" && chmod 700 "$SIM/credenciales"
 read -rs -p "Pega la llave de la API de Gemini (no se verá) y pulsa Enter: " K; echo
-K="$(printf '%s' "$K" | tr -d '[:space:]')"
-if ! [[ "$K" =~ ^[A-Za-z0-9_-]{30,80}$ ]]; then
-  echo "ALTO: eso no parece una llave de la API de Gemini. No guardé nada."; unset K; exit 1
+K="$(printf '%s' "$K" | tr -d '[:space:]' | tr -d "\"'")"
+# v2: acepta también el formato nuevo de Google (p. ej. con punto: "AQ.…"); la prueba real es la verificación con Google
+if [ -z "$K" ]; then
+  echo "ALTO: no recibí nada. El pegado no llegó: en cmd usa clic derecho (o Ctrl+V) y luego Enter. No guardé nada."; exit 1
 fi
+if [ "${#K}" -lt 20 ] || [ "${#K}" -gt 200 ]; then
+  echo "ALTO: recibí ${#K} caracteres; una llave tiene entre 20 y 200. Revisa que copiaste la llave completa. No guardé nada."; unset K; exit 1
+fi
+if ! [[ "$K" =~ ^[A-Za-z0-9._~+/=:-]+$ ]]; then
+  echo "ALTO: lo que pegaste trae caracteres que no van en una llave (recibí ${#K} caracteres). Copia solo la llave. No guardé nada."; unset K; exit 1
+fi
+echo "OK    recibí una llave de ${#K} caracteres"
 ( umask 077; printf '%s\n' "$K" > "$F" ); chmod 600 "$F"; unset K
 if [ -f "$INI" ] && ! grep -q '^\[gemini\]' "$INI"; then
   printf '\n[gemini]\nmodelo = gemini-3.5-flash-lite\nmax_llamadas_dia = 20\n' >> "$INI"
