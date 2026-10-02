@@ -59,7 +59,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v6 (2-oct-2026)"
+VERSION_SEMANA = "semana-v6.1 (2-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -75,6 +75,8 @@ VERSION_SEMANA = "semana-v6 (2-oct-2026)"
 #     DESPUÉS de guardar y enviar la proyección T−85; registra cada llamada (gemini_llamadas.csv) y deja un voto por
 #     equipo (vacío si no hubo respuesta = no acierto). Modo 'gemini-piloto' (criterios P1-P4). La confiabilidad de
 #     Gemini se cuenta solo con sus votos T−85 y por versión (g0 = v5, g1...). La proyección es idéntica a la de v5.
+# v6.1 (2-oct): el formato de salida va como enum, como exige generateContent: responseFormat.text.mimeType =
+#     "APPLICATION_JSON" (v6 mandaba "application/json" y Google respondía 400 en el primer piloto). Cambia la huella.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -939,6 +941,7 @@ GEMINI_MAX_PRUEBA_DIA = 40                         # tope aparte para el piloto 
 GEMINI_PLAZO_S = 90                                # 35A: 90 s en total para la tanda
 GEMINI_HILOS = 8                                   # D3
 GEMINI_MAX_TOKENS = 16384                          # techo de costo (incluye el razonamiento)
+GEMINI_MIME = "APPLICATION_JSON"                   # v6.1: enum de generateContent (TextResponseFormat.MimeType)
 PRECIO_ENTRADA, PRECIO_SALIDA = 0.30e-6, 2.50e-6   # USD por token, gemini-3.5-flash-lite (el razonamiento se cobra como salida)
 PRECIO_BUSQUEDA = 0.014                            # USD por búsqueda, solo después de las 5.000 gratis al mes (se reporta aparte)
 GEMINI_LLAMADAS = SAL / "gemini_llamadas.csv"
@@ -998,6 +1001,7 @@ def gemini_huella(variante):
     """Huella de la configuración completa (todo lo que se envía y cómo se lee). Cambia → versión nueva."""
     v = GEMINI_VARIANTES[variante]
     cfg = dict(modelo=GEMINI_MODELO, via="generateContent", variante=variante, nivel=v["nivel"], esquema=v["esquema"],
+               mime=GEMINI_MIME if v["esquema"] else "",
                sistema=GEMINI_SISTEMA, usuario=GEMINI_USUARIO, texto_json=GEMINI_TEXTO_JSON if not v["esquema"] else "",
                forma_esquema=json.dumps(gemini_esquema("AAA", "BBB"), sort_keys=True), herramientas=["google_search"],
                plazo=GEMINI_PLAZO_S, hilos=GEMINI_HILOS, max_tokens=GEMINI_MAX_TOKENS, granularidad="juego")
@@ -1048,7 +1052,7 @@ def gemini_cuerpo(j, ahora, variante):
     v = GEMINI_VARIANTES[variante]
     gc = {"thinkingConfig": {"thinkingLevel": v["nivel"]}, "maxOutputTokens": GEMINI_MAX_TOKENS}
     if v["esquema"]:
-        gc["responseFormat"] = {"text": {"mimeType": "application/json", "schema": gemini_esquema(j["visita"], j["local"])}}
+        gc["responseFormat"] = {"text": {"mimeType": GEMINI_MIME, "schema": gemini_esquema(j["visita"], j["local"])}}
     return {"systemInstruction": {"parts": [{"text": GEMINI_SISTEMA}]},
             "contents": [{"role": "user", "parts": [{"text": gemini_pregunta(j, ahora, variante)}]}],
             "tools": [{"google_search": {}}],
