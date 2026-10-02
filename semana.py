@@ -39,6 +39,7 @@ Uso
   venv/bin/python semana.py retro                         (retrospectiva de los juegos jugados y sus pestañas)
   venv/bin/python semana.py hoja [--semana N]             (rehace las pestañas desde el registro, sin simular)
   venv/bin/python semana.py qb                            (QB de cada juego por fuente y confiabilidad de cada fuente)
+  venv/bin/python semana.py gemini-piloto [--variante g1] (piloto del agente Gemini: P1-P4; no cuenta para el piso)
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña de prueba)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
@@ -58,7 +59,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v5 (2-oct-2026)"
+VERSION_SEMANA = "semana-v6 (2-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -69,6 +70,11 @@ VERSION_SEMANA = "semana-v5 (2-oct-2026)"
 #     reporte oficial, Sleeper y el roster); sin acuerdo → "QB dudoso" (rojo, selecciones excluidas); registro de
 #     cada voto y confiabilidad de cada fuente contra el QB que jugó; modo 'qb'; agente Gemini en sombra (solo con
 #     credenciales/gemini.key; nunca vota). Con las tres fuentes de acuerdo con nflverse, la proyección es la de v4.
+# v6 (35A, configuración g1 decidida por Ozz el 2-oct): el agente Gemini consulta un juego por llamada (hasta 8 a la
+#     vez, 90 s en total), con generateContent, razonamiento medium, búsqueda de Google y salida con esquema; corre
+#     DESPUÉS de guardar y enviar la proyección T−85; registra cada llamada (gemini_llamadas.csv) y deja un voto por
+#     equipo (vacío si no hubo respuesta = no acierto). Modo 'gemini-piloto' (criterios P1-P4). La confiabilidad de
+#     Gemini se cuenta solo con sus votos T−85 y por versión (g0 = v5, g1...). La proyección es idéntica a la de v5.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -870,12 +876,14 @@ def confiabilidad_qb(g26, semana=None):
     if semana is not None:
         reg = reg.filter(pl.col("semana") == str(semana))
     hechos = g26.filter(pl.col("result").is_not_null())
-    real, inicio = {}, {}
+    real, real_nom, inicio = {}, {}, {}
     for r in hechos.iter_rows(named=True):
         real[(r["game_id"], r["home_team"])] = _texto(r.get("home_qb_id"))
         real[(r["game_id"], r["away_team"])] = _texto(r.get("away_qb_id"))
+        real_nom[(r["game_id"], r["home_team"])] = _norm(r.get("home_qb_name"))
+        real_nom[(r["game_id"], r["away_team"])] = _norm(r.get("away_qb_name"))
         inicio[r["game_id"]] = r["inicio"]
-    elegido = {}                                       # (game, equipo, fuente) → (prioridad, corrida, qb)
+    elegido = {}                                       # (game, equipo, fuente) → (prioridad, (qb_id, nombre))
     for f in reg.iter_rows(named=True):
         k = (f["game_id"], f["equipo"])
         if k not in real or not real[k]:
@@ -883,126 +891,479 @@ def confiabilidad_qb(g26, semana=None):
         t = t_utc(f["corrida_utc"])
         if t is None or (inicio.get(f["game_id"]) and t >= inicio[f["game_id"]]):
             continue
+        fuente = f["fuente"]
+        if fuente == "gemini":                         # v6: solo sus votos T−85, separados por versión (g0 = v5)
+            if f["tipo"] != "t85":
+                continue
+            m = re.match(r"^(g\d[\w-]*) ·", _texto(f.get("nota")))
+            fuente = "gemini " + (m.group(1) if m else "g0")
         prio = (1 if f["tipo"] in TIPOS_QUE_CUENTAN else 0, t)
-        kk = (f["game_id"], f["equipo"], f["fuente"])
+        kk = (f["game_id"], f["equipo"], fuente)
         if kk not in elegido or prio > elegido[kk][0]:
-            elegido[kk] = (prio, _texto(f["qb_id"]))
+            elegido[kk] = (prio, (_texto(f["qb_id"]), _norm(f.get("qb_nombre"))))
     out = {}
-    for (gid, eq, fuente), (_, qb) in elegido.items():
+    for (gid, eq, fuente), (_, (qb, nom)) in elegido.items():
+        acierto = (qb == real[(gid, eq)]) if qb else bool(nom and nom == real_nom.get((gid, eq)))
         a, n = out.get(fuente, (0, 0))
-        out[fuente] = (a + int(qb == real[(gid, eq)]), n + 1)
+        out[fuente] = (a + int(acierto), n + 1)
     return out
 
 
 def confiabilidad_txt(c):
     if not c:
         return ""
-    orden = ["consenso", "nflverse", "espn", "sleeper", "gemini"]
-    nombres = {"consenso": "consenso", "nflverse": "nflverse", "espn": "ESPN", "sleeper": "Sleeper", "gemini": "Gemini (sombra)"}
-    return "QB acertado por fuente: " + " · ".join(f"{nombres[f]} {c[f][0]}/{c[f][1]}" for f in orden if f in c)
+    orden = ["consenso", "nflverse", "espn", "sleeper"] + sorted(f for f in c if f.startswith("gemini"))
+    nombres = {"consenso": "consenso", "nflverse": "nflverse", "espn": "ESPN", "sleeper": "Sleeper"}
+    nombres.update({f: f"Gemini {f.split(' ', 1)[1]} (sombra)" for f in c if f.startswith("gemini ")})
+    return "QB acertado por fuente: " + " · ".join(f"{nombres.get(f, f)} {c[f][0]}/{c[f][1]}" for f in orden if f in c)
 
 
 # --------------------------------------------------------------------------------------
-# Agente Gemini en sombra (35A): solo corre si existe credenciales/gemini.key; nunca vota
+# Agente Gemini en sombra (35A) — configuración g1 (decisiones de Ozz del 2-oct-2026, registradas antes de su
+# primera consulta en claude/registro_35A_g1.md y en el contexto del proyecto). Nunca vota en el consenso.
+#   · Modelo fijo en el código (semana.ini ya no lo elige); vía única generateContent; razonamiento medium;
+#     sin temperature/top_p/top_k (obsoletos e ignorados en 3.5 Flash-Lite); búsqueda de Google; salida con esquema.
+#   · Una consulta por juego, hasta 8 a la vez; 90 s en total para toda la tanda; sin reintentos.
+#   · Corre SOLO en las corridas T−85 y DESPUÉS de guardar y enviar la proyección (no puede retrasarla).
+#   · Cada llamada se registra en salidas/semana/gemini_llamadas.csv (latencia, tokens, búsquedas, costo, estado).
+#   · Cada equipo pedido deja un voto en fuentes_qb.csv (fuente "gemini"); sin respuesta → voto vacío, que cuenta
+#     como no acierto (decisión 5: misma regla que las abstenciones de nflverse, ESPN y Sleeper).
+#   · Variantes predefinidas para el piloto (g1-low, g1-texto, g1-high): cada una tiene su etiqueta y su huella;
+#     cualquier cambio de configuración es una versión nueva y reinicia el reloj del piso (decisión 6).
 # --------------------------------------------------------------------------------------
 GEMINI_LLAVE = BASE / "credenciales" / "gemini.key"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODELO_DEF = "gemini-3.5-flash-lite"
-GEMINI_MAX_DIA = 20
-GEMINI_ESPERA_S = 90
+GEMINI_MODELO = "gemini-3.5-flash-lite"            # D1: fijo y versionado
+GEMINI_MAX_DIA = 20                                # tope de consultas por día (corridas T−85); semana.ini puede bajarlo o subirlo
+GEMINI_MAX_PRUEBA_DIA = 40                         # tope aparte para el piloto (alcanza para probar una variante más el mismo día)
+GEMINI_PLAZO_S = 90                                # 35A: 90 s en total para la tanda
+GEMINI_HILOS = 8                                   # D3
+GEMINI_MAX_TOKENS = 16384                          # techo de costo (incluye el razonamiento)
+PRECIO_ENTRADA, PRECIO_SALIDA = 0.30e-6, 2.50e-6   # USD por token, gemini-3.5-flash-lite (el razonamiento se cobra como salida)
+PRECIO_BUSQUEDA = 0.014                            # USD por búsqueda, solo después de las 5.000 gratis al mes (se reporta aparte)
+GEMINI_LLAMADAS = SAL / "gemini_llamadas.csv"
+CAMPOS_GEM = ["corrida_utc", "tipo", "agente", "huella", "modelo", "model_version", "game_id", "semana", "visita", "local",
+              "estado", "http", "latencia_s", "tok_entrada", "tok_herramienta", "tok_salida", "tok_razonamiento",
+              "busquedas", "consultas_busqueda", "dominios", "costo_usd", "qb_visita", "conf_visita", "url_visita",
+              "fecha_visita", "url_visita_verificada", "qb_local", "conf_local", "url_local", "fecha_local",
+              "url_local_verificada", "fin", "detalle"]
+EQUIPOS = {"ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens", "BUF": "Buffalo Bills",
+           "CAR": "Carolina Panthers", "CHI": "Chicago Bears", "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns",
+           "DAL": "Dallas Cowboys", "DEN": "Denver Broncos", "DET": "Detroit Lions", "GB": "Green Bay Packers",
+           "HOU": "Houston Texans", "IND": "Indianapolis Colts", "JAX": "Jacksonville Jaguars", "KC": "Kansas City Chiefs",
+           "LA": "Los Angeles Rams", "LAC": "Los Angeles Chargers", "LV": "Las Vegas Raiders", "MIA": "Miami Dolphins",
+           "MIN": "Minnesota Vikings", "NE": "New England Patriots", "NO": "New Orleans Saints", "NYG": "New York Giants",
+           "NYJ": "New York Jets", "PHI": "Philadelphia Eagles", "PIT": "Pittsburgh Steelers", "SEA": "Seattle Seahawks",
+           "SF": "San Francisco 49ers", "TB": "Tampa Bay Buccaneers", "TEN": "Tennessee Titans", "WAS": "Washington Commanders"}
+RONDAS = {"WC": "wild-card round", "DIV": "divisional round", "CON": "conference championship", "SB": "Super Bowl"}
+GEMINI_SISTEMA = """You identify NFL starting quarterbacks using Google Search. Rules:
+1. Always search before answering. Your training data is out of date.
+2. Prefer reports from the last 72 hours; ignore anything older than 7 days.
+   Priority: official inactive list (released ~90 min before kickoff), team
+   announcements, NFL.com, ESPN, team beat reporters.
+3. "Starting quarterback" = the player expected to take the team's first offensive snap.
+4. Return exactly one entry per requested team, using the team codes given.
+5. source_url must be a page that appeared in your search results. Never build or guess a URL.
+6. If reports conflict or are stale, still give your best answer and set confidence to "low"."""
+GEMINI_USUARIO = """Now: {ahora_utc} UTC ({ahora_et} ET). NFL {temporada} {fase}.
+Game: {visita_nombre} ({visita}) at {local_nombre} ({local}), kickoff {inicio_utc} UTC.
+Who is the starting quarterback for {visita} and for {local}?"""
+GEMINI_TEXTO_JSON = ("\nAnswer ONLY with a JSON object of this form and nothing else: "
+                     '{{"teams": [{{"team": "{visita}", "qb": "Full Name", "confidence": "high|medium|low", '
+                     '"source_url": "https://...", "source_date": "YYYY-MM-DD"}}, {{"team": "{local}", ...}}]}}')
+GEMINI_VARIANTES = {                               # g1 = la decidida; las otras solo existen como salida prevista del piloto
+    "g1": {"nivel": "medium", "esquema": True},
+    "g1-low": {"nivel": "low", "esquema": True},       # si fallan P3 o P4
+    "g1-texto": {"nivel": "medium", "esquema": False}, # si la API rechaza esquema + búsqueda
+    "g1-high": {"nivel": "high", "esquema": True},     # si falla P2 (se prueba una sola vez)
+}
+CONFIANZAS = ("high", "medium", "low")
 
 
-def _gemini_cfg():
+def gemini_esquema(visita, local):
+    return {"type": "object",
+            "properties": {"teams": {"type": "array", "minItems": 2, "maxItems": 2, "items": {
+                "type": "object",
+                "properties": {
+                    "team": {"type": "string", "enum": [visita, local]},
+                    "qb": {"type": "string", "description": "Full name of the expected starting quarterback."},
+                    "confidence": {"type": "string", "enum": list(CONFIANZAS)},
+                    "source_url": {"type": "string", "description": "URL of a page that appeared in your search results."},
+                    "source_date": {"type": "string", "format": "date", "description": "Publication date of that source (YYYY-MM-DD)."}},
+                "required": ["team", "qb", "confidence", "source_url", "source_date"]}}},
+            "required": ["teams"]}
+
+
+def gemini_huella(variante):
+    """Huella de la configuración completa (todo lo que se envía y cómo se lee). Cambia → versión nueva."""
+    v = GEMINI_VARIANTES[variante]
+    cfg = dict(modelo=GEMINI_MODELO, via="generateContent", variante=variante, nivel=v["nivel"], esquema=v["esquema"],
+               sistema=GEMINI_SISTEMA, usuario=GEMINI_USUARIO, texto_json=GEMINI_TEXTO_JSON if not v["esquema"] else "",
+               forma_esquema=json.dumps(gemini_esquema("AAA", "BBB"), sort_keys=True), herramientas=["google_search"],
+               plazo=GEMINI_PLAZO_S, hilos=GEMINI_HILOS, max_tokens=GEMINI_MAX_TOKENS, granularidad="juego")
+    return hashlib.md5(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+
+
+def gemini_cfg():
+    """(variante, tope diario) desde semana.ini [gemini]. 'modelo' ya no se lee (D1): si existe y es otro, se avisa."""
     cfg = configparser.ConfigParser()
     if CONFIG.exists():
         cfg.read(CONFIG)
     sec = cfg["gemini"] if cfg.has_section("gemini") else {}
-    return (str(sec.get("modelo", GEMINI_MODELO_DEF)).strip() or GEMINI_MODELO_DEF,
-            int(str(sec.get("max_llamadas_dia", GEMINI_MAX_DIA)).strip() or GEMINI_MAX_DIA))
+    mod = str(sec.get("modelo", GEMINI_MODELO)).strip()
+    if mod and mod != GEMINI_MODELO:
+        log(f"AVISO Gemini: semana.ini pide el modelo {mod}; se ignora (v6: el modelo es fijo, {GEMINI_MODELO})")
+    var = str(sec.get("variante", "g1")).strip() or "g1"
+    if var not in GEMINI_VARIANTES:
+        log(f"AVISO Gemini: variante '{var}' desconocida en semana.ini; uso g1")
+        var = "g1"
+    try:
+        tope = int(str(sec.get("max_llamadas_dia", GEMINI_MAX_DIA)).strip() or GEMINI_MAX_DIA)
+    except ValueError:
+        tope = GEMINI_MAX_DIA
+    return var, tope
 
 
-def _textos_y_urls(obj, textos, urls):
-    """Recorre la respuesta (cualquier versión de la API) y junta los textos y las URL citadas."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in ("text", "output_text") and isinstance(v, str):
-                textos.append(v)
-            elif k in ("uri", "url") and isinstance(v, str) and v.startswith("http"):
-                urls.append(v)
-            else:
-                _textos_y_urls(v, textos, urls)
-    elif isinstance(obj, list):
-        for v in obj:
-            _textos_y_urls(v, textos, urls)
+def _fmt_et(t):
+    e = t.astimezone(NUEVA_YORK)
+    return f"{['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][e.weekday()]} " \
+           f"{['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][e.month - 1]} " \
+           f"{e.day}, {(e.hour % 12) or 12}:{e.minute:02d} {'AM' if e.hour < 12 else 'PM'}"
 
 
-def _json_en_texto(txt):
-    """Primer arreglo JSON que aparezca en el texto (el modelo a veces lo envuelve en ```json)."""
-    i = txt.find("[")
+def gemini_pregunta(j, ahora, variante):
+    fase = (f"regular season, week {j['semana']}" if j.get("game_type", "REG") == "REG"
+            else f"postseason, {RONDAS.get(j['game_type'], j['game_type'])}")
+    txt = GEMINI_USUARIO.format(ahora_utc=ahora.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                                ahora_et=_fmt_et(ahora), temporada=TEMPORADA, fase=fase,
+                                visita_nombre=EQUIPOS.get(j["visita"], j["visita"]), visita=j["visita"],
+                                local_nombre=EQUIPOS.get(j["local"], j["local"]), local=j["local"],
+                                inicio_utc=j["inicio"].astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"))
+    if not GEMINI_VARIANTES[variante]["esquema"]:
+        txt += GEMINI_TEXTO_JSON.format(visita=j["visita"], local=j["local"])
+    return txt
+
+
+def gemini_cuerpo(j, ahora, variante):
+    v = GEMINI_VARIANTES[variante]
+    gc = {"thinkingConfig": {"thinkingLevel": v["nivel"]}, "maxOutputTokens": GEMINI_MAX_TOKENS}
+    if v["esquema"]:
+        gc["responseFormat"] = {"text": {"mimeType": "application/json", "schema": gemini_esquema(j["visita"], j["local"])}}
+    return {"systemInstruction": {"parts": [{"text": GEMINI_SISTEMA}]},
+            "contents": [{"role": "user", "parts": [{"text": gemini_pregunta(j, ahora, variante)}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": gc}
+
+
+def _objeto_json(txt):
+    """El objeto JSON de la respuesta: directo, o el primero que aparezca en el texto (variante sin esquema)."""
+    txt = (txt or "").strip()
+    try:
+        v = json.loads(txt)
+        return v if isinstance(v, dict) else None
+    except ValueError:
+        pass
+    i = txt.find("{")
     while i != -1:
-        for j in range(len(txt), i, -1):
-            if txt[j - 1] == "]":
+        for k in range(len(txt), i, -1):
+            if txt[k - 1] == "}":
                 try:
-                    v = json.loads(txt[i:j])
-                    if isinstance(v, list):
+                    v = json.loads(txt[i:k])
+                    if isinstance(v, dict):
                         return v
                 except ValueError:
                     continue
-        i = txt.find("[", i + 1)
-    return []
+        i = txt.find("{", i + 1)
+    return None
 
 
-def gemini_qb(juegos, fuentes, ahora, estado):
-    """Pregunta a Gemini (con búsqueda de Google) el QB titular de cada equipo de esos juegos.
-    Devuelve {equipo: (gsis, nombre, url)}; {} si no hay llave, si se pasó el tope del día o si falla."""
-    import requests
-    if not GEMINI_LLAVE.exists():
-        return {}
-    modelo, tope = _gemini_cfg()
-    hoy = ahora.astimezone(CARACAS).date().isoformat()
-    usado = estado.setdefault("gemini", {})
-    if usado.get(hoy, 0) >= tope:
-        log(f"Gemini: tope de {tope} consultas del día alcanzado; no consulto")
-        return {}
-    usado[hoy] = usado.get(hoy, 0) + 1
-    for k in [k for k in usado if k != hoy]:
-        usado.pop(k)
-    llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
-    lista = "; ".join(f"{v} at {l} ({fecha_cc(ini)} Caracas time)" for v, l, ini in juegos)
-    pregunta = ("For each NFL team in these games, who will start at quarterback? Prefer the official inactive list, "
-                "the team's announcement or reliable beat reporters from the last 48 hours. Games: " + lista +
-                '. Answer ONLY a JSON array like [{"team": "SEA", "qb": "Full Name", "source": "https://..."}], one object per team, '
-                "using these exact team abbreviations.")
-    cab = {"x-goog-api-key": llave, "Content-Type": "application/json"}
-    intentos = [(f"{GEMINI_URL}/interactions", {"model": modelo, "input": pregunta, "tools": [{"type": "google_search"}]}),
-                (f"{GEMINI_URL}/models/{modelo}:generateContent",
-                 {"contents": [{"parts": [{"text": pregunta}]}], "tools": [{"google_search": {}}]})]
-    for url, cuerpo in intentos:
-        try:
-            r = requests.post(url, headers=cab, json=cuerpo, timeout=GEMINI_ESPERA_S)
-        except Exception as e:  # noqa: BLE001 — sin el texto (no debe salir nada de la llave)
-            log(f"Gemini: error de red ({type(e).__name__})")
-            return {}
-        if r.status_code in (400, 404) and "interactions" in url:
-            continue                                   # esa versión de la API no está: prueba generateContent
-        if r.status_code >= 300:
-            log(f"Gemini: respondió {r.status_code}")
-            return {}
-        textos, urls = [], []
-        _textos_y_urls(r.json(), textos, urls)
-        lista_json = _json_en_texto("\n".join(textos))
-        out = {}
-        por_nombre = {_norm(n): g for g, n in fuentes.nombre.items() if n}
-        for x in lista_json:
+def _dominio(url):
+    m = re.match(r"^https?://([^/?#]+)", _texto(url).lower())
+    return re.sub(r"^www\.", "", m.group(1)) if m else ""
+
+
+def gemini_leer(datos, j):
+    """De la respuesta de generateContent: uso de tokens, búsquedas, dominios, y la respuesta validada por equipo."""
+    u = datos.get("usageMetadata") or {}
+    out = dict(model_version=_texto(datos.get("modelVersion")),
+               tok_entrada=int(u.get("promptTokenCount") or 0), tok_herramienta=int(u.get("toolUsePromptTokenCount") or 0),
+               tok_salida=int(u.get("candidatesTokenCount") or 0), tok_razonamiento=int(u.get("thoughtsTokenCount") or 0))
+    out["costo_usd"] = round((out["tok_entrada"] + out["tok_herramienta"]) * PRECIO_ENTRADA
+                             + (out["tok_salida"] + out["tok_razonamiento"]) * PRECIO_SALIDA, 6)
+    cand = (datos.get("candidates") or [{}])[0] or {}
+    out["fin"] = _texto(cand.get("finishReason"))
+    gm = cand.get("groundingMetadata") or {}
+    consultas = sorted({_texto(q) for q in (gm.get("webSearchQueries") or []) if _texto(q)})
+    out["busquedas"] = len(consultas)
+    out["consultas_busqueda"] = " | ".join(consultas)[:400]
+    dominios = []
+    for ch in gm.get("groundingChunks") or []:
+        w = (ch or {}).get("web") or {}
+        d = _texto(w.get("domain")) or _texto(w.get("title")) or _dominio(w.get("uri"))
+        d = re.sub(r"^www\.", "", d.lower())
+        if d and d not in dominios:
+            dominios.append(d)
+    out["dominios"] = " ".join(dominios)[:400]
+    partes = ((cand.get("content") or {}).get("parts")) or []
+    texto = "".join(p.get("text", "") for p in partes if isinstance(p, dict) and not p.get("thought"))
+    obj = _objeto_json(texto)
+    equipos = {}
+    if obj and isinstance(obj.get("teams"), list):
+        for x in obj["teams"]:
             if not isinstance(x, dict):
                 continue
-            eq, nom = _texto(x.get("team")).upper(), _texto(x.get("qb"))
-            eq = DE_OTRAS.get(eq, eq)
-            gid = por_nombre.get(_norm(nom), "")
-            out[eq] = (gid, nom, _texto(x.get("source")) or (urls[0] if urls else ""))
-        log(f"Gemini ({modelo}): {len(out)} equipos respondidos, {len(set(urls))} fuentes citadas")
-        return out
-    return {}
+            eq = DE_OTRAS.get(_texto(x.get("team")).upper(), _texto(x.get("team")).upper())
+            qb = _texto(x.get("qb"))
+            if eq not in (j["visita"], j["local"]) or not qb or eq in equipos:
+                continue
+            conf = _texto(x.get("confidence")).lower()
+            url = _texto(x.get("source_url"))
+            dom = _dominio(url)
+            equipos[eq] = dict(qb=qb, conf=conf if conf in CONFIANZAS else "", url=url[:300],
+                               fecha=_texto(x.get("source_date"))[:10],
+                               verificada=int(bool(dom) and any(dom == d or dom.endswith("." + d) or d.endswith("." + dom) for d in dominios)))
+    out["equipos"] = equipos
+    if obj is None:
+        out["estado"], out["detalle"] = "respuesta inválida", ("sin texto" if not texto else "no es JSON: " + texto[:150])
+    elif len(equipos) == 2:
+        out["estado"] = "ok"
+    elif equipos:
+        out["estado"], out["detalle"] = "parcial", "respondió un solo equipo válido"
+    else:
+        out["estado"], out["detalle"] = "respuesta inválida", "JSON sin equipos válidos"
+    return out
+
+
+def gemini_llamar(llave, j, ahora, variante, limite):
+    """Una consulta (un juego). Nunca lanza excepciones ni registra la llave."""
+    import requests
+    base = dict(game_id=j["game_id"], semana=j["semana"], visita=j["visita"], local=j["local"], equipos={})
+    t0 = time.time()
+    resta = limite - t0
+    if resta < 5:
+        return {**base, "estado": "tiempo agotado", "detalle": "sin tiempo para empezar", "latencia_s": 0.0}
+    try:
+        r = requests.post(f"{GEMINI_URL}/models/{GEMINI_MODELO}:generateContent",
+                          headers={"x-goog-api-key": llave, "Content-Type": "application/json"},
+                          json=gemini_cuerpo(j, ahora, variante), timeout=(min(10.0, resta), resta))
+    except requests.exceptions.Timeout:
+        return {**base, "estado": "tiempo agotado", "latencia_s": round(time.time() - t0, 2)}
+    except Exception as e:  # noqa: BLE001 — solo el tipo: el texto podría traer datos de la conexión
+        return {**base, "estado": "error de red", "detalle": type(e).__name__, "latencia_s": round(time.time() - t0, 2)}
+    lat = round(time.time() - t0, 2)
+    if r.status_code != 200:
+        try:
+            msg = _texto(((r.json() or {}).get("error") or {}).get("message"))
+        except Exception:  # noqa: BLE001
+            msg = ""
+        return {**base, "estado": "error HTTP", "http": r.status_code, "detalle": msg[:300], "latencia_s": lat}
+    try:
+        datos = r.json()
+    except ValueError:
+        return {**base, "estado": "respuesta inválida", "http": 200, "detalle": "la respuesta no es JSON", "latencia_s": lat}
+    return {**base, **gemini_leer(datos, j), "http": 200, "latencia_s": lat}
+
+
+def gemini_tanda(juegos, ahora, estado, tipo, variante=None):
+    """Consulta los juegos en paralelo (máx. 8) con 90 s en total. Devuelve (resultados, duración_s, variante, huella);
+    resultados = [] si el agente está apagado (sin llave). Respeta el tope diario; lo que no se consulta queda 'tope'."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    if not GEMINI_LLAVE.exists() or not juegos:
+        return [], 0.0, None, None
+    var_ini, tope = gemini_cfg()
+    variante = variante or var_ini
+    if tipo != "t85":
+        tope = GEMINI_MAX_PRUEBA_DIA
+    huella = gemini_huella(variante)
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    clave = "gemini" if tipo == "t85" else "gemini_prueba"
+    usado = estado.setdefault(clave, {})
+    for k in [k for k in usado if k != hoy]:
+        usado.pop(k)
+    disponibles = max(tope - usado.get(hoy, 0), 0)
+    a_consultar, sin_cupo = juegos[:disponibles], juegos[disponibles:]
+    usado[hoy] = usado.get(hoy, 0) + len(a_consultar)
+    llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+    t0 = time.time()
+    limite = t0 + GEMINI_PLAZO_S
+    res = {}
+    if a_consultar:
+        ex = ThreadPoolExecutor(max_workers=GEMINI_HILOS)
+        futs = {ex.submit(gemini_llamar, llave, j, ahora, variante, limite): j for j in a_consultar}
+        hechos, _ = wait(futs, timeout=max(limite - time.time(), 0) + 1.0)
+        for f, j in futs.items():
+            if f in hechos and f.exception() is None:
+                res[j["game_id"]] = f.result()
+            else:
+                res[j["game_id"]] = dict(game_id=j["game_id"], semana=j["semana"], visita=j["visita"], local=j["local"],
+                                         equipos={}, estado="tiempo agotado", latencia_s=float(GEMINI_PLAZO_S),
+                                         detalle="" if f not in hechos else f"excepción {type(f.exception()).__name__}")
+        ex.shutdown(wait=False, cancel_futures=True)
+    del llave
+    for j in sin_cupo:
+        res[j["game_id"]] = dict(game_id=j["game_id"], semana=j["semana"], visita=j["visita"], local=j["local"],
+                                 equipos={}, estado="tope", detalle=f"tope de {tope} consultas del día", latencia_s=0.0)
+    dur = round(time.time() - t0, 2)
+    salida = [res[j["game_id"]] for j in juegos]
+    filas = []
+    for x in salida:
+        f = {k: x.get(k) for k in CAMPOS_GEM if k in x}
+        f.update(corrida_utc=iso(ahora), tipo=tipo, agente=variante, huella=huella, modelo=GEMINI_MODELO)
+        for lado, eq in (("visita", x["visita"]), ("local", x["local"])):
+            e = x["equipos"].get(eq) or {}
+            f.update({f"qb_{lado}": e.get("qb", ""), f"conf_{lado}": e.get("conf", ""), f"url_{lado}": e.get("url", ""),
+                      f"fecha_{lado}": e.get("fecha", ""), f"url_{lado}_verificada": e.get("verificada", "")})
+        filas.append(f)
+    SAL.mkdir(parents=True, exist_ok=True)
+    nuevo = not GEMINI_LLAMADAS.exists()
+    with open(GEMINI_LLAMADAS, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CAMPOS_GEM)
+        if nuevo:
+            w.writeheader()
+        for f in filas:
+            w.writerow({k: ("" if f.get(k) is None else f.get(k)) for k in CAMPOS_GEM})
+    cuenta = {}
+    for x in salida:
+        cuenta[x["estado"]] = cuenta.get(x["estado"], 0) + 1
+    log(f"Gemini {variante} ({huella}, {tipo}): {len(salida)} juegos en {dur:.1f} s · {cuenta}")
+    return salida, dur, variante, huella
+
+
+def gid_por_nombre(fq, nombre, equipo):
+    """Nombre que respondió Gemini → gsis: igual nombre normalizado; si no, único QB del roster de ese equipo con ese
+    apellido. Si no se puede, '' (el voto se compara después por nombre contra el QB que jugó)."""
+    n = _norm(nombre)
+    if not n:
+        return ""
+    for g, nom in fq.nombre.items():
+        if nom and _norm(nom) == n:
+            return g
+    ap = _norm(nombre.split()[-1]) if nombre.split() else ""
+    cands = [g for g, f in fq.roster.items()
+             if _texto(f.get("team")) == equipo and ap and _norm(_texto(f.get("full_name")).split()[-1] if _texto(f.get("full_name")) else "") == ap]
+    return cands[0] if len(cands) == 1 else ""
+
+
+def gemini_sombra(pendientes, ahora, estado):
+    """Corridas T−85: consulta los juegos proyectados y registra los votos en sombra (uno por equipo, vacío si no hay
+    respuesta). pendientes = [(juego, FuentesQB)]. Nunca detiene la corrida."""
+    try:
+        juegos = [j for j, _ in pendientes]
+        salida, dur, variante, huella = gemini_tanda(juegos, ahora, estado, "t85")
+        if not salida:
+            return
+        fq_de = {j["game_id"]: fq for j, fq in pendientes}
+        votos = []
+        for x in salida:
+            fq = fq_de[x["game_id"]]
+            for eq in (x["visita"], x["local"]):
+                e = x["equipos"].get(eq) or {}
+                nom = e.get("qb", "")
+                nota = f"{variante} · {x['estado']}" + (f" · conf {e.get('conf')}" if e.get("conf") else "") + \
+                       (f" · {e.get('url')}" if e.get("url") else "")
+                votos.append(dict(corrida_utc=iso(ahora), tipo="t85", game_id=x["game_id"], semana=x["semana"], equipo=eq,
+                                  fuente="gemini", qb_id=gid_por_nombre(fq, nom, eq) if nom else "", qb_nombre=nom,
+                                  nota=nota[:200]))
+        anexar_fuentes(votos)
+    except Exception as e:  # noqa: BLE001
+        log(f"Gemini: error en la sombra ({type(e).__name__}); la proyección no se afecta")
+
+
+def gemini_piloto(g26, ahora, estado, variante=None):
+    """Piloto (criterios P1-P4 escritos antes, registro 35A g1): consulta los juegos pendientes de la semana, tipo
+    'prueba' (no cuenta para el piso ni deja votos). Devuelve el informe en texto."""
+    import polars as pl
+    if not GEMINI_LLAVE.exists():
+        return "Piloto: no hay llave de Gemini (credenciales/gemini.key). Cárgala con: bash ~/nfl_sim/cargar_gemini.sh"
+    sem = semana_actual(g26, ahora)
+    if sem is None:
+        return "Piloto: no hay juegos pendientes en el calendario."
+    jg = g26.filter((pl.col("week") == sem) & (pl.col("inicio") > ahora)).sort(["inicio", "game_id"])
+    juegos = [dict(game_id=r["game_id"], semana=sem, game_type=r["game_type"], visita=r["away_team"], local=r["home_team"],
+                   inicio=r["inicio"]) for r in jg.iter_rows(named=True)]
+    variante = variante or gemini_cfg()[0]
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    usados = (estado.get("gemini_prueba") or {}).get(hoy, 0)
+    if GEMINI_MAX_PRUEBA_DIA - usados < len(juegos):
+        return (f"Piloto: no hay cupo para un piloto completo hoy ({usados} de {GEMINI_MAX_PRUEBA_DIA} consultas de prueba "
+                f"usadas; hacen falta {len(juegos)}). No consulté nada; se puede repetir mañana.")
+    salida, dur, variante, huella = gemini_tanda(juegos, ahora, estado, "prueba", variante)
+    n = len(salida)
+    if not n:
+        return "Piloto: no se hizo ninguna consulta."
+    resp = [x for x in salida if x.get("http") == 200]
+    ok = [x for x in salida if x["estado"] == "ok"]
+    con_busq = [x for x in resp if (x.get("busquedas") or 0) >= 1]
+    lat = [x.get("latencia_s") or 0.0 for x in salida]
+    costos = [x.get("costo_usd") or 0.0 for x in resp]
+    c_medio = sum(costos) / len(costos) if costos else None
+    p1 = len(ok) / n >= 0.90
+    p2 = bool(resp) and len(con_busq) == len(resp)
+    p3 = dur <= 60 and max(lat) < GEMINI_PLAZO_S and not any(x["estado"] == "tiempo agotado" for x in salida)
+    p4 = c_medio is not None and c_medio <= 0.02
+    si = lambda b: "✅" if b else "❌"  # noqa: E731
+    mv = sorted({x.get("model_version") for x in resp if x.get("model_version")})
+    lin = [f"PILOTO Gemini · variante {variante} (huella {huella}) · {GEMINI_MODELO}"
+           + (f" · versión devuelta: {', '.join(mv)}" if mv else ""),
+           f"Semana {sem}: {n} consultas (juegos pendientes) en una tanda de {dur:.0f} s · tipo 'prueba': no cuenta para el piso",
+           f"P1 JSON válido con los dos equipos: {len(ok)}/{n} ({100 * len(ok) / n:.0f} %) · pasa si ≥ 90 % {si(p1)}",
+           f"P2 al menos una búsqueda (de las que respondieron): {len(con_busq)}/{len(resp)} · pasa si 100 % {si(p2)}",
+           f"P3 tanda {dur:.0f} s (≤ 60) y la más lenta {max(lat):.0f} s (< 90) {si(p3)}",
+           (f"P4 costo medio USD {c_medio:.4f} por consulta (máx {max(costos):.4f}) · pasa si ≤ 0,02 {si(p4)}"
+            if c_medio is not None else f"P4 sin consultas respondidas {si(False)}")]
+    if p1 and p2 and p3 and p4:
+        lin.append(f"VEREDICTO: PASA. La variante {variante} queda como definitiva para las corridas T−85.")
+    else:
+        rech = [x for x in salida if x["estado"] == "error HTTP" and x.get("http") == 400]
+        sug = []
+        if rech and len(rech) >= n // 2 and GEMINI_VARIANTES[variante]["esquema"]:
+            sug.append("la API rechazó la petición (400): probar g1-texto (sin esquema) → /piloto g1-texto")
+        elif variante == "g1":
+            if not (p3 and p4):
+                sug.append("fallan P3 o P4: probar g1-low → /piloto g1-low")
+            if not p2:
+                sug.append("falla P2: probar g1-high una sola vez → /piloto g1-high")
+        lin.append("VEREDICTO: NO PASA. " + ("Siguiente paso previsto: " + "; ".join(sug) if sug else "Mándame este informe."))
+    # descriptivo (no decide): coincidencia con el consenso de fuentes, tokens, búsquedas, dominios, errores
+    try:
+        fq = FuentesQB(sem)
+        igual = total = 0
+        for x in salida:
+            fila = jg.filter(pl.col("game_id") == x["game_id"]).row(0, named=True)
+            for eq in (x["visita"], x["local"]):
+                e = x["equipos"].get(eq)
+                if not e:
+                    continue
+                base = _texto(fila["home_qb_id"] if eq == fila["home_team"] else fila["away_qb_id"])
+                _, usado, _, _ = fq.votar(eq, base)
+                g = gid_por_nombre(fq, e["qb"], eq)
+                total += 1
+                igual += int(bool(g) and g == usado)
+        lin.append(f"Descriptivo: coincide con el consenso de fuentes en {igual} de {total} equipos respondidos.")
+    except Exception as e:  # noqa: BLE001
+        lin.append(f"Descriptivo: no pude comparar con el consenso ({type(e).__name__}).")
+    if resp:
+        media = lambda k: sum((x.get(k) or 0) for x in resp) / len(resp)  # noqa: E731
+        lin.append(f"Tokens medios: entrada {media('tok_entrada'):.0f} · herramienta {media('tok_herramienta'):.0f} · "
+                   f"salida {media('tok_salida'):.0f} · razonamiento {media('tok_razonamiento'):.0f} · "
+                   f"búsquedas {sum(x.get('busquedas') or 0 for x in resp)} en total")
+        doms = {}
+        for x in resp:
+            for d in (x.get("dominios") or "").split():
+                doms[d] = doms.get(d, 0) + 1
+        if doms:
+            lin.append("Dominios citados: " + ", ".join(f"{d} ({c})" for d, c in sorted(doms.items(), key=lambda kv: -kv[1])[:8]))
+    estados = {}
+    for x in salida:
+        estados[x["estado"]] = estados.get(x["estado"], 0) + 1
+    lin.append("Estados: " + ", ".join(f"{k} {v}" for k, v in estados.items()))
+    for x in salida:
+        eqs = " · ".join(f"{eq} {x['equipos'][eq]['qb']} ({x['equipos'][eq]['conf'] or '—'})"
+                         for eq in (x["visita"], x["local"]) if eq in x["equipos"])
+        lin.append(f"  {x['visita']} @ {x['local']}: {x['estado']} · {x.get('latencia_s') or 0:.0f} s"
+                   + (f" · {eqs}" if eqs else "") + (f" · {x['detalle']}" if x.get("detalle") else ""))
+    lin.append(f"Registro: salidas/semana/{GEMINI_LLAMADAS.name}")
+    return "\n".join(lin)
 
 
 # --------------------------------------------------------------------------------------
@@ -1144,9 +1505,10 @@ def sesgo_semanal(filas, previas):
                 f["sesgo_spread_semana"] = ss; f["sesgo_total_semana"] = st; f["bandera_sesgo"] = bandera
 
 
-def consenso_semana(gs, sem, tipo, ahora, estado):
+def consenso_semana(gs, sem, tipo, ahora):
     """QB por consenso para los juegos de una semana (v5). Reemplaza qbl/qbv por el QB elegido, deja el estado del
-    consenso en fl/fv y registra cada voto (y el del agente en sombra en las corridas T−85)."""
+    consenso en fl/fv y registra cada voto. v6: el agente Gemini ya no se consulta aquí (corre después de enviar la
+    proyección); devuelve también las fuentes cargadas, que la sombra usa para leer los nombres."""
     import polars as pl
     fq = FuentesQB(sem)
     for a in fq.avisos:
@@ -1161,23 +1523,17 @@ def consenso_semana(gs, sem, tipo, ahora, estado):
                                       fuente=fuente, qb_id=votos[fuente], qb_nombre=fq.nombre.get(votos[fuente], "")))
             votos_log.append(dict(corrida_utc=iso(ahora), tipo=tipo, game_id=r["game_id"], semana=sem, equipo=eq,
                                   fuente="consenso", qb_id=usado or "", qb_nombre=fq.nombre.get(usado, ""), nota=det))
-    if tipo == "t85" and estado is not None:
-        juegos = list(zip(gs["away_team"].to_list(), gs["home_team"].to_list(), gs["inicio"].to_list()))
-        for eq, (gid_qb, nom, url) in gemini_qb(juegos, fq, ahora, estado).items():
-            fila = next((r for r in gs.iter_rows(named=True) if eq in (r["home_team"], r["away_team"])), None)
-            if fila:
-                votos_log.append(dict(corrida_utc=iso(ahora), tipo=tipo, game_id=fila["game_id"], semana=sem, equipo=eq,
-                                      fuente="gemini", qb_id=gid_qb, qb_nombre=nom, nota=url[:200]))
     anexar_fuentes(votos_log)
-    return gs.with_columns(pl.Series("qbl", qbl), pl.Series("qbv", qbv), pl.Series("fl", fl), pl.Series("fv", fv))
+    return gs.with_columns(pl.Series("qbl", qbl), pl.Series("qbv", qbv), pl.Series("fl", fl), pl.Series("fv", fv)), fq
 
 
 def es_dudoso(f):
     return any(str(f.get(k) or "").startswith("dudoso") for k in ("qb_local_fuente", "qb_visita_fuente"))
 
 
-def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, estado=None):
-    """Corrida hacia adelante (la que cuenta para 31A y 29A): juegos que todavía no empiezan."""
+def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, sombra=None):
+    """Corrida hacia adelante (la que cuenta para 31A y 29A): juegos que todavía no empiezan.
+    sombra: lista donde se anotan los juegos T−85 (con sus fuentes) para el agente Gemini, que corre después."""
     import polars as pl
     ctx = ctx or preparar_contexto(g_all, g26)
     resumenes = []
@@ -1188,7 +1544,10 @@ def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, estado=None):
         filas = []
         for sem, gs in jg.group_by("week", maintain_order=True):
             sem = int(sem[0] if isinstance(sem, tuple) else sem)
-            gs = consenso_semana(gs, sem, tipo, ahora, estado)
+            gs, fq = consenso_semana(gs, sem, tipo, ahora)
+            if tipo == "t85" and sombra is not None:
+                sombra += [(dict(game_id=r["game_id"], semana=sem, game_type=r["game_type"], visita=r["away_team"],
+                                 local=r["home_team"], inicio=r["inicio"]), fq) for r in gs.iter_rows(named=True)]
             mg, tt, F = simular_semana(ctx, gs, sem, args.n_sims)
             pin = lineas_bot(args.bot_dir, "pinnacle", gs["game_id"].to_list(), ahora, MAX_EDAD_PIN_H)
             bo = lineas_bot(args.bot_dir, "betonlineag", gs["game_id"].to_list(), ahora, MAX_EDAD_BO_H)
@@ -1450,7 +1809,8 @@ def semanas_con_datos(g26):
 # --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba"])
+    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto"])
+    ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
     ap.add_argument("--tipo", default="manual")
@@ -1528,10 +1888,23 @@ def main():
                 print(f"  grupo {fecha_cc(ini)} Caracas: {gr.height} juegos · T−85 a las "
                       f"{(ini - dt.timedelta(minutes=MIN_T85)).astimezone(CARACAS).strftime('%H:%M')}"
                       f"{' (ya corrió)' if iso(ini) in estado['grupos'] else ''}")
+        if GEMINI_LLAVE.exists():
+            var, tope = gemini_cfg()
+            hoy = ahora.astimezone(CARACAS).date().isoformat()
+            print(f"Agente Gemini (sombra): activo · {GEMINI_MODELO} · variante {var} (huella {gemini_huella(var)}) · "
+                  f"hoy {estado.get('gemini', {}).get(hoy, 0)}/{tope} consultas T−85 y "
+                  f"{estado.get('gemini_prueba', {}).get(hoy, 0)}/{GEMINI_MAX_PRUEBA_DIA} de piloto")
+        else:
+            print("Agente Gemini (sombra): apagado (no hay credenciales/gemini.key)")
         return
 
     if args.modo == "qb":
         print(texto_qb(g26, ahora, args.semana))
+        return
+
+    if args.modo == "gemini-piloto":
+        print(gemini_piloto(g26, ahora, estado, args.variante))
+        guardar_estado(estado)
         return
 
     if args.modo == "hoja":
@@ -1578,7 +1951,8 @@ def main():
 
     log(f"{VERSION_SEMANA}: corre {[(t, c, len(i)) for t, c, i in lista]}")
     g_all, g26 = calendario(0.25)                    # calendario fresco (QB titulares y líneas) antes de proyectar
-    resumenes, nombres_qb = correr(lista, g_all, g26, args, ahora, estado=estado)
+    sombra = []
+    resumenes, nombres_qb = correr(lista, g_all, g26, args, ahora, sombra=sombra)
     for tipo, clave, ids in lista:
         if tipo in ("miercoles", "sabado"):
             estado["fijas"][clave] = iso(ahora)
@@ -1593,6 +1967,9 @@ def main():
         sys.path.insert(0, str(BASE))
         import sprint2 as s2
         s2.telegram(texto_telegram(resumenes))
+    if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
+        gemini_sombra(sombra, ahora, estado)
+        guardar_estado(estado)
     log("== LISTO")
 
 

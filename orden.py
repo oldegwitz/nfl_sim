@@ -11,6 +11,8 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /retro   → rehace la retrospectiva de los juegos ya jugados (semana.py retro)
   /estado  → qué toca y cuándo (semana.py estado)
   /qb      → QB titular de cada juego por fuente (nflverse, ESPN, Sleeper), consenso y confiabilidad (semana.py qb)
+  /piloto [variante] → piloto del agente Gemini con los criterios P1-P4 (semana.py gemini-piloto); variante opcional:
+             g1 (por omisión), g1-low, g1-texto o g1-high. Tipo 'prueba': no cuenta para el piso de 35A.
   /ayuda   → esta lista
 
 Las corridas pedidas por Telegram se registran (tipo "telegram") y actualizan la hoja, pero NO son la proyección
@@ -29,7 +31,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v2 (2-oct-2026)"   # v2: /qb muestra el consenso de fuentes (semana.py qb, decisión 32)
+VERSION = "orden-v3 (2-oct-2026)"   # v2: /qb con consenso de fuentes · v3: /piloto (piloto del agente Gemini, 35A g1)
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -44,13 +46,17 @@ ORDENES = {
     "/retro": (["retro"], "Rehago la retrospectiva de los juegos ya jugados (≈1 min)."),
     "/estado": (["estado"], None),
     "/qb": (["qb"], None),
+    "/piloto": (["gemini-piloto"], "Piloto de Gemini: una consulta por juego pendiente, en paralelo (≈1-2 min). No cuenta para el piso."),
 }
+VARIANTES = ("g1", "g1-low", "g1-texto", "g1-high")
+SALIDA_COMPLETA = ("/qb", "/estado", "/piloto")
 AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/correr — proyecta ahora y actualiza la hoja\n"
          "/hoja — rehace las pestañas (sin simular)\n"
          "/retro — rehace la retrospectiva\n"
          "/estado — qué toca y cuándo\n"
          "/qb — QB de cada juego por fuente y su confiabilidad\n"
+         "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
          "/ayuda — esta lista\n"
          "Las corridas pedidas aquí se registran pero no cuentan para 31A ni para el CLV.")
 
@@ -104,7 +110,7 @@ def correr_semana(args):
     lineas = [re.sub(r"^\[[^\]]*UTC\] ", "", x) for x in salida.splitlines() if x.strip()]   # sin la hora del log
     if codigo != 0:
         lineas = [x for x in lineas if "Error" in x or "error" in x or "Traceback" in x or x.startswith("  ")][-8:] or lineas[-8:]
-    return codigo, "\n".join(lineas if args and args[0] in ("qb", "estado") else lineas[-15:])
+    return codigo, "\n".join(lineas if args and args[0] in ("qb", "estado", "gemini-piloto") else lineas[-15:])
 
 
 def main():
@@ -134,20 +140,26 @@ def main():
                 if msg:
                     log(f"mensaje ignorado de un chat no autorizado ({(msg.get('chat') or {}).get('id')})")
                 continue
-            texto = (msg.get("text") or "").strip().split()[0].split("@")[0].lower() if msg.get("text") else ""
+            partes = (msg.get("text") or "").strip().split()
+            texto = partes[0].split("@")[0].lower() if partes else ""
+            extra = [x.lower() for x in partes[1:2]]
             if not texto:
                 continue
             log(f"orden: {texto}")
             if texto in ("/ayuda", "/start", "/help"):
                 tg.enviar(chat, AYUDA)
+            elif texto == "/piloto" and extra and extra[0] not in VARIANTES:
+                tg.enviar(chat, f"Variante desconocida: {extra[0]}. Usa una de: {', '.join(VARIANTES)}.")
             elif texto in ORDENES:
                 args, aviso = ORDENES[texto]
+                if texto == "/piloto" and extra:
+                    args = args + ["--variante", extra[0]]
                 if aviso:
                     tg.enviar(chat, aviso)
                 t0 = time.time()
                 codigo, salida = correr_semana(args)
                 estado = "listo" if codigo == 0 else "falló"
-                tg.enviar(chat, salida if (texto in ("/qb", "/estado") and codigo == 0) else f"{texto} {estado} en {time.time() - t0:.0f} s.\n{salida}")
+                tg.enviar(chat, salida if (texto in SALIDA_COMPLETA and codigo == 0) else f"{texto} {estado} en {time.time() - t0:.0f} s.\n{salida}")
                 log(f"orden {texto}: {estado} ({codigo})")
             else:
                 tg.enviar(chat, "No conozco esa orden.\n" + AYUDA)
