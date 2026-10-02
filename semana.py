@@ -18,7 +18,8 @@ Qué hace en cada corrida
      "Semana N" de la hoja de Google (una por semana, con colores) y manda un resumen por Telegram.
   8. Cuando nflverse publica un resultado, completa solo las columnas de cierre de esa semana (marcador, error
      del modelo contra el del cierre, si cubrió el lado del modelo, total real, pata Wong +6) y la fila resumen.
-  La hoja es de solo lectura: Ozz no escribe nada (sin columnas manuales desde v4). El QB es el de nflverse.
+  La hoja es de solo lectura: Ozz no escribe nada (sin columnas manuales desde v4). El QB titular sale del consenso
+  de nflverse, ESPN y Sleeper (v5); si no hay acuerdo, el juego va en rojo como "QB dudoso".
 
 Cuándo corre (modo 'auto', lo llama el temporizador de systemd cada 5 min; si no toca nada, sale sin escribir)
   · miércoles y sábado 10:15 (Caracas): todos los juegos de la semana que no empezaron;
@@ -37,6 +38,7 @@ Uso
   venv/bin/python semana.py correr [--semana N] [--juegos ID,ID] [--tipo manual]
   venv/bin/python semana.py retro                         (retrospectiva de los juegos jugados y sus pestañas)
   venv/bin/python semana.py hoja [--semana N]             (rehace las pestañas desde el registro, sin simular)
+  venv/bin/python semana.py qb                            (QB de cada juego por fuente y confiabilidad de cada fuente)
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña de prueba)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
@@ -50,18 +52,23 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v4 (2-oct-2026)"
+VERSION_SEMANA = "semana-v5 (2-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
 # v4 (pedido de Ozz, 2-oct): sin columnas manuales (QB y OK); columnas de cierre y fila resumen que se llenan
 #     solas con los resultados de nflverse; modo 'retro' (semanas ya jugadas, en gris, aparte del registro);
 #     modo 'hoja' (rehace las pestañas sin simular). La proyección hacia adelante es idéntica a v3.
+# v5 (decisiones 32 y 35A, 2-oct): QB titular por consenso de nflverse, ESPN y Sleeper (disponibilidad según el
+#     reporte oficial, Sleeper y el roster); sin acuerdo → "QB dudoso" (rojo, selecciones excluidas); registro de
+#     cada voto y confiabilidad de cada fuente contra el QB que jugó; modo 'qb'; agente Gemini en sombra (solo con
+#     credenciales/gemini.key; nunca vota). Con las tres fuentes de acuerdo con nflverse, la proyección es la de v4.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -533,6 +540,10 @@ def estado_txt(f):
     d = _difieren(f)
     if f.get("tipo") == "retro":                       # nunca en rojo: la fila retro va en gris
         return "retro: hecha después del juego" + (f" · modelo y mercado difieren ({d})" if d else "")
+    dq = [str(f.get(k))[len("dudoso: "):] for k in ("qb_visita_fuente", "qb_local_fuente")
+          if str(f.get(k) or "").startswith("dudoso")]
+    if dq:
+        return "REVISAR: QB dudoso (" + " | ".join(dq) + ")" + (f" · modelo y mercado difieren ({d})" if d else "")
     if d:
         return "REVISAR: modelo y mercado difieren (" + d + ")"
     return f.get("sel_estado") or ""
@@ -679,6 +690,322 @@ def lineas_bot(bot_dir, casa, ids, ahora, max_horas):
 
 
 # --------------------------------------------------------------------------------------
+# QB titular por consenso de fuentes (decisión 32, registrada en el documento antes de usarse)
+#   Votan 3 fuentes: nflverse (games.csv), ESPN (tabla de profundidad, consultada en la corrida) y Sleeper (una vez
+#   al día como máximo, como pide su documentación). Cada fuente vota por su QB mejor ubicado que esté DISPONIBLE:
+#   no está Out/Doubtful en el reporte oficial (nflverse), ni Out/IR/PUP/suspendido/Doubtful en Sleeper, ni en
+#   reserva/cortado/práctica en el roster de nflverse. 2 o más votos iguales → ese QB; si no → "QB dudoso": se usa
+#   el de nflverse para proyectar, pero el juego va en rojo y sus selecciones quedan excluidas.
+#   Cada voto se guarda (salidas/semana/fuentes_qb.csv) y, con el QB que efectivamente jugó (nflverse después del
+#   juego), se mide cuántas veces acertó cada fuente: el registro semana a semana de confiabilidad.
+#   El agente Gemini (35A) vota en SOMBRA: se registra y se mide, pero no entra al consenso.
+# --------------------------------------------------------------------------------------
+URL_INJ = "https://github.com/nflverse/nflverse-data/releases/download/injuries/injuries_{}.csv"
+URL_SLEEPER = "https://api.sleeper.app/v1/players/nfl"
+URL_ESPN_EQUIPOS = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
+URL_ESPN_PROF = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/{}/teams/{}/depthcharts"
+ESPN_ABREV = {"LA": "LAR", "WAS": "WSH"}                     # nflverse → ESPN (el resto coincide)
+SLEEPER_ABREV = {"LA": "LAR"}                                 # nflverse → Sleeper
+DE_OTRAS = {"LAR": "LA", "WSH": "WAS"}                        # respuestas con otras abreviaturas → nflverse
+FUENTES_QB = SAL / "fuentes_qb.csv"
+CAMPOS_QB = ["corrida_utc", "tipo", "game_id", "semana", "equipo", "fuente", "qb_id", "qb_nombre", "nota"]
+FUENTES_VOTAN = ("nflverse", "espn", "sleeper")
+NO_DISP_REPORTE = {"out", "doubtful"}
+NO_DISP_SLEEPER = {"out", "ir", "pup", "sus", "suspended", "doubtful", "nfi", "cov", "dnr"}
+NO_DISP_ROSTER = {"RES", "CUT", "DEV", "RET"}
+TIPOS_QUE_CUENTAN = ("t85", "sabado", "miercoles")
+
+
+def _texto(x):
+    return "" if x is None else str(x).strip()
+
+
+def _norm(nombre):
+    """Nombre comparable: minúsculas, sin sufijos (Jr., III) ni signos."""
+    n = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", "", _texto(nombre).lower())
+    return re.sub(r"[^a-z]", "", n)
+
+
+class FuentesQB:
+    """Carga una vez por corrida las fuentes del QB titular. Si una fuente falla, se abstiene (nunca detiene la corrida)."""
+
+    def __init__(self, sem):
+        import polars as pl
+        self.sem = sem
+        self.avisos = []
+        self.roster, self.por_espn, self.por_sleeper, self.nombre = {}, {}, {}, {}
+        if bajar(URL_ROSTER.format(TEMPORADA), DATOS / f"roster_{TEMPORADA}.csv", 100_000, 12.0):
+            try:
+                r = pl.read_csv(DATOS / f"roster_{TEMPORADA}.csv", infer_schema_length=0).filter(pl.col("position") == "QB")
+                for f in r.iter_rows(named=True):
+                    gid = _texto(f.get("gsis_id"))
+                    if not gid:
+                        continue
+                    self.roster[gid] = f
+                    self.nombre[gid] = _texto(f.get("full_name"))
+                    if _texto(f.get("espn_id")):
+                        self.por_espn[_texto(f["espn_id"])] = gid
+                    if _texto(f.get("sleeper_id")):
+                        self.por_sleeper[_texto(f["sleeper_id"])] = gid
+            except Exception as e:  # noqa: BLE001
+                self.avisos.append(f"roster: {type(e).__name__}")
+        self.reporte = {}                                    # gsis → estado del reporte oficial de la semana
+        if bajar(URL_INJ.format(TEMPORADA), DATOS / f"injuries_{TEMPORADA}.csv", 1000, 6.0):
+            try:
+                inj = pl.read_csv(DATOS / f"injuries_{TEMPORADA}.csv", infer_schema_length=0)
+                inj = inj.filter(pl.col("week") == str(sem))
+                for f in inj.iter_rows(named=True):
+                    self.reporte[_texto(f.get("gsis_id"))] = _texto(f.get("report_status")).lower()
+            except Exception as e:  # noqa: BLE001
+                self.avisos.append(f"reporte de lesiones: {type(e).__name__}")
+        self.sleeper_eq, self.sleeper_iny = {}, {}           # equipo → [(orden, gsis)] · gsis → estado de lesión
+        if bajar(URL_SLEEPER, DATOS / "sleeper_jugadores.json", 1_000_000, 24.0):
+            try:
+                d = json.loads((DATOS / "sleeper_jugadores.json").read_text(encoding="utf-8"))
+                for pid, j in d.items():
+                    if j.get("position") != "QB" or not j.get("team"):
+                        continue
+                    gid = self.por_sleeper.get(str(pid)) or _texto(j.get("gsis_id"))
+                    if not gid:
+                        continue
+                    self.nombre.setdefault(gid, _texto(j.get("full_name")))
+                    self.sleeper_iny[gid] = _texto(j.get("injury_status")).lower()
+                    if j.get("depth_chart_order") is not None:
+                        self.sleeper_eq.setdefault(j["team"], []).append((int(j["depth_chart_order"]), gid))
+            except Exception as e:  # noqa: BLE001
+                self.avisos.append(f"Sleeper: {type(e).__name__}")
+        self.espn_ids = {}
+        if bajar(URL_ESPN_EQUIPOS, DATOS / "espn_equipos.json", 5_000, 24 * 30):
+            try:
+                d = json.loads((DATOS / "espn_equipos.json").read_text(encoding="utf-8"))
+                for t in d["sports"][0]["leagues"][0]["teams"]:
+                    self.espn_ids[t["team"]["abbreviation"]] = t["team"]["id"]
+            except Exception as e:  # noqa: BLE001
+                self.avisos.append(f"ESPN equipos: {type(e).__name__}")
+        self._espn_cache = {}
+
+    def disponible(self, gid):
+        if not gid:
+            return False
+        if self.reporte.get(gid, "") in NO_DISP_REPORTE:
+            return False
+        if self.sleeper_iny.get(gid, "") in NO_DISP_SLEEPER:
+            return False
+        st = _texto((self.roster.get(gid) or {}).get("status"))
+        return st not in NO_DISP_ROSTER
+
+    def candidatos_espn(self, equipo):
+        """QB de la tabla de profundidad de ESPN en orden (gsis), consultada en el momento."""
+        import requests
+        if equipo in self._espn_cache:
+            return self._espn_cache[equipo]
+        out = []
+        tid = self.espn_ids.get(ESPN_ABREV.get(equipo, equipo))
+        if tid:
+            try:
+                d = requests.get(URL_ESPN_PROF.format(TEMPORADA, tid), timeout=20).json()
+                for it in d.get("items", []):
+                    qb = (it.get("positions") or {}).get("qb")
+                    if not qb:
+                        continue
+                    for a in sorted(qb.get("athletes", []), key=lambda a: a.get("rank", 99)):
+                        espn_id = str(a.get("athlete", {}).get("$ref", "")).split("/athletes/")[-1].split("?")[0]
+                        gid = self.por_espn.get(espn_id)
+                        if gid and gid not in out:
+                            out.append(gid)
+                    break
+            except Exception as e:  # noqa: BLE001
+                self.avisos.append(f"ESPN {equipo}: {type(e).__name__}")
+        self._espn_cache[equipo] = out
+        return out
+
+    def candidatos_sleeper(self, equipo):
+        return [g for _, g in sorted(self.sleeper_eq.get(SLEEPER_ABREV.get(equipo, equipo), []))]
+
+    def votar(self, equipo, qb_nflverse):
+        """{fuente: gsis o ''} y el resultado del consenso: (gsis_usado, estado, detalle)."""
+        votos = {"nflverse": qb_nflverse if self.disponible(qb_nflverse) else ""}
+        primero = {"nflverse": qb_nflverse or ""}
+        for fuente, cands in (("espn", self.candidatos_espn(equipo)), ("sleeper", self.candidatos_sleeper(equipo))):
+            votos[fuente] = next((g for g in cands if self.disponible(g)), "")
+            primero[fuente] = cands[0] if cands else ""
+        cuenta = {}
+        for f in FUENTES_VOTAN:
+            if votos[f]:
+                cuenta[votos[f]] = cuenta.get(votos[f], 0) + 1
+        validas = sum(1 for f in FUENTES_VOTAN if votos[f])
+        top = max(cuenta.items(), key=lambda kv: kv[1]) if cuenta else (None, 0)
+        nom = lambda g: self.nombre.get(g, g) or "—"  # noqa: E731
+
+        def dijo(f):                                   # qué dijo cada fuente, en palabras
+            if votos[f]:
+                return nom(votos[f])
+            return f"{nom(primero[f])} no disponible" if primero[f] else "sin dato"
+        if top[1] >= 2:
+            disiden = [f"{f}: {dijo(f)}" for f in FUENTES_VOTAN if votos[f] != top[0]]
+            estado = f"{top[1]}/{validas}"
+            return votos, top[0], estado, estado + ("" if not disiden else " · difiere " + ", ".join(disiden))
+        detalle = " · ".join(f"{f} {dijo(f)}" for f in FUENTES_VOTAN)
+        return votos, (qb_nflverse or votos["espn"] or votos["sleeper"]), "dudoso", "dudoso: " + detalle
+
+
+def anexar_fuentes(filas):
+    SAL.mkdir(parents=True, exist_ok=True)
+    nuevo = not FUENTES_QB.exists()
+    with open(FUENTES_QB, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CAMPOS_QB)
+        if nuevo:
+            w.writeheader()
+        for f in filas:
+            w.writerow({k: ("" if f.get(k) is None else f.get(k)) for k in CAMPOS_QB})
+
+
+def confiabilidad_qb(g26, semana=None):
+    """Aciertos de cada fuente contra el QB que jugó (nflverse después del juego), con el voto de la corrida que cuenta
+    (la última antes del inicio entre T−85, sábado y miércoles; si no hubo, la última). {fuente: (aciertos, total)}."""
+    import polars as pl
+    if not FUENTES_QB.exists():
+        return {}
+    reg = pl.read_csv(FUENTES_QB, infer_schema_length=0)
+    if semana is not None:
+        reg = reg.filter(pl.col("semana") == str(semana))
+    hechos = g26.filter(pl.col("result").is_not_null())
+    real, inicio = {}, {}
+    for r in hechos.iter_rows(named=True):
+        real[(r["game_id"], r["home_team"])] = _texto(r.get("home_qb_id"))
+        real[(r["game_id"], r["away_team"])] = _texto(r.get("away_qb_id"))
+        inicio[r["game_id"]] = r["inicio"]
+    elegido = {}                                       # (game, equipo, fuente) → (prioridad, corrida, qb)
+    for f in reg.iter_rows(named=True):
+        k = (f["game_id"], f["equipo"])
+        if k not in real or not real[k]:
+            continue
+        t = t_utc(f["corrida_utc"])
+        if t is None or (inicio.get(f["game_id"]) and t >= inicio[f["game_id"]]):
+            continue
+        prio = (1 if f["tipo"] in TIPOS_QUE_CUENTAN else 0, t)
+        kk = (f["game_id"], f["equipo"], f["fuente"])
+        if kk not in elegido or prio > elegido[kk][0]:
+            elegido[kk] = (prio, _texto(f["qb_id"]))
+    out = {}
+    for (gid, eq, fuente), (_, qb) in elegido.items():
+        a, n = out.get(fuente, (0, 0))
+        out[fuente] = (a + int(qb == real[(gid, eq)]), n + 1)
+    return out
+
+
+def confiabilidad_txt(c):
+    if not c:
+        return ""
+    orden = ["consenso", "nflverse", "espn", "sleeper", "gemini"]
+    nombres = {"consenso": "consenso", "nflverse": "nflverse", "espn": "ESPN", "sleeper": "Sleeper", "gemini": "Gemini (sombra)"}
+    return "QB acertado por fuente: " + " · ".join(f"{nombres[f]} {c[f][0]}/{c[f][1]}" for f in orden if f in c)
+
+
+# --------------------------------------------------------------------------------------
+# Agente Gemini en sombra (35A): solo corre si existe credenciales/gemini.key; nunca vota
+# --------------------------------------------------------------------------------------
+GEMINI_LLAVE = BASE / "credenciales" / "gemini.key"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODELO_DEF = "gemini-3.5-flash-lite"
+GEMINI_MAX_DIA = 20
+GEMINI_ESPERA_S = 90
+
+
+def _gemini_cfg():
+    cfg = configparser.ConfigParser()
+    if CONFIG.exists():
+        cfg.read(CONFIG)
+    sec = cfg["gemini"] if cfg.has_section("gemini") else {}
+    return (str(sec.get("modelo", GEMINI_MODELO_DEF)).strip() or GEMINI_MODELO_DEF,
+            int(str(sec.get("max_llamadas_dia", GEMINI_MAX_DIA)).strip() or GEMINI_MAX_DIA))
+
+
+def _textos_y_urls(obj, textos, urls):
+    """Recorre la respuesta (cualquier versión de la API) y junta los textos y las URL citadas."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in ("text", "output_text") and isinstance(v, str):
+                textos.append(v)
+            elif k in ("uri", "url") and isinstance(v, str) and v.startswith("http"):
+                urls.append(v)
+            else:
+                _textos_y_urls(v, textos, urls)
+    elif isinstance(obj, list):
+        for v in obj:
+            _textos_y_urls(v, textos, urls)
+
+
+def _json_en_texto(txt):
+    """Primer arreglo JSON que aparezca en el texto (el modelo a veces lo envuelve en ```json)."""
+    i = txt.find("[")
+    while i != -1:
+        for j in range(len(txt), i, -1):
+            if txt[j - 1] == "]":
+                try:
+                    v = json.loads(txt[i:j])
+                    if isinstance(v, list):
+                        return v
+                except ValueError:
+                    continue
+        i = txt.find("[", i + 1)
+    return []
+
+
+def gemini_qb(juegos, fuentes, ahora, estado):
+    """Pregunta a Gemini (con búsqueda de Google) el QB titular de cada equipo de esos juegos.
+    Devuelve {equipo: (gsis, nombre, url)}; {} si no hay llave, si se pasó el tope del día o si falla."""
+    import requests
+    if not GEMINI_LLAVE.exists():
+        return {}
+    modelo, tope = _gemini_cfg()
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    usado = estado.setdefault("gemini", {})
+    if usado.get(hoy, 0) >= tope:
+        log(f"Gemini: tope de {tope} consultas del día alcanzado; no consulto")
+        return {}
+    usado[hoy] = usado.get(hoy, 0) + 1
+    for k in [k for k in usado if k != hoy]:
+        usado.pop(k)
+    llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+    lista = "; ".join(f"{v} at {l} ({fecha_cc(ini)} Caracas time)" for v, l, ini in juegos)
+    pregunta = ("For each NFL team in these games, who will start at quarterback? Prefer the official inactive list, "
+                "the team's announcement or reliable beat reporters from the last 48 hours. Games: " + lista +
+                '. Answer ONLY a JSON array like [{"team": "SEA", "qb": "Full Name", "source": "https://..."}], one object per team, '
+                "using these exact team abbreviations.")
+    cab = {"x-goog-api-key": llave, "Content-Type": "application/json"}
+    intentos = [(f"{GEMINI_URL}/interactions", {"model": modelo, "input": pregunta, "tools": [{"type": "google_search"}]}),
+                (f"{GEMINI_URL}/models/{modelo}:generateContent",
+                 {"contents": [{"parts": [{"text": pregunta}]}], "tools": [{"google_search": {}}]})]
+    for url, cuerpo in intentos:
+        try:
+            r = requests.post(url, headers=cab, json=cuerpo, timeout=GEMINI_ESPERA_S)
+        except Exception as e:  # noqa: BLE001 — sin el texto (no debe salir nada de la llave)
+            log(f"Gemini: error de red ({type(e).__name__})")
+            return {}
+        if r.status_code in (400, 404) and "interactions" in url:
+            continue                                   # esa versión de la API no está: prueba generateContent
+        if r.status_code >= 300:
+            log(f"Gemini: respondió {r.status_code}")
+            return {}
+        textos, urls = [], []
+        _textos_y_urls(r.json(), textos, urls)
+        lista_json = _json_en_texto("\n".join(textos))
+        out = {}
+        por_nombre = {_norm(n): g for g, n in fuentes.nombre.items() if n}
+        for x in lista_json:
+            if not isinstance(x, dict):
+                continue
+            eq, nom = _texto(x.get("team")).upper(), _texto(x.get("qb"))
+            eq = DE_OTRAS.get(eq, eq)
+            gid = por_nombre.get(_norm(nom), "")
+            out[eq] = (gid, nom, _texto(x.get("source")) or (urls[0] if urls else ""))
+        log(f"Gemini ({modelo}): {len(out)} equipos respondidos, {len(set(urls))} fuentes citadas")
+        return out
+    return {}
+
+
+# --------------------------------------------------------------------------------------
 # Corrida (hacia adelante y retrospectiva)
 # --------------------------------------------------------------------------------------
 def preparar_contexto(g_all, g26):
@@ -817,7 +1144,39 @@ def sesgo_semanal(filas, previas):
                 f["sesgo_spread_semana"] = ss; f["sesgo_total_semana"] = st; f["bandera_sesgo"] = bandera
 
 
-def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None):
+def consenso_semana(gs, sem, tipo, ahora, estado):
+    """QB por consenso para los juegos de una semana (v5). Reemplaza qbl/qbv por el QB elegido, deja el estado del
+    consenso en fl/fv y registra cada voto (y el del agente en sombra en las corridas T−85)."""
+    import polars as pl
+    fq = FuentesQB(sem)
+    for a in fq.avisos:
+        log(f"AVISO fuentes del QB: {a}")
+    qbl, qbv, fl, fv, votos_log = [], [], [], [], []
+    for r in gs.iter_rows(named=True):
+        for eq, base, lq, lf in ((r["home_team"], r["qbl"], qbl, fl), (r["away_team"], r["qbv"], qbv, fv)):
+            votos, usado, est, det = fq.votar(eq, base)
+            lq.append(usado or ""); lf.append(det)
+            for fuente in FUENTES_VOTAN:
+                votos_log.append(dict(corrida_utc=iso(ahora), tipo=tipo, game_id=r["game_id"], semana=sem, equipo=eq,
+                                      fuente=fuente, qb_id=votos[fuente], qb_nombre=fq.nombre.get(votos[fuente], "")))
+            votos_log.append(dict(corrida_utc=iso(ahora), tipo=tipo, game_id=r["game_id"], semana=sem, equipo=eq,
+                                  fuente="consenso", qb_id=usado or "", qb_nombre=fq.nombre.get(usado, ""), nota=det))
+    if tipo == "t85" and estado is not None:
+        juegos = list(zip(gs["away_team"].to_list(), gs["home_team"].to_list(), gs["inicio"].to_list()))
+        for eq, (gid_qb, nom, url) in gemini_qb(juegos, fq, ahora, estado).items():
+            fila = next((r for r in gs.iter_rows(named=True) if eq in (r["home_team"], r["away_team"])), None)
+            if fila:
+                votos_log.append(dict(corrida_utc=iso(ahora), tipo=tipo, game_id=fila["game_id"], semana=sem, equipo=eq,
+                                      fuente="gemini", qb_id=gid_qb, qb_nombre=nom, nota=url[:200]))
+    anexar_fuentes(votos_log)
+    return gs.with_columns(pl.Series("qbl", qbl), pl.Series("qbv", qbv), pl.Series("fl", fl), pl.Series("fv", fv))
+
+
+def es_dudoso(f):
+    return any(str(f.get(k) or "").startswith("dudoso") for k in ("qb_local_fuente", "qb_visita_fuente"))
+
+
+def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, estado=None):
     """Corrida hacia adelante (la que cuenta para 31A y 29A): juegos que todavía no empiezan."""
     import polars as pl
     ctx = ctx or preparar_contexto(g_all, g26)
@@ -829,6 +1188,7 @@ def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None):
         filas = []
         for sem, gs in jg.group_by("week", maintain_order=True):
             sem = int(sem[0] if isinstance(sem, tuple) else sem)
+            gs = consenso_semana(gs, sem, tipo, ahora, estado)
             mg, tt, F = simular_semana(ctx, gs, sem, args.n_sims)
             pin = lineas_bot(args.bot_dir, "pinnacle", gs["game_id"].to_list(), ahora, MAX_EDAD_PIN_H)
             bo = lineas_bot(args.bot_dir, "betonlineag", gs["game_id"].to_list(), ahora, MAX_EDAD_BO_H)
@@ -873,7 +1233,9 @@ def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None):
         sesgo_semanal(filas, list(leer_registro().iter_rows(named=True)))
         for f in filas:
             if f.get("sel_ml") or f.get("sel_sp"):
-                if f.get("marcado_spread") or f.get("marcado_total"):
+                if es_dudoso(f):
+                    f["sel_estado"] = "excluida: QB dudoso"
+                elif f.get("marcado_spread") or f.get("marcado_total"):
                     f["sel_estado"] = "excluida: filtro"
                 elif f.get("bandera_sesgo"):
                     f["sel_estado"] = "excluida: sesgo de la semana"
@@ -983,7 +1345,8 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
     hoja.escribir(f"'{t}'!A1:C1", [[f"Semana {semana} · NFL {TEMPORADA}", "",
                                     f"motor s2-v1 en modo registro (sin validar) · actualizado {fecha_cc(ahora)} (Caracas) · "
                                     f"líneas en convención de la casa: DAL -3.5 = DAL favorito por 3,5" + nota]])
-    hoja.escribir(f"'{t}'!A3:C3", [["Resumen", "", resumen_txt(cierres, jg.height)]])
+    conf = confiabilidad_txt(confiabilidad_qb(g26, semana))
+    hoja.escribir(f"'{t}'!A3:C3", [["Resumen", "", resumen_txt(cierres, jg.height) + (" " + conf + "." if conf else "")]])
 
 
 def escribir_semanas(hoja, g26, semanas, nombres_qb, ahora, estado):
@@ -1009,19 +1372,20 @@ def texto_telegram(resumenes):
         sems = sorted({f["semana"] for f in filas})
         lin.append(f"MOTOR s2-v1 · {nombre} · semana {', '.join(map(str, sems))} · {len(filas)} juegos · sin validar (H29)")
         for f in filas:
-            marca = "🔴 " if (f.get("marcado_spread") or f.get("marcado_total")) else ("🟢 " if f.get("sel_estado") == "candidata" else "")
+            marca = "🔴 " if (f.get("marcado_spread") or f.get("marcado_total") or es_dudoso(f)) else ("🟢 " if f.get("sel_estado") == "candidata" else "")
             extra = [x for x in (senal_ml_txt(f), senal_sp_txt(f)) if x]
             w = wong_txt(f)
             lin.append(f"{marca}{f['visita']} @ {f['local']}: mercado {linea_txt(f['local'], f['visita'], f.get('spread_ref')) or '—'}"
                        f"{'*' if f.get('ref_spread') == 'nflverse' else ''} · modelo {linea_txt(f['local'], f['visita'], f['spread_modelo'])}"
                        f" · total {f['total']:.1f} (cons. {f.get('nfl_total_line')})"
                        + (f" · {'; '.join(extra)} [{f.get('sel_estado')}]" if extra else "")
-                       + (f" · 🔵 Wong {w}" if w else ""))
+                       + (f" · 🔵 Wong {w}" if w else "")
+                       + (" · QB dudoso" if es_dudoso(f) else ""))
         bs = [f for f in filas if f.get("bandera_sesgo")]
         if bs:
             lin.append(f"⚠️ Revisión de sesgo de la semana: spread {bs[0].get('sesgo_spread_semana')} / total {bs[0].get('sesgo_total_semana')}")
         lin += [f"Aviso: {a}" for a in avisos]
-        lin.append("* = consenso de nflverse (no hay Pinnacle de ≤ 3 h). 🔴 revisar (modelo y mercado muy distintos) · 🟢 candidata del modelo · 🔵 pata Wong.")
+        lin.append("* = consenso de nflverse (no hay Pinnacle de ≤ 3 h). 🔴 revisar (modelo y mercado muy distintos, o QB dudoso) · 🟢 candidata del modelo · 🔵 pata Wong.")
         lin.append("")
     return "\n".join(lin).strip()
 
@@ -1034,6 +1398,34 @@ def texto_retro(filas, g26):
         cc = [cierre_de(info[f["game_id"]], f) for f in filas if f["semana"] == sem and f["game_id"] in info]
         lin.append(f"Semana {sem}: " + resumen_txt(cc, len(cc)).split(". Error =")[0])
     lin.append("Detalle por juego en la hoja (pestañas en gris).")
+    return "\n".join(lin)
+
+
+def texto_qb(g26, ahora, semana=None):
+    """QB titular de cada juego pendiente de la semana según cada fuente, el consenso y la confiabilidad acumulada."""
+    import polars as pl
+    sem = semana or semana_actual(g26, ahora)
+    if sem is None:
+        return "No hay juegos pendientes en el calendario."
+    jg = g26.filter((pl.col("week") == sem) & (pl.col("inicio") > ahora)).sort(["inicio", "game_id"])
+    fq = FuentesQB(sem)
+    nom = lambda g: fq.nombre.get(g, g) or "—"  # noqa: E731
+    lin = [f"QB titular · semana {sem} · visitante @ local · [acuerdo de nflverse, ESPN y Sleeper]"]
+    dudas = []
+    for r in jg.iter_rows(named=True):
+        partes = []
+        for eq, base in ((r["away_team"], _texto(r.get("away_qb_id"))), (r["home_team"], _texto(r.get("home_qb_id")))):
+            votos, usado, est, det = fq.votar(eq, base)
+            partes.append(f"{nom(usado)} [{est}]")
+            if est == "dudoso" or "difiere" in det:
+                dudas.append(f"  {eq}: {det}")
+        lin.append(f"{fecha_cc(r['inicio'])} {r['away_team']} @ {r['home_team']}: {partes[0]} @ {partes[1]}")
+    if dudas:
+        lin.append("Desacuerdos:")
+        lin += dudas
+    lin += [f"Aviso: {a}" for a in fq.avisos]
+    conf = confiabilidad_txt(confiabilidad_qb(g26))
+    lin.append(conf + " (acumulado; mide contra el QB que jugó)" if conf else "Confiabilidad: todavía sin juegos cerrados con votos registrados.")
     return "\n".join(lin)
 
 
@@ -1058,7 +1450,7 @@ def semanas_con_datos(g26):
 # --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "hoja-prueba"])
+    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba"])
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
     ap.add_argument("--tipo", default="manual")
@@ -1138,6 +1530,10 @@ def main():
                       f"{' (ya corrió)' if iso(ini) in estado['grupos'] else ''}")
         return
 
+    if args.modo == "qb":
+        print(texto_qb(g26, ahora, args.semana))
+        return
+
     if args.modo == "hoja":
         if hoja is None:
             print("Hoja: no configurada (falta semana.ini o la credencial) o no se pudo abrir.")
@@ -1182,7 +1578,7 @@ def main():
 
     log(f"{VERSION_SEMANA}: corre {[(t, c, len(i)) for t, c, i in lista]}")
     g_all, g26 = calendario(0.25)                    # calendario fresco (QB titulares y líneas) antes de proyectar
-    resumenes, nombres_qb = correr(lista, g_all, g26, args, ahora)
+    resumenes, nombres_qb = correr(lista, g_all, g26, args, ahora, estado=estado)
     for tipo, clave, ids in lista:
         if tipo in ("miercoles", "sabado"):
             estado["fijas"][clave] = iso(ahora)

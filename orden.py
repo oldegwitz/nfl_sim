@@ -10,7 +10,7 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /hoja    → rehace las pestañas desde el registro, sin simular (semana.py hoja)
   /retro   → rehace la retrospectiva de los juegos ya jugados (semana.py retro)
   /estado  → qué toca y cuándo (semana.py estado)
-  /qb      → QB titular de cada juego de la semana según nflverse
+  /qb      → QB titular de cada juego por fuente (nflverse, ESPN, Sleeper), consenso y confiabilidad (semana.py qb)
   /ayuda   → esta lista
 
 Las corridas pedidas por Telegram se registran (tipo "telegram") y actualizan la hoja, pero NO son la proyección
@@ -21,7 +21,6 @@ registran solo por su tipo, porque el texto de una excepción puede traer la URL
 Lo arranca el servicio nfl-sim-orden (instalar_orden.sh).
 """
 import configparser
-import csv
 import re
 import datetime as dt
 import subprocess
@@ -30,7 +29,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v1 (2-oct-2026)"
+VERSION = "orden-v2 (2-oct-2026)"   # v2: /qb muestra el consenso de fuentes (semana.py qb, decisión 32)
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -44,13 +43,14 @@ ORDENES = {
     "/hoja": (["hoja"], "Rehago las pestañas desde el registro, sin simular (segundos)."),
     "/retro": (["retro"], "Rehago la retrospectiva de los juegos ya jugados (≈1 min)."),
     "/estado": (["estado"], None),
+    "/qb": (["qb"], None),
 }
 AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/correr — proyecta ahora y actualiza la hoja\n"
          "/hoja — rehace las pestañas (sin simular)\n"
          "/retro — rehace la retrospectiva\n"
          "/estado — qué toca y cuándo\n"
-         "/qb — QB titular de cada juego de la semana\n"
+         "/qb — QB de cada juego por fuente y su confiabilidad\n"
          "/ayuda — esta lista\n"
          "Las corridas pedidas aquí se registran pero no cuentan para 31A ni para el CLV.")
 
@@ -104,36 +104,7 @@ def correr_semana(args):
     lineas = [re.sub(r"^\[[^\]]*UTC\] ", "", x) for x in salida.splitlines() if x.strip()]   # sin la hora del log
     if codigo != 0:
         lineas = [x for x in lineas if "Error" in x or "error" in x or "Traceback" in x or x.startswith("  ")][-8:] or lineas[-8:]
-    return codigo, "\n".join(lineas[-15:])
-
-
-def qb_semana():
-    """QB titular de cada juego de la semana en curso, según el calendario de nflverse ya descargado."""
-    ruta = BASE / "datos" / "games.csv"
-    if not ruta.exists():
-        return "No encuentro datos/games.csv (todavía no corrió semana.py)."
-    ahora = dt.datetime.now(dt.timezone.utc)
-    filas = []
-    with open(ruta, encoding="utf-8") as fh:
-        for r in csv.DictReader(fh):
-            if r.get("season") != "2026" or r.get("result") not in ("", None):
-                continue
-            try:
-                h, m = (int(x) for x in r["gametime"].split(":")[:2])
-                y, mo, d = (int(x) for x in r["gameday"].split("-"))
-                ini = dt.datetime(y, mo, d, h, m, tzinfo=ZoneInfo("America/New_York"))
-            except (ValueError, KeyError):
-                continue
-            if ini.astimezone(dt.timezone.utc) > ahora:
-                filas.append((int(r["week"]), ini, r))
-    if not filas:
-        return "No hay juegos pendientes en el calendario."
-    sem = min(f[0] for f in filas)
-    txt = [f"QB titular según nflverse · semana {sem} (visitante @ local)"]
-    for _, ini, r in sorted([f for f in filas if f[0] == sem], key=lambda f: (f[1], f[2]["game_id"])):
-        c = ini.astimezone(CARACAS)
-        txt.append(f"{DIAS[c.weekday()]} {c:%H:%M} {r['away_team']} @ {r['home_team']}: {r.get('away_qb_name') or '¿?'} @ {r.get('home_qb_name') or '¿?'}")
-    return "\n".join(txt)
+    return codigo, "\n".join(lineas if args and args[0] in ("qb", "estado") else lineas[-15:])
 
 
 def main():
@@ -169,8 +140,6 @@ def main():
             log(f"orden: {texto}")
             if texto in ("/ayuda", "/start", "/help"):
                 tg.enviar(chat, AYUDA)
-            elif texto == "/qb":
-                tg.enviar(chat, qb_semana())
             elif texto in ORDENES:
                 args, aviso = ORDENES[texto]
                 if aviso:
@@ -178,7 +147,7 @@ def main():
                 t0 = time.time()
                 codigo, salida = correr_semana(args)
                 estado = "listo" if codigo == 0 else "falló"
-                tg.enviar(chat, f"{texto} {estado} en {time.time() - t0:.0f} s.\n{salida}")
+                tg.enviar(chat, salida if (texto in ("/qb", "/estado") and codigo == 0) else f"{texto} {estado} en {time.time() - t0:.0f} s.\n{salida}")
                 log(f"orden {texto}: {estado} ({codigo})")
             else:
                 tg.enviar(chat, "No conozco esa orden.\n" + AYUDA)
