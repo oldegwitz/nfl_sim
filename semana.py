@@ -27,7 +27,7 @@ Uso
   venv/bin/python semana.py auto                          (lo usa el temporizador)
   venv/bin/python semana.py estado                        (qué toca y cuándo; no corre nada)
   venv/bin/python semana.py correr [--semana N] [--juegos ID,ID] [--tipo manual]
-  venv/bin/python semana.py hoja-prueba                   (prueba la conexión con la hoja)
+  venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña de prueba)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
 Solo lee ~/nfl_ev (líneas del bot y config.ini para Telegram); escribe solo en ~/nfl_sim y en la hoja.
@@ -45,7 +45,10 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v2 (1-oct-2026)"
+VERSION_SEMANA = "semana-v3 (2-oct-2026)"
+# v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
+#     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
+#     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -263,7 +266,11 @@ class Hoja:
 
     def _ok(self, r):
         if r.status_code >= 300:
-            raise RuntimeError(f"Sheets respondió {r.status_code}")
+            try:
+                msg = str(r.json().get("error", {}).get("message", ""))
+            except ValueError:
+                msg = ""
+            raise RuntimeError(f"Sheets respondió {r.status_code}" + (f": {msg[:240]}" if msg else ""))
         return r.json() if r.content else {}
 
     def pestanas(self):
@@ -323,9 +330,15 @@ def _rango(sid, f0, f1, c0, c1):
     return {"sheetId": sid, "startRowIndex": f0, "endRowIndex": f1, "startColumnIndex": c0, "endColumnIndex": c1}
 
 
-def crear_pestana(hoja, sem):
-    """Crea la pestaña 'Semana N' (primera a la izquierda) con encabezado, leyenda de colores y formatos."""
-    sid = 1000 + sem
+TITULO_PRUEBA, SID_PRUEBA = "Prueba (se borra sola)", 1999     # pestaña temporal de 'hoja-prueba'
+
+
+def crear_pestana(hoja, sem, titulo=None, sid=None):
+    """Crea la pestaña 'Semana N' (primera a la izquierda) con encabezado, leyenda de colores y formatos.
+    Columnas A-B inmovilizadas (inicio y juego): ninguna celda combinada cruza ese borde, porque Sheets
+    rechaza toda la tanda con 400 ("no puedes combinar columnas inmovilizadas con columnas móviles")."""
+    sid = 1000 + sem if sid is None else sid
+    t = titulo or pestana(sem)
     fondo = lambda r, color: {"repeatCell": {"range": r, "cell": {"userEnteredFormat": {"backgroundColorStyle": {"rgbColor": _rgb(color)}}},  # noqa: E731
                                              "fields": "userEnteredFormat.backgroundColorStyle"}}
     regla = lambda rangos, formula, color, negrita=False, idx=0: {"addConditionalFormatRule": {"index": idx, "rule": {  # noqa: E731
@@ -334,22 +347,27 @@ def crear_pestana(hoja, sem):
     ancho = lambda c0, c1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c1},  # noqa: E731
                                                               "properties": {"pixelSize": px}, "fields": "pixelSize"}}
     juegos = _rango(sid, 4, FILAS_MAX, 0, 13)
+    combinar = lambda c0, c1, f=0: {"mergeCells": {"range": _rango(sid, f, f + 1, c0, c1), "mergeType": "MERGE_ALL"}}  # noqa: E731
     pedidos = [
-        {"addSheet": {"properties": {"sheetId": sid, "title": pestana(sem), "index": 0,
+        {"addSheet": {"properties": {"sheetId": sid, "title": t, "index": 0,
                                      "gridProperties": {"rowCount": FILAS_MAX, "columnCount": 19, "frozenRowCount": 4, "frozenColumnCount": 2}}}},
-        {"mergeCells": {"range": _rango(sid, 0, 1, 0, 19), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": _rango(sid, 1, 2, 0, 5), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": _rango(sid, 1, 2, 5, 9), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": _rango(sid, 1, 2, 9, 13), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": _rango(sid, 1, 2, 13, 19), "mergeType": "MERGE_ALL"}},
-        {"repeatCell": {"range": _rango(sid, 0, 1, 0, 19), "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13}}},
+        # fila 1: A-B (inmovilizadas) "Semana N · NFL 2026" | C-S detalle de la corrida
+        combinar(0, 2, 0), combinar(2, 19, 0),
+        # fila 2: A-B rótulo | C-F verde | G-J azul | K-N rojo | O-S amarillo  (ninguna cruza el borde B|C)
+        combinar(0, 2, 1), combinar(2, 6, 1), combinar(6, 10, 1), combinar(10, 14, 1), combinar(14, 19, 1),
+        {"repeatCell": {"range": _rango(sid, 0, 1, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13}}},
                         "fields": "userEnteredFormat.textFormat"}},
-        fondo(_rango(sid, 1, 2, 0, 5), COLORES["verde"]), fondo(_rango(sid, 1, 2, 5, 9), COLORES["azul"]),
-        fondo(_rango(sid, 1, 2, 9, 13), COLORES["rojo"]), fondo(_rango(sid, 1, 2, 13, 19), COLORES["amarillo"]),
+        {"repeatCell": {"range": _rango(sid, 0, 1, 2, 19), "cell": {"userEnteredFormat": {"textFormat": {
+            "fontSize": 9, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}, "verticalAlignment": "MIDDLE"}},
+            "fields": "userEnteredFormat.textFormat,userEnteredFormat.verticalAlignment"}},
+        {"repeatCell": {"range": _rango(sid, 1, 2, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat"}},
+        fondo(_rango(sid, 1, 2, 2, 6), COLORES["verde"]), fondo(_rango(sid, 1, 2, 6, 10), COLORES["azul"]),
+        fondo(_rango(sid, 1, 2, 10, 14), COLORES["rojo"]), fondo(_rango(sid, 1, 2, 14, 19), COLORES["amarillo"]),
         {"repeatCell": {"range": _rango(sid, 1, 2, 0, 19), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
                         "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
         {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 1, "endIndex": 2},
-                                       "properties": {"pixelSize": 48}, "fields": "pixelSize"}},
+                                       "properties": {"pixelSize": 64}, "fields": "pixelSize"}},
         {"repeatCell": {"range": _rango(sid, 3, 4, 0, 19), "cell": {"userEnteredFormat": {
             "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
             "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
@@ -367,9 +385,9 @@ def crear_pestana(hoja, sem):
         regla([_rango(sid, 4, FILAS_MAX, 9, 11)], '=AND(LEN(J5)>0,LEFT($M5,9)="candidata")', COLORES["verde"], True, 3),
     ]
     hoja.lote(pedidos)
-    t = pestana(sem)
-    hoja.escribir(f"'{t}'!A2", [["Verde: candidata del modelo (sin validar, H29: el cierre le gana por 0,4 pts). Verde fuerte = con tu OK. Solo monto mínimo.",
-                                 "", "", "", "",
+    hoja.escribir(f"'{t}'!A2", [["Colores", "",
+                                 "Verde: candidata del modelo (sin validar, H29: el cierre le gana por 0,4 pts). Verde fuerte = con tu OK. Solo monto mínimo.",
+                                 "", "", "",
                                  "Azul: pata Wong para teaser de 6 pts (underdog +1,5 a +2,5 en BetOnline, total < 50). Es lo único con valor medido (H28).",
                                  "", "", "",
                                  "Rojo: el modelo y el mercado difieren mucho. En ese juego no se usa el modelo.",
@@ -755,9 +773,10 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
     if n:
         hoja.escribir(f"'{t}'!A5:M{4 + n}", [["" if c is None else c for c in f] for f in bloque])
         hoja.escribir(f"'{t}'!Q5:S{4 + n}", [["" if c is None else c for c in f] for f in cola])
-    hoja.escribir(f"'{t}'!A1", [[f"Semana {semana} · NFL {TEMPORADA} · motor s2-v1 en modo registro (sin validar) · "
-                                 f"actualizado {fecha_cc(ahora)} (Caracas) · líneas en convención de la casa: DAL -3.5 = DAL favorito por 3,5"
-                                 + (" · semana informativa, fuera de 31A" if semana < SEMANA_31A else "")]])
+    hoja.escribir(f"'{t}'!A1:C1", [[f"Semana {semana} · NFL {TEMPORADA}", "",
+                                    f"motor s2-v1 en modo registro (sin validar) · actualizado {fecha_cc(ahora)} (Caracas) · "
+                                    f"líneas en convención de la casa: DAL -3.5 = DAL favorito por 3,5"
+                                    + (" · semana informativa, fuera de 31A" if semana < SEMANA_31A else "")]])
 
 
 def texto_telegram(resumenes):
@@ -831,6 +850,18 @@ def main():
                 print(f"Hoja: no se pudo conectar ({type(e).__name__}). Revisa la llave JSON y que la API de Google Sheets esté habilitada.")
             return
         print(f"Hoja OK: pestañas {list(ps)}")
+        # escritura real con el mismo formato que las pestañas semanales: crea una pestaña de prueba y la borra
+        try:
+            viejas = [i for nombre, i in ps.items() if nombre == TITULO_PRUEBA or i == SID_PRUEBA]
+            if viejas:
+                hoja.lote([{"deleteSheet": {"sheetId": i}} for i in viejas])
+            crear_pestana(hoja, 0, TITULO_PRUEBA, SID_PRUEBA)
+            hoja.escribir(f"'{TITULO_PRUEBA}'!A5:B5", [["dom 04-oct 13:00", "PRUEBA @ PRUEBA"]])
+            hoja.lote([{"deleteSheet": {"sheetId": SID_PRUEBA}}])
+        except Exception as e:  # noqa: BLE001
+            print(f"Hoja: conecta, pero falló la pestaña de prueba ({type(e).__name__}: {str(e)[:300]})")
+            return
+        print("Hoja OK: pestaña de prueba con el formato semanal creada, escrita y borrada")
         return
 
     ajustes, hoja_ok = {}, False
@@ -900,7 +931,7 @@ def main():
                 actualizar_hoja(hoja, g26, s_, nombres_qb, ahora)
                 log(f"hoja: pestaña {pestana(s_)} actualizada")
             except Exception as e:  # noqa: BLE001
-                log(f"Hoja: error al escribir la pestaña {pestana(s_)} ({type(e).__name__}: {str(e)[:80]})")
+                log(f"Hoja: error al escribir la pestaña {pestana(s_)} ({type(e).__name__}: {str(e)[:300]})")
     if resumenes and not args.sin_telegram:
         sys.path.insert(0, str(BASE))
         import sprint2 as s2
