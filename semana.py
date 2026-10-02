@@ -59,7 +59,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v6.1 (2-oct-2026)"
+VERSION_SEMANA = "semana-v6.2 (2-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -77,6 +77,11 @@ VERSION_SEMANA = "semana-v6.1 (2-oct-2026)"
 #     Gemini se cuenta solo con sus votos T−85 y por versión (g0 = v5, g1...). La proyección es idéntica a la de v5.
 # v6.1 (2-oct): el formato de salida va como enum, como exige generateContent: responseFormat.text.mimeType =
 #     "APPLICATION_JSON" (v6 mandaba "application/json" y Google respondía 400 en el primer piloto). Cambia la huella.
+# v6.2 (2-oct, decisión de Ozz tras el diagnóstico): con 3.5 Flash-Lite la respuesta no trae groundingMetadata, pero las
+#     fuentes vienen como enlaces grounding-api-redirect, que solo produce la búsqueda de Google. Nueva columna
+#     'evidencia_busqueda' (metadatos | enlace | ninguna) y P2 del piloto = evidencia de búsqueda en el 100 % de las que
+#     respondieron. Solo cambia la medición: lo que se envía y cómo se leen los QB no cambian (huella igual que v6.1).
+#     gemini_llamadas.csv con columnas viejas se guarda aparte (gemini_llamadas_hasta_v61.csv) y se empieza uno nuevo.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -947,7 +952,7 @@ PRECIO_BUSQUEDA = 0.014                            # USD por búsqueda, solo des
 GEMINI_LLAMADAS = SAL / "gemini_llamadas.csv"
 CAMPOS_GEM = ["corrida_utc", "tipo", "agente", "huella", "modelo", "model_version", "game_id", "semana", "visita", "local",
               "estado", "http", "latencia_s", "tok_entrada", "tok_herramienta", "tok_salida", "tok_razonamiento",
-              "busquedas", "consultas_busqueda", "dominios", "costo_usd", "qb_visita", "conf_visita", "url_visita",
+              "busquedas", "consultas_busqueda", "dominios", "evidencia_busqueda", "costo_usd", "qb_visita", "conf_visita", "url_visita",
               "fecha_visita", "url_visita_verificada", "qb_local", "conf_local", "url_local", "fecha_local",
               "url_local_verificada", "fin", "detalle"]
 EQUIPOS = {"ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens", "BUF": "Buffalo Bills",
@@ -981,6 +986,7 @@ GEMINI_VARIANTES = {                               # g1 = la decidida; las otras
     "g1-high": {"nivel": "high", "esquema": True},     # si falla P2 (se prueba una sola vez)
 }
 CONFIANZAS = ("high", "medium", "low")
+PREFIJO_BUSQUEDA = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"   # enlaces que solo crea la búsqueda de Google
 
 
 def gemini_esquema(visita, local):
@@ -1108,6 +1114,7 @@ def gemini_leer(datos, j):
         if d and d not in dominios:
             dominios.append(d)
     out["dominios"] = " ".join(dominios)[:400]
+    meta_con_contenido = bool(consultas or (gm.get("groundingChunks") or []) or gm.get("searchEntryPoint"))
     partes = ((cand.get("content") or {}).get("parts")) or []
     texto = "".join(p.get("text", "") for p in partes if isinstance(p, dict) and not p.get("thought"))
     obj = _objeto_json(texto)
@@ -1127,6 +1134,15 @@ def gemini_leer(datos, j):
                                fecha=_texto(x.get("source_date"))[:10],
                                verificada=int(bool(dom) and any(dom == d or dom.endswith("." + d) or d.endswith("." + dom) for d in dominios)))
     out["equipos"] = equipos
+    # P2 (v6.2, registrado el 2-oct antes del piloto 3): (a) groundingMetadata con contenido, o (b) enlace de búsqueda
+    # de Google (grounding-api-redirect) como fuente de los DOS equipos pedidos
+    url_completa = {}                                # equipo → source_url sin recortar
+    for x in (obj.get("teams") if obj and isinstance(obj.get("teams"), list) else []):
+        if isinstance(x, dict):
+            eq = DE_OTRAS.get(_texto(x.get("team")).upper(), _texto(x.get("team")).upper())
+            url_completa.setdefault(eq, _texto(x.get("source_url")))
+    con_enlace = all(url_completa.get(eq, "").startswith(PREFIJO_BUSQUEDA) for eq in (j["visita"], j["local"]))
+    out["evidencia_busqueda"] = "metadatos" if meta_con_contenido else "enlace" if con_enlace else "ninguna"
     if obj is None:
         out["estado"], out["detalle"] = "respuesta inválida", ("sin texto" if not texto else "no es JSON: " + texto[:150])
     elif len(equipos) == 2:
@@ -1219,6 +1235,15 @@ def gemini_tanda(juegos, ahora, estado, tipo, variante=None):
                       f"fecha_{lado}": e.get("fecha", ""), f"url_{lado}_verificada": e.get("verificada", "")})
         filas.append(f)
     SAL.mkdir(parents=True, exist_ok=True)
+    if GEMINI_LLAMADAS.exists():                     # v6.2: columnas nuevas → el archivo viejo se guarda aparte, no se mezcla
+        with open(GEMINI_LLAMADAS, encoding="utf-8") as fh:
+            encabezado = fh.readline().strip().split(",")
+        if encabezado != CAMPOS_GEM:
+            viejo = GEMINI_LLAMADAS.with_name("gemini_llamadas_hasta_v61.csv")
+            if viejo.exists():
+                viejo = GEMINI_LLAMADAS.with_name(f"gemini_llamadas_previo_{int(time.time())}.csv")
+            GEMINI_LLAMADAS.rename(viejo)
+            log(f"Gemini: el registro de llamadas tenía otras columnas; lo guardé como {viejo.name}")
     nuevo = not GEMINI_LLAMADAS.exists()
     with open(GEMINI_LLAMADAS, "a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CAMPOS_GEM)
@@ -1297,7 +1322,7 @@ def gemini_piloto(g26, ahora, estado, variante=None):
         return "Piloto: no se hizo ninguna consulta."
     resp = [x for x in salida if x.get("http") == 200]
     ok = [x for x in salida if x["estado"] == "ok"]
-    con_busq = [x for x in resp if (x.get("busquedas") or 0) >= 1]
+    con_busq = [x for x in resp if x.get("evidencia_busqueda") in ("metadatos", "enlace")]
     lat = [x.get("latencia_s") or 0.0 for x in salida]
     costos = [x.get("costo_usd") or 0.0 for x in resp]
     c_medio = sum(costos) / len(costos) if costos else None
@@ -1311,7 +1336,9 @@ def gemini_piloto(g26, ahora, estado, variante=None):
            + (f" · versión devuelta: {', '.join(mv)}" if mv else ""),
            f"Semana {sem}: {n} consultas (juegos pendientes) en una tanda de {dur:.0f} s · tipo 'prueba': no cuenta para el piso",
            f"P1 JSON válido con los dos equipos: {len(ok)}/{n} ({100 * len(ok) / n:.0f} %) · pasa si ≥ 90 % {si(p1)}",
-           f"P2 al menos una búsqueda (de las que respondieron): {len(con_busq)}/{len(resp)} · pasa si 100 % {si(p2)}",
+           f"P2 con evidencia de búsqueda (de las que respondieron): {len(con_busq)}/{len(resp)} · pasa si 100 % {si(p2)} "
+           f"[metadatos {sum(1 for x in resp if x.get('evidencia_busqueda') == 'metadatos')} · enlace de búsqueda en los dos equipos "
+           f"{sum(1 for x in resp if x.get('evidencia_busqueda') == 'enlace')}]",
            f"P3 tanda {dur:.0f} s (≤ 60) y la más lenta {max(lat):.0f} s (< 90) {si(p3)}",
            (f"P4 costo medio USD {c_medio:.4f} por consulta (máx {max(costos):.4f}) · pasa si ≤ 0,02 {si(p4)}"
             if c_medio is not None else f"P4 sin consultas respondidas {si(False)}")]
