@@ -16,6 +16,10 @@ Qué hace en cada corrida
      SIN DINERO por el motor: las selecciones no están validadas (H29).
   7. Guarda todo en salidas/semana/proyecciones_2026.csv (nada se recalcula después), escribe la pestaña
      "Semana N" de la hoja de Google (una por semana, con colores) y manda un resumen por Telegram.
+  7b. (v7) En las corridas que cuentan (miércoles, sábado, T−85) arma el "Boleto (informativo)" de los juegos del
+     domingo y el lunes: lado = favorito de Pinnacle sin vig (el modelo solo deja una marca), precios de BetOnline,
+     P(cobrar), EV y costo esperado de tres boletos (solo ML, mixto, teaser Wong) y la tabla de 3 a 8 patas. Se
+     congela al empezar el primer juego del domingo; después de los juegos agrega el EV contra el cierre y el resultado.
   8. Cuando nflverse publica un resultado, completa solo las columnas de cierre de esa semana (marcador, error
      del modelo contra el del cierre, si cubrió el lado del modelo, total real, pata Wong +6) y la fila resumen.
   La hoja es de solo lectura: Ozz no escribe nada (sin columnas manuales desde v4). El QB titular sale del consenso
@@ -40,7 +44,8 @@ Uso
   venv/bin/python semana.py hoja [--semana N]             (rehace las pestañas desde el registro, sin simular)
   venv/bin/python semana.py qb                            (QB de cada juego por fuente y confiabilidad de cada fuente)
   venv/bin/python semana.py gemini-piloto [--variante g1] (piloto del agente Gemini: P1-P4; no cuenta para el piso)
-  venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña de prueba)
+  venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña semanal y
+                                                           un boleto de prueba con el formato real)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
 Solo lee ~/nfl_ev (líneas del bot y config.ini para Telegram); escribe solo en ~/nfl_sim y en la hoja.
@@ -54,12 +59,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v6.2 (2-oct-2026)"
+VERSION_SEMANA = "semana-v7 (3-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -82,6 +88,19 @@ VERSION_SEMANA = "semana-v6.2 (2-oct-2026)"
 #     'evidencia_busqueda' (metadatos | enlace | ninguna) y P2 del piloto = evidencia de búsqueda en el 100 % de las que
 #     respondieron. Solo cambia la medición: lo que se envía y cómo se leen los QB no cambian (huella igual que v6.1).
 #     gemini_llamadas.csv con columnas viejas se guarda aparte (gemini_llamadas_hasta_v61.csv) y se empieza uno nuevo.
+# v7 (2-oct, siete ajustes de la hoja pedidos por Ozz; solo presentación y registro descriptivo: el modelo s2-v1, la
+#     simulación, la regla 29A y el agente Gemini no cambian; la proyección es idéntica a v6.2):
+#     (1) celdas de señal sin señal → "retro (n/a)", "sin señal" o "sin Pinnacle 3 h"; (2) en juegos excluidos la señal
+#     se ve como "excluida · …"; (3) "REVISAR: …" → "Fuera: …" (desde 32b no hay revisión manual); (4) columna nueva
+#     "Por qué difiere": piezas del número del modelo (fuerza de pase, de corrida, ajuste por QB, localía) y movimiento
+#     de Pinnacle desde la primera foto del bot; (5) leyenda del verde corregida: ningún dinero por el motor (31A);
+#     (6) señal en palabras ("MIA ML: modelo 20 % · precio 16 %"; "MIA +11.0: cubre 55 % (necesita 52,4 %)");
+#     (7) pestaña "Boleto (informativo)". El registro suma 8 columnas al final (precio del spread de BetOnline, piezas
+#     del modelo y apertura de Pinnacle); el archivo anterior se guarda intacto en proyecciones_2026_antes_v7.csv.
+#     (8, pedido de Ozz el 2-oct, antes de instalar v7) récord de cada equipo junto a su nombre en "Juego" y, debajo de
+#     los juegos de cada "Semana N", el bloque de los 32 equipos ordenados por récord con lo que pasó ANTES de esa
+#     semana: récord, ganados esperados por el mercado, ATS contra el cierre, QB del último juego, puntos a favor y en
+#     contra, rival de esta semana y la semana pasada. Sale solo de nflverse (descriptivo; no toca el modelo).
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -109,7 +128,12 @@ FILTRO_SPREAD, FILTRO_TOTAL = 3.5, 5.0
 SESGO_SPREAD, SESGO_TOTAL = 1.0, 1.5
 UMBRAL_ML, UMBRAL_SP = 0.03, 0.53  # 29A
 WONG_LINEAS, WONG_TOTAL_MAX = (1.5, 2.0, 2.5), 50.0   # H26/H28
-FILAS_MAX = 40                     # filas por pestaña semanal (encabezado en la 4, juegos desde la 5)
+FILAS_MAX = 60                     # filas por pestaña semanal (v7: encabezado en la 4, juegos 5-24, equipos 26-59)
+JUEGOS_MAX = 20                    # filas de juegos de cada semana (5 a 24)
+FILA_EQUIPOS = 26                  # v7, ajuste 8: título del bloque de equipos (encabezado en la 27, equipos desde la 28)
+ENCAB_EQUIPOS = ["Equipo", "Récord", "Esperados (mercado)", "ATS (vs cierre)", "QB del último juego",
+                 "Puntos a favor / en contra", "Esta semana", "Semana pasada"]
+BE_ESTANDAR = -110                 # precio para "necesita X %" cuando BetOnline no tiene la línea de Pinnacle
 
 CAMPOS = ["corrida_utc", "tipo", "version", "game_id", "semana", "game_type", "inicio_utc", "local", "visita",
           "qb_local_id", "qb_visita_id", "qb_local_fuente", "qb_visita_fuente", "margen", "mediana", "total",
@@ -119,7 +143,13 @@ CAMPOS = ["corrida_utc", "tipo", "version", "game_id", "semana", "game_type", "i
           "bo_ml_visit", "nfl_spread_line", "nfl_total_line", "ref_spread", "spread_modelo", "spread_ref",
           "dif_spread", "dif_total", "marcado_spread", "marcado_total", "sesgo_spread_semana", "sesgo_total_semana",
           "bandera_sesgo", "p_cubre_local", "p_push", "sel_ml", "sel_ml_ventaja", "sel_sp", "sel_sp_prob",
-          "sel_estado", "wong", "wong_linea"]
+          "sel_estado", "wong", "wong_linea",
+          # v7 (al final, para no mover las columnas anteriores): precio del spread de BetOnline; piezas del margen del
+          # modelo en puntos a favor del local (respuesta lineal del simulador, RESP de s2-v1: descriptivo); primera foto
+          # de Pinnacle del juego en el log del bot ("apertura" que vio el bot)
+          "bo_cuota_sp_local", "bo_cuota_sp_visit", "comp_pase_pts", "comp_corrida_pts", "comp_qb_pts",
+          "comp_localia_pts", "pin_ap_ts", "pin_ap_hcp_local"]
+REGISTRO_ANTES_V7 = SAL / "proyecciones_2026_antes_v7.csv"   # copia intacta del registro con las columnas de v6.2
 
 
 def log(msg):
@@ -233,8 +263,35 @@ def leer_registro(ruta=REGISTRO):
     return pl.read_csv(ruta, infer_schema_length=0)              # todo como texto
 
 
+def migrar_registro():
+    """v7: si el registro tiene las columnas de una versión anterior, agrega las nuevas al final (vacías en las filas
+    viejas) sin tocar ningún valor; antes guarda el archivo original intacto. Devuelve (copia, filas) o None."""
+    if not REGISTRO.exists():
+        return None
+    with open(REGISTRO, newline="", encoding="utf-8") as fh:
+        enc = next(csv.reader(fh), None)
+    if not enc or enc == CAMPOS:
+        return None
+    sobran = [c for c in enc if c not in CAMPOS]
+    if sobran or enc != CAMPOS[:len(enc)]:
+        raise SystemExit(f"El registro tiene columnas que no reconozco ({sobran[:5]}): no lo toco. Avísale a Claude.")
+    copia = REGISTRO_ANTES_V7 if not REGISTRO_ANTES_V7.exists() else SAL / f"proyecciones_2026_antes_v7_{int(time.time())}.csv"
+    shutil.copy2(REGISTRO, copia)
+    with open(REGISTRO, newline="", encoding="utf-8") as fh:
+        filas = list(csv.DictReader(fh))
+    tmp = REGISTRO.with_suffix(".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=CAMPOS)
+        w.writeheader()
+        for f in filas:
+            w.writerow({k: (f.get(k) or "") for k in CAMPOS})
+    tmp.replace(REGISTRO)
+    return copia, len(filas)
+
+
 def anexar_registro(filas):
     SAL.mkdir(parents=True, exist_ok=True)
+    migrar_registro()
     nuevo = not REGISTRO.exists()
     with open(REGISTRO, "a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CAMPOS)
@@ -359,26 +416,30 @@ def pestana(sem):
 
 
 # Columnas de la pestaña semanal (v4: todo lo escribe la EC2; la hoja es de solo lectura)
-#   A-M proyección · N-R cierre (se llenan solas con el resultado) · S-U datos de control (gris chico)
+#   A-N proyección · O-S cierre (se llenan solas con el resultado) · T-V datos de control (gris chico)
+#   v7: "Revisar / estado" → "Estado" y columna nueva N "Por qué difiere"
 ENCAB = ["Inicio (Caracas)", "Juego", "Línea mercado", "Línea modelo", "Modelo vs mercado", "Total consenso",
          "Total modelo", "Gana (modelo)", "Gana (Pinnacle)", "Señal ML", "Señal spread", "Pata Wong (BetOnline)",
-         "Revisar / estado", "Resultado", "Error modelo / cierre", "Lado del modelo", "Total real", "Pata Wong +6",
-         "QB usados", "Corrida", "game_id"]
-NCOL = len(ENCAB)                                   # 21 (A-U)
-COL_ID = "U"
+         "Estado", "Por qué difiere", "Resultado", "Error modelo / cierre", "Lado del modelo", "Total real",
+         "Pata Wong +6", "QB usados", "Corrida", "game_id"]
+NCOL = len(ENCAB)                                   # 22 (A-V)
+COL_ID = "V"
+N_PROY = 14                                         # A-N: proyección (las reglas de color rojo y gris cubren estas)
 COLORES = {"verde": "#D9EAD3", "azul": "#9FC5E8", "rojo": "#F4CCCC", "cierre": "#D0E0E3", "resumen": "#F3F3F3",
            "encab": "#1F3864", "gris": "#999999", "gris_texto": "#808080", "blanco": "#FFFFFF",
            "cubrio": "#B7E1CD", "no_cubrio": "#F4C7C3"}
 LEYENDA = ["Colores", "",
-           "Verde: candidata del modelo (sin validar, H29: el cierre le gana por 0,4 pts). Solo registro o monto mínimo.",
+           "Verde: señal del modelo que cuenta para el registro 29A (sin validar; H29: el cierre le gana por 0,4 pts). "
+           "Ningún dinero por el motor (31A).",
            "", "", "",
            "Azul: pata Wong para teaser de 6 pts (underdog +1,5 a +2,5, total < 50). Lo único con valor medido (H28).",
            "", "",
-           "Rojo: el modelo y el mercado difieren mucho. En ese juego no se usa el modelo.",
-           "", "", "",
+           "Rojo (Fuera): el modelo y el mercado difieren mucho, o el QB es dudoso. En ese juego no se usa el modelo: "
+           "sus señales quedan excluidas.",
+           "", "", "", "",
            "Cierre (se llena solo al terminar el juego): verde = cubrió, rojo = no cubrió. Error = puntos de diferencia con el resultado.",
            "", "", "", "",
-           "Gris en cursiva: proyección retro, hecha después del juego. No cuenta para 31A ni para el CLV."]
+           "Gris en cursiva: proyección retro, hecha después del juego. No cuenta para 31A ni para el CLV.", "", ""]
 
 
 def _rgb(h):
@@ -400,6 +461,8 @@ def crear_pestana(hoja, sem, titulo=None, sid=None):
     sid = 1000 + sem if sid is None else sid
     t = titulo or pestana(sem)
     F = FILAS_MAX
+    G = 4 + JUEGOS_MAX                                  # fin de las filas de juegos (las reglas de color no tocan el bloque de equipos)
+    E = FILA_EQUIPOS - 1                                # fila del título del bloque de equipos (índice desde 0)
     fondo = lambda r, color: {"repeatCell": {"range": r, "cell": {"userEnteredFormat": {"backgroundColorStyle": {"rgbColor": _rgb(color)}}},  # noqa: E731
                                              "fields": "userEnteredFormat.backgroundColorStyle"}}
     regla = lambda rangos, formula, fmt, idx: {"addConditionalFormatRule": {"index": idx, "rule": {  # noqa: E731
@@ -411,11 +474,11 @@ def crear_pestana(hoja, sem, titulo=None, sid=None):
     pedidos = [
         {"addSheet": {"properties": {"sheetId": sid, "title": t, "index": 0,
                                      "gridProperties": {"rowCount": F, "columnCount": NCOL, "frozenRowCount": 4, "frozenColumnCount": 2}}}},
-        # fila 1: A-B "Semana N · NFL 2026" | C-U detalle de la corrida
+        # fila 1: A-B "Semana N · NFL 2026" | C-V detalle de la corrida
         combinar(0, 2, 0), combinar(2, NCOL, 0),
-        # fila 2 (leyenda): A-B | C-F verde | G-I azul | J-M rojo | N-R cierre | S-U gris  (ninguna cruza el borde B|C)
-        combinar(0, 2, 1), combinar(2, 6, 1), combinar(6, 9, 1), combinar(9, 13, 1), combinar(13, 18, 1), combinar(18, NCOL, 1),
-        # fila 3 (resumen de la semana): A-B rótulo | C-U texto
+        # fila 2 (leyenda): A-B | C-F verde | G-I azul | J-N rojo | O-S cierre | T-V gris  (ninguna cruza el borde B|C)
+        combinar(0, 2, 1), combinar(2, 6, 1), combinar(6, 9, 1), combinar(9, 14, 1), combinar(14, 19, 1), combinar(19, NCOL, 1),
+        # fila 3 (resumen de la semana): A-B rótulo | C-V texto
         combinar(0, 2, 2), combinar(2, NCOL, 2),
         {"repeatCell": {"range": _rango(sid, 0, 1, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13}}},
                         "fields": "userEnteredFormat.textFormat"}},
@@ -425,9 +488,9 @@ def crear_pestana(hoja, sem, titulo=None, sid=None):
         {"repeatCell": {"range": _rango(sid, 1, 3, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                         "fields": "userEnteredFormat.textFormat"}},
         fondo(_rango(sid, 1, 2, 2, 6), COLORES["verde"]), fondo(_rango(sid, 1, 2, 6, 9), COLORES["azul"]),
-        fondo(_rango(sid, 1, 2, 9, 13), COLORES["rojo"]), fondo(_rango(sid, 1, 2, 13, 18), COLORES["cierre"]),
-        fondo(_rango(sid, 1, 2, 18, NCOL), COLORES["resumen"]),
-        {"repeatCell": {"range": _rango(sid, 1, 2, 18, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
+        fondo(_rango(sid, 1, 2, 9, 14), COLORES["rojo"]), fondo(_rango(sid, 1, 2, 14, 19), COLORES["cierre"]),
+        fondo(_rango(sid, 1, 2, 19, NCOL), COLORES["resumen"]),
+        {"repeatCell": {"range": _rango(sid, 1, 2, 19, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
             "italic": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}}, "fields": "userEnteredFormat.textFormat"}},
         {"repeatCell": {"range": _rango(sid, 1, 3, 0, NCOL), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
                         "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
@@ -438,21 +501,38 @@ def crear_pestana(hoja, sem, titulo=None, sid=None):
             "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
             "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
             "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
-        {"repeatCell": {"range": _rango(sid, 4, F, 18, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
+        {"repeatCell": {"range": _rango(sid, 4, G, 19, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
             "fontSize": 8, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}}}, "fields": "userEnteredFormat.textFormat"}},
-        ancho(0, 1, 110), ancho(1, 2, 95), ancho(2, 3, 115), ancho(3, 4, 95), ancho(4, 5, 110), ancho(5, 7, 75),
-        ancho(7, 9, 85), ancho(9, 11, 125), ancho(11, 12, 140), ancho(12, 13, 220), ancho(13, 14, 125), ancho(14, 15, 105),
-        ancho(15, 16, 120), ancho(16, 17, 85), ancho(17, 18, 130), ancho(18, 19, 210), ancho(19, 20, 115), ancho(20, 21, 125),
+        ancho(0, 1, 110), ancho(1, 2, 165), ancho(2, 3, 115), ancho(3, 4, 95), ancho(4, 5, 110), ancho(5, 7, 75),
+        ancho(7, 9, 85), ancho(9, 10, 215), ancho(10, 11, 230), ancho(11, 12, 140), ancho(12, 13, 220), ancho(13, 14, 360),
+        ancho(14, 15, 125), ancho(15, 16, 105), ancho(16, 17, 120), ancho(17, 18, 85), ancho(18, 19, 130), ancho(19, 20, 210),
+        ancho(20, 21, 115), ancho(21, 22, 125),
         # colores de las filas (el orden importa: en cada celda manda la primera regla que se cumple)
-        regla([_rango(sid, 4, F, 11, 12)], "=LEN($L5)>0", fmt_fondo(COLORES["azul"], True), 0),
-        regla([_rango(sid, 4, F, 0, 13)], '=LEFT($T5,5)="retro"',
+        regla([_rango(sid, 4, G, 11, 12)], "=LEN($L5)>0", fmt_fondo(COLORES["azul"], True), 0),
+        regla([_rango(sid, 4, G, 0, N_PROY)], '=LEFT($U5,5)="retro"',
               {"textFormat": {"italic": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}, 1),
-        regla([_rango(sid, 4, F, 0, 13)], '=LEFT($M5,7)="REVISAR"', fmt_fondo(COLORES["rojo"]), 2),
-        regla([_rango(sid, 4, F, 9, 11)], '=AND(LEN(J5)>0,LEFT($M5,9)="candidata")', fmt_fondo(COLORES["verde"], True), 3),
-        regla([_rango(sid, 4, F, 15, 16)], '=LEFT($P5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 4),
-        regla([_rango(sid, 4, F, 15, 16)], '=LEFT($P5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 5),
-        regla([_rango(sid, 4, F, 17, 18)], '=LEFT($R5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 6),
-        regla([_rango(sid, 4, F, 17, 18)], '=LEFT($R5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 7),
+        regla([_rango(sid, 4, G, 0, N_PROY)], '=LEFT($M5,5)="Fuera"', fmt_fondo(COLORES["rojo"]), 2),
+        # verde solo en la celda que trae una señal de verdad ("sin señal", "sin Pinnacle 3 h", "retro (n/a)" y
+        # "excluida (…)" no se pintan)
+        regla([_rango(sid, 4, G, 9, 11)], '=AND(LEFT($M5,9)="candidata",LEN(J5)>0,LEFT(J5,3)<>"sin",'
+                                          'LEFT(J5,5)<>"retro",LEFT(J5,8)<>"excluida")', fmt_fondo(COLORES["verde"], True), 3),
+        regla([_rango(sid, 4, G, 16, 17)], '=LEFT($Q5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 4),
+        regla([_rango(sid, 4, G, 16, 17)], '=LEFT($Q5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 5),
+        regla([_rango(sid, 4, G, 18, 19)], '=LEFT($S5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 6),
+        regla([_rango(sid, 4, G, 18, 19)], '=LEFT($S5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 7),
+        # v7, ajuste 8: bloque de equipos (título A-B | C-V, como las filas 1 y 3; encabezado A-H)
+        combinar(0, 2, E), combinar(2, NCOL, E), fondo(_rango(sid, E, E + 1, 0, NCOL), COLORES["resumen"]),
+        {"repeatCell": {"range": _rango(sid, E, E + 1, 0, NCOL), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
+                        "verticalAlignment": "MIDDLE", "textFormat": {"bold": False}}},
+                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment,userEnteredFormat.textFormat"}},
+        {"repeatCell": {"range": _rango(sid, E, E + 1, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": E, "endIndex": E + 1},
+                                       "properties": {"pixelSize": 48}, "fields": "pixelSize"}},
+        {"repeatCell": {"range": _rango(sid, E + 1, E + 2, 0, len(ENCAB_EQUIPOS)), "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
+            "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
+            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
     ]
     hoja.lote(pedidos)
     hoja.escribir(f"'{t}'!A2", [LEYENDA])
@@ -466,7 +546,7 @@ def asegurar_pestana(hoja, sem):
     t = pestana(sem)
     ps = hoja.pestanas()
     if t in ps:
-        enc = hoja.leer(f"'{t}'!A4:{COL_ID}4")
+        enc = hoja.leer(f"'{t}'!4:4")          # v7: la fila entera (una pestaña vieja de 21 columnas no tiene la V)
         if enc and list(enc[0]) == ENCAB:
             return False
         hoja.lote([{"deleteSheet": {"sheetId": ps[t]}}])
@@ -514,19 +594,95 @@ def gana_txt(local, visita, p_local):
     return f"{local} {100 * p:.0f} %" if p >= 0.5 else f"{visita} {100 * (1 - p):.0f} %"
 
 
+def pct(x, dec=0):
+    """0.524 → '52,4 %' (coma decimal, como en el resto de la hoja)."""
+    return f"{100 * x:.{dec}f}".replace(".", ",") + " %"
+
+
 def senal_ml_txt(f):
+    """v7, ajuste 6: la señal en palabras, para que no se lea como 'gana tal equipo': 'MIA ML: modelo 20 % · precio 16 %'
+    (precio = probabilidad de Pinnacle sin vig). Vacío si no hay señal."""
     if not f.get("sel_ml"):
         return ""
-    eq = f["local"] if f["sel_ml"] == "local" else f["visita"]
-    return f"{eq} ML (+{100 * float(f['sel_ml_ventaja']):.0f} pp)"
+    loc = f["sel_ml"] == "local"
+    eq = f["local"] if loc else f["visita"]
+    pm, pp = _num(f.get("p_local")), _num(f.get("pin_p_ml_local"))
+    if pm is None or pp is None:
+        return f"{eq} ML"
+    if not loc:
+        pm, pp = 1 - pm, 1 - pp
+    return f"{eq} ML: modelo {pct(pm)} · precio {pct(pp)}"
+
+
+def necesita_sp(f, lado):
+    """Probabilidad de cubrir que hace falta para no perder: con el precio de BetOnline si su línea es la misma de
+    Pinnacle (foto de ≤ 12 h); si no, a −110 (52,4 %)."""
+    h, hb = _num(f.get("pin_hcp_local")), _num(f.get("bo_hcp_local"))
+    c = _num(f.get("bo_cuota_sp_local" if lado == "local" else "bo_cuota_sp_visit"))
+    cuota = c if (h is not None and hb is not None and c is not None and abs(h - hb) < 0.05) else BE_ESTANDAR
+    return 1 / decimal(cuota)
 
 
 def senal_sp_txt(f):
+    """v7, ajuste 6: 'MIA +11.0: cubre 55 % (necesita 52,4 %)'. Vacío si no hay señal."""
     if not f.get("sel_sp"):
         return ""
     h = float(f["pin_hcp_local"])
     eq, lin = (f["local"], h) if f["sel_sp"] == "local" else (f["visita"], -h)
-    return f"{eq} {lin:+.1f} ({100 * float(f['sel_sp_prob']):.0f} %)"
+    lin_txt = "PK" if abs(lin) < 0.05 else f"{lin:+.1f}"
+    return f"{eq} {lin_txt}: cubre {pct(float(f['sel_sp_prob']))} (necesita {pct(necesita_sp(f, f['sel_sp']), 1)})"
+
+
+def fuera(f):
+    """Juego en rojo: el modelo y el mercado difieren mucho (filtro de alucinación) o el QB es dudoso."""
+    return f.get("tipo") != "retro" and (es_dudoso(f) or f.get("marcado_spread") in (1, "1") or f.get("marcado_total") in (1, "1"))
+
+
+def celda_senal(f, cual):
+    """v7, ajustes 1 y 2: lo que muestra la celda de señal (ML o spread) en la pestaña semanal."""
+    if f.get("tipo") == "retro":
+        return "retro (n/a)"
+    if _num(f.get("pin_p_ml_local" if cual == "ml" else "pin_hcp_local")) is None:
+        return "sin Pinnacle 3 h"
+    txt = senal_ml_txt(f) if cual == "ml" else senal_sp_txt(f)
+    if not txt:
+        return "sin señal"
+    if fuera(f) or str(f.get("sel_estado") or "").startswith("excluida"):
+        return f"excluida · {txt}"
+    return txt
+
+
+def _a_favor(loc, vis, x):
+    """Puntos a favor del local (x > 0) o del visitante (x < 0): 'DAL +3.2'."""
+    return "0.0" if abs(x) < 0.05 else f"{loc if x > 0 else vis} +{abs(x):.1f}"
+
+
+def porque_txt(f):
+    """v7, ajuste 4 (descriptivo): de dónde sale el número del modelo y cuánto se movió Pinnacle desde la primera foto del
+    bot. Piezas = respuesta lineal del simulador (puntos de margen por EPA/jugada, RESP de s2-v1); la suma se acerca
+    al margen simulado sin ser exacta (el simulador no es lineal)."""
+    loc, vis = f.get("local"), f.get("visita")
+    partes = []
+    comps = [("pase", _num(f.get("comp_pase_pts"))), ("corrida", _num(f.get("comp_corrida_pts"))),
+             ("QB", _num(f.get("comp_qb_pts"))), ("localía", _num(f.get("comp_localia_pts")))]
+    if all(v is not None for _, v in comps):
+        for nombre, v in comps:
+            if nombre == "localía" and abs(v) < 0.05:
+                partes.append("sede neutral")
+            elif nombre == "QB" and abs(v) < 0.05:
+                partes.append("QB sin ajuste")
+            else:
+                partes.append(f"{nombre} {_a_favor(loc, vis, v)}")
+    else:
+        partes.append("sin desglose (corrida anterior a v7)")
+    ap, h = _num(f.get("pin_ap_hcp_local")), _num(f.get("pin_hcp_local"))
+    if ap is not None and h is not None:
+        mov = h - ap                                    # < 0: la línea se movió hacia el local
+        if abs(mov) < 0.05:
+            partes.append(f"Pinnacle sin cambio desde la apertura ({linea_txt(loc, vis, ap)})")
+        else:
+            partes.append(f"Pinnacle abrió {linea_txt(loc, vis, ap)} y se movió {abs(mov):.1f} hacia {loc if mov < 0 else vis}")
+    return " · ".join(partes)
 
 
 def wong_txt(f):
@@ -555,10 +711,10 @@ def estado_txt(f):
         return "retro: hecha después del juego" + (f" · modelo y mercado difieren ({d})" if d else "")
     dq = [str(f.get(k))[len("dudoso: "):] for k in ("qb_visita_fuente", "qb_local_fuente")
           if str(f.get(k) or "").startswith("dudoso")]
-    if dq:
-        return "REVISAR: QB dudoso (" + " | ".join(dq) + ")" + (f" · modelo y mercado difieren ({d})" if d else "")
+    if dq:                                             # v7, ajuste 3: desde 32b no hay revisión manual → "Fuera"
+        return "Fuera: QB dudoso (" + " | ".join(dq) + ")" + (f" · modelo y mercado difieren ({d})" if d else "")
     if d:
-        return "REVISAR: modelo y mercado difieren (" + d + ")"
+        return "Fuera: modelo y mercado difieren (" + d + ")"
     return f.get("sel_estado") or ""
 
 
@@ -652,6 +808,95 @@ def resumen_txt(cierres, n_juegos):
 
 
 # --------------------------------------------------------------------------------------
+# Equipos antes de la semana (v7, ajuste 8; pedido de Ozz el 2-oct). Solo nflverse, descriptivo: el récord y las rachas
+# ya los descuenta el mercado (H4, H14, H23); por eso se muestran junto a lo que el mercado esperaba.
+# --------------------------------------------------------------------------------------
+def _qb_corto(nombre):
+    partes = str(nombre or "").split()
+    return f"{partes[0][0]}. {' '.join(partes[1:])}" if len(partes) >= 2 else (partes[0] if partes else "")
+
+
+def _dec(x, d=1):
+    return f"{x:.{d}f}".replace(".", ",")
+
+
+def equipos_antes(g26, semana):
+    """{equipo: dict} con los juegos de 2026 de semanas ANTERIORES a 'semana' que ya tienen resultado: ganados, perdidos,
+    empates, ganados esperados (probabilidad sin vig del moneyline de cierre de nflverse, método de potencia), récord
+    contra el spread de cierre de nflverse (ATS), puntos a favor y en contra, y el último juego (con su QB titular)."""
+    import polars as pl
+    eq = {}
+    for t in g26["home_team"].to_list() + g26["away_team"].to_list():
+        eq.setdefault(t, dict(n=0, g=0, p=0, e=0, esp=0.0, n_esp=0, ats=[0, 0, 0], pf=0, pc=0, ult=None))
+    previos = g26.filter((pl.col("week") < semana) & pl.col("result").is_not_null()).sort(["inicio", "game_id"])
+    for r in previos.iter_rows(named=True):
+        ml_l, ml_v = _num(r.get("home_moneyline")), _num(r.get("away_moneyline"))
+        p_loc = sin_vig_potencia(ml_l, ml_v) if ml_l is not None and ml_v is not None else None
+        sl = _num(r.get("spread_line"))
+        for local in (True, False):
+            t = r["home_team"] if local else r["away_team"]
+            rival = r["away_team"] if local else r["home_team"]
+            m = r["result"] if local else -r["result"]               # margen del equipo
+            pts, opp = (r["home_score"], r["away_score"]) if local else (r["away_score"], r["home_score"])
+            d = eq[t]
+            d["n"] += 1
+            d["pf"] += pts
+            d["pc"] += opp
+            d["g" if m > 0 else ("p" if m < 0 else "e")] += 1
+            if p_loc is not None:
+                d["esp"] += p_loc if local else 1 - p_loc
+                d["n_esp"] += 1
+            x = None
+            if sl is not None:
+                x = m - (sl if local else -sl)                          # contra el margen que esperaba el cierre
+                d["ats"][0 if x > 0 else (1 if x < 0 else 2)] += 1
+            d["ult"] = dict(semana=int(r["week"]), local=local, rival=rival, pts=pts, opp=opp, m=m,
+                            hcp=None if sl is None else (-sl if local else sl), x=x,
+                            qb=r.get("home_qb_name" if local else "away_qb_name"))
+    return eq
+
+
+def record_txt(d):
+    return f"{d['g']}-{d['p']}" + (f"-{d['e']}" if d["e"] else "")
+
+
+def filas_equipos(g26, semana):
+    """Bloque de equipos de la pestaña semanal: título, encabezado y una fila por equipo, de mejor a peor récord
+    (desempate: diferencia de puntos; después, por nombre)."""
+    import polars as pl
+    eq = equipos_antes(g26, semana)
+    esta = {}
+    for r in g26.filter(pl.col("week") == semana).iter_rows(named=True):
+        neutral = " (neutral)" if r.get("location") == "Neutral" else ""
+        esta[r["home_team"]] = f"vs {r['away_team']}{neutral}"
+        esta[r["away_team"]] = f"@ {r['home_team']}{neutral}"
+    orden = sorted(eq, key=lambda t: (-((eq[t]["g"] + 0.5 * eq[t]["e"]) / eq[t]["n"]) if eq[t]["n"] else 0.0,
+                                      -(eq[t]["pf"] - eq[t]["pc"]), t))
+    filas = []
+    for t in orden:
+        d = eq[t]
+        if not d["n"]:
+            filas.append([t, "0-0", "", "", "", "", esta.get(t, "descanso"), "sin juegos todavía"])
+            continue
+        u = d["ult"]
+        res = "G" if u["m"] > 0 else ("P" if u["m"] < 0 else "E")
+        lin = "" if u["hcp"] is None else (" · " + t + (" PK" if abs(u["hcp"]) < 0.05 else f" {u['hcp']:+.1f}"))
+        cub = "" if u["x"] is None else (" · " + ("push" if u["x"] == 0 else ("cubrió" if u["x"] > 0 else "no cubrió")
+                                                   + f" por {abs(u['x']):.1f}"))
+        ats = f"{d['ats'][0]}-{d['ats'][1]}" + (f"-{d['ats'][2]}" if d["ats"][2] else "")
+        filas.append([t, record_txt(d), _dec(d["esp"]) + ("" if d["n_esp"] == d["n"] else f" ({d['n_esp']} de {d['n']})"),
+                      ats, _qb_corto(u["qb"]), f"{_dec(d['pf'] / d['n'])} / {_dec(d['pc'] / d['n'])}", esta.get(t, "descanso"),
+                      f"S{u['semana']} {res} {u['pts']}-{u['opp']} {'vs' if u['local'] else '@'} {u['rival']}{lin}{cub}"])
+    titulo = ["Equipos", "",
+              f"Cómo llegan a la semana {semana} (solo juegos de semanas anteriores; nflverse). Descriptivo: el récord y "
+              "las rachas ya los descuenta el mercado (H4, H14, H23). Esperados = suma de la probabilidad sin vig del "
+              "moneyline de cierre de cada juego (si ganó más de lo esperado, el mercado lo subestimó o tuvo suerte). "
+              "ATS = contra el spread de cierre de nflverse. Semana pasada: resultado, línea de cierre del equipo y por "
+              "cuánto cubrió o no."]
+    return [titulo + [""] * (len(ENCAB_EQUIPOS) - len(titulo)), list(ENCAB_EQUIPOS)] + filas, eq
+
+
+# --------------------------------------------------------------------------------------
 # Probabilidades sin vig (método de potencia) y líneas del bot
 # --------------------------------------------------------------------------------------
 def decimal(americana):
@@ -676,14 +921,41 @@ def sin_vig_potencia(c1, c2):
     return p[0] ** k / (p[0] ** k + p[1] ** k)
 
 
-def lineas_bot(bot_dir, casa, ids, ahora, max_horas):
-    """Última foto de una casa del bot de ≤ max_horas para cada juego: {game_id: dict}."""
+_LOG_BOT = {}
+COLS_FOTO = ("ts_utc", "fuente", "game_id", "hcp_local", "cuota_sp_local", "cuota_sp_visit", "ml_local", "ml_visit")
+
+
+def log_bot(bot_dir, con_cierres=False):
+    """Fotos del bot (~/nfl_ev/lineas_log.csv, solo lectura), leídas una vez por corrida. con_cierres: suma
+    cierres.csv (escaneo de T−10 del bot) si tiene las mismas columnas; si no, lo ignora."""
     import polars as pl
+    clave = (str(bot_dir), con_cierres)
+    if clave in _LOG_BOT:
+        return _LOG_BOT[clave]
     ruta = Path(bot_dir) / "lineas_log.csv"
     if not ruta.exists():
         log(f"AVISO: no encuentro {ruta}; sin líneas del bot")
+        _LOG_BOT[clave] = None
+        return None
+    lg = pl.read_csv(ruta, infer_schema_length=0)
+    if con_cierres and (Path(bot_dir) / "cierres.csv").exists():
+        try:
+            ci = pl.read_csv(Path(bot_dir) / "cierres.csv", infer_schema_length=0)
+            if all(c in ci.columns for c in COLS_FOTO) and all(c in lg.columns for c in COLS_FOTO):
+                lg = pl.concat([lg.select(COLS_FOTO), ci.select(COLS_FOTO)], how="vertical_relaxed")
+        except Exception as e:  # noqa: BLE001
+            log(f"AVISO: no pude leer cierres.csv del bot ({type(e).__name__}); uso solo lineas_log.csv")
+    _LOG_BOT[clave] = lg
+    return lg
+
+
+def lineas_bot(bot_dir, casa, ids, ahora, max_horas):
+    """Última foto de una casa del bot de ≤ max_horas para cada juego: {game_id: dict}."""
+    import polars as pl
+    lg = log_bot(bot_dir)
+    if lg is None:
         return {}
-    lg = pl.read_csv(ruta, infer_schema_length=0).filter((pl.col("fuente") == casa) & pl.col("game_id").is_in(ids))
+    lg = lg.filter((pl.col("fuente") == casa) & pl.col("game_id").is_in(ids))
     out = {}
     for gid, grupo in lg.group_by("game_id"):
         mejor = None
@@ -700,6 +972,595 @@ def lineas_bot(bot_dir, casa, ids, ahora, max_horas):
                 d[k] = _num(f.get(k))
             out[gid[0] if isinstance(gid, tuple) else gid] = d
     return out
+
+
+def apertura_pin(bot_dir, ids, ahora):
+    """Primera foto de Pinnacle de cada juego en el log del bot (la 'apertura' que vio el bot, que captura desde el
+    24-sep-2026): {game_id: (ts, hcp_local)}. Solo descriptivo (columna 'Por qué difiere')."""
+    import polars as pl
+    lg = log_bot(bot_dir)
+    if lg is None:
+        return {}
+    primera = {}
+    for f in lg.filter((pl.col("fuente") == "pinnacle") & pl.col("game_id").is_in(ids)).iter_rows(named=True):
+        ts, h = t_utc(f["ts_utc"]), _num(f.get("hcp_local"))
+        if ts is None or h is None or ts > ahora:
+            continue
+        if f["game_id"] not in primera or ts < primera[f["game_id"]][0]:
+            primera[f["game_id"]] = (ts, h)
+    return {gid: (iso(ts), h) for gid, (ts, h) in primera.items()}
+
+
+def cierre_pin(bot_dir, inicios):
+    """Cierre de Pinnacle de cada juego: la última foto del bot antes del inicio (lineas_log.csv y, si tiene las mismas
+    columnas, cierres.csv del escaneo de T−10). inicios: {game_id: datetime UTC} → {game_id: dict}."""
+    import polars as pl
+    lg = log_bot(bot_dir, con_cierres=True)
+    if lg is None or not inicios:
+        return {}
+    ult = {}
+    for f in lg.filter((pl.col("fuente") == "pinnacle") & pl.col("game_id").is_in(list(inicios))).iter_rows(named=True):
+        ts, gid = t_utc(f["ts_utc"]), f["game_id"]
+        if ts is None or ts > inicios[gid]:
+            continue
+        if gid not in ult or ts > ult[gid][0]:
+            ult[gid] = (ts, f)
+    out = {}
+    for gid, (ts, f) in ult.items():
+        d = dict(ts=iso(ts), min_antes=round((inicios[gid] - ts).total_seconds() / 60))
+        for k in ("hcp_local", "cuota_sp_local", "cuota_sp_visit", "ml_local", "ml_visit"):
+            d[k] = _num(f.get(k))
+        out[gid] = d
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Boleto (informativo) — ajuste 7 de v7. Especificación aprobada por Ozz el 2-oct (claude/ajustes_hoja_pendientes.md):
+#   · Lado de cada pata = favorito de Pinnacle sin vig (foto de ≤ 3 h; si no hay, consenso de nflverse, marcado *).
+#     El modelo NO elige: solo deja una marca si prefiere el otro lado (H29). ML por omisión (H6/H21).
+#   · Tres boletos: (1) solo ML; (2) mixto: en cada juego, ML o spread del mismo favorito, el de menor costo (EV menos
+#     negativo) al precio y número de BetOnline; (3) teaser Wong de 6 pts si hay ≥ 3 patas azules (tabla de BetOnline
+#     con recargo, premisa 5). Más la tabla de P(cobrar) de 3 a 8 patas (ML, las más probables primero).
+#   · Spread y teaser: distribución del margen de la sección 3 (resultados reales 2012-2025 con spread de cierre de
+#     nflverse a ≤ 1,5 pts del centro), anclada a la probabilidad sin vig de la línea de referencia.
+#   · Parlay: P(cobrar) = Π(p_gana + p_push); EV = Π(p_gana·D + p_push) − 1 (patas independientes, sección 3).
+#   · Se arma en las corridas que cuentan (miércoles, sábado, T−85) mientras no empiece el primer juego del domingo;
+#     una corrida con menos líneas frescas que el boleto guardado no lo reemplaza. Después de los juegos: EV contra el
+#     cierre (última foto de Pinnacle antes del inicio) y resultado. Ningún dinero por el motor (31A).
+# --------------------------------------------------------------------------------------
+BOLETOS = SAL / "boletos"
+TITULO_BOLETO, SID_BOLETO = "Boleto (informativo)", 900
+TITULO_BOLETO_PRUEBA, SID_BOLETO_PRUEBA = "Prueba boleto (se borra sola)", 1998
+TIPOS_BOLETO = ("miercoles", "sabado", "t85")
+NOMBRE_CORRIDA = {"miercoles": "miércoles 10:15", "sabado": "sábado 10:15", "t85": "T−85"}
+DIAS_BOLETO = ("Sunday", "Monday")
+TEASER_PAGOS = {2: -120, 3: 151, 4: 248, 5: 420, 6: 600, 7: 900, 8: 1300}   # premisa 5: teaser de 6 pts con recargo Wong
+PARLAY_PATAS = range(3, 9)                         # tabla de P(cobrar) de 3 a 8 patas
+DIST_TEMPORADAS = (2012, 2025)
+NUCLEO_PTS, NUCLEO_MIN_N, NUCLEO_MAX_PTS = 1.5, 150, 4.0
+NCOL_BOLETO = 12
+_MARGENES = {}
+
+
+def margenes_historicos():
+    """(spread de cierre de nflverse, margen real del local) de 2012-2025: la base de la distribución del margen."""
+    import polars as pl
+    if "x" not in _MARGENES:
+        g = pl.read_csv(DATOS / "games.csv", infer_schema_length=20000)
+        g = g.filter(pl.col("season").is_between(*DIST_TEMPORADAS) & pl.col("result").is_not_null()
+                     & pl.col("spread_line").is_not_null())
+        _MARGENES["x"] = (g["spread_line"].cast(pl.Float64).to_numpy(), g["result"].cast(pl.Float64).to_numpy())
+    return _MARGENES["x"]
+
+
+class Margen:
+    """Distribución del margen del local para un juego (sección 3): resultados reales de los juegos con spread de cierre
+    a ≤ 1,5 pts del centro (se ensancha de 0,5 en 0,5 hasta 4 pts si hay < 150 juegos), anclada a la línea de
+    referencia: en ella, P(local cubre) = probabilidad sin vig de la referencia. Las otras líneas (BetOnline, +6 del
+    teaser) se mueven con la distribución empírica, que conserva los números clave (3, 7)."""
+
+    def __init__(self, hcp_ref, p_sp_ref=None):
+        import numpy as np
+        sl, res = margenes_historicos()
+        mu = -float(hcp_ref)                            # margen esperado del local según la línea de referencia
+        w = NUCLEO_PTS
+        while True:
+            m = np.abs(sl - mu) <= w + 1e-9
+            if m.sum() >= NUCLEO_MIN_N or w >= NUCLEO_MAX_PTS:
+                break
+            w += 0.5
+        if m.sum() < 30:                                # línea extrema: los 150 juegos de spread más cercano
+            m = np.zeros(len(sl), dtype=bool)
+            m[np.argsort(np.abs(sl - mu), kind="stable")[:NUCLEO_MIN_N]] = True
+        self.d, self.n, self.ancho = res[m], int(m.sum()), w
+        self.adj = 0.0
+        if p_sp_ref is not None:
+            self.adj = p_sp_ref * (1 - self.push(hcp_ref)) - self._cubre(hcp_ref)
+
+    def _cubre(self, h):
+        return float((self.d + h > 1e-9).mean())
+
+    def push(self, h):
+        import numpy as np
+        return float((np.abs(self.d + h) < 1e-9).mean())
+
+    def local(self, h):
+        """(P gana, P push) del local con hándicap h."""
+        q = self.push(h)
+        return min(max(self._cubre(h) + self.adj, 0.0), 1.0 - q), q
+
+    def lado(self, es_local, h_lado):
+        """(P gana, P push) del lado pedido con su propio hándicap (−3.5 = favorito por 3,5)."""
+        if es_local:
+            return self.local(h_lado)
+        p_l, q = self.local(-h_lado)
+        return max(1.0 - p_l - q, 0.0), q
+
+
+def _dia_et(g):
+    w = g.get("weekday")
+    if w:
+        return str(w)
+    return g["inicio"].astimezone(NUEVA_YORK).strftime("%A") if g.get("inicio") else ""
+
+
+def referencia_juego(g, p):
+    """Precios de referencia de un juego: Pinnacle de ≤ 3 h (ML y spread) o, si no hay, el consenso de nflverse."""
+    if (p and p.get("ml_local") is not None and p.get("ml_visit") is not None and p.get("hcp_local") is not None
+            and sin_vig_potencia(p["ml_local"], p["ml_visit"]) is not None):
+        return dict(fuente="pinnacle", ts=p["ts"], horas=p["horas"], ml_local=p["ml_local"], ml_visit=p["ml_visit"],
+                    hcp_local=p["hcp_local"], sp_local=p.get("cuota_sp_local"), sp_visit=p.get("cuota_sp_visit"))
+    ml_l, ml_v, sl = _num(g.get("home_moneyline")), _num(g.get("away_moneyline")), _num(g.get("spread_line"))
+    if ml_l is None or ml_v is None or sl is None or sin_vig_potencia(ml_l, ml_v) is None:
+        return None
+    return dict(fuente="nflverse", ts=None, horas=None, ml_local=ml_l, ml_visit=ml_v, hcp_local=-sl,
+                sp_local=_num(g.get("home_spread_odds")), sp_visit=_num(g.get("away_spread_odds")))
+
+
+def _frescas(snap):
+    """Juegos del boleto con Pinnacle de ≤ 3 h y algún precio de BetOnline de ≤ 12 h."""
+    return sum(1 for j in (snap or {}).get("juegos", []) if j["ref"]["fuente"] == "pinnacle" and j.get("bo"))
+
+
+def ruta_boleto(sem):
+    return BOLETOS / f"boleto_semana_{sem}.json"
+
+
+def leer_boleto(sem):
+    try:
+        return json.loads(ruta_boleto(sem).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ultimo_boleto():
+    """El boleto guardado de la semana más reciente (el que muestra la pestaña)."""
+    sems = []
+    for r in BOLETOS.glob("boleto_semana_*.json") if BOLETOS.exists() else []:
+        m = re.fullmatch(r"boleto_semana_(\d+)\.json", r.name)
+        if m:
+            sems.append(int(m.group(1)))
+    return leer_boleto(max(sems)) if sems else None
+
+
+def armar_boleto(g26, sem, bot_dir, ahora, tipo):
+    """Arma y guarda la foto del boleto de la semana (solo los datos de entrada: precios y probabilidades se calculan al
+    mostrarla, siempre igual). Devuelve la foto nueva, o None si no corresponde o si la guardada tiene más líneas frescas."""
+    import polars as pl
+    if tipo not in TIPOS_BOLETO or sem is None:
+        return None
+    jg = [g for g in g26.filter(pl.col("week") == sem).sort(["inicio", "game_id"]).iter_rows(named=True)
+          if _dia_et(g) in DIAS_BOLETO and g.get("inicio") is not None]
+    if not jg:
+        return None
+    if ahora >= min(g["inicio"] for g in jg):
+        return None                                    # ya empezó el primer juego del domingo: queda congelado
+    ids = [g["game_id"] for g in jg]
+    pin = lineas_bot(bot_dir, "pinnacle", ids, ahora, MAX_EDAD_PIN_H)
+    bo = lineas_bot(bot_dir, "betonlineag", ids, ahora, MAX_EDAD_BO_H)
+    ult = ultimas_proyecciones(sem)
+    juegos, sin_ref = [], []
+    for g in jg:
+        gid = g["game_id"]
+        ref = referencia_juego(g, pin.get(gid))
+        if ref is None:
+            sin_ref.append(gid)
+            continue
+        b = bo.get(gid)
+        bo_d = None if not b else {k: b[k] for k in ("ts", "horas", "ml_local", "ml_visit", "hcp_local",
+                                                     "cuota_sp_local", "cuota_sp_visit")}
+        u = ult.get(gid)
+        modelo = None
+        if u and u.get("tipo") != "retro" and _num(u.get("p_local")) is not None:
+            motivo = "QB dudoso" if es_dudoso(u) else ("filtro" if fuera(u) else "")
+            modelo = dict(p_local=_num(u.get("p_local")), fuera=motivo, corrida=u.get("corrida_utc"))
+        juegos.append(dict(game_id=gid, inicio_utc=iso(g["inicio"]), local=g["home_team"], visita=g["away_team"],
+                           total_nfl=_num(g.get("total_line")), ref=ref, bo=bo_d, modelo=modelo))
+    nuevo = dict(version=VERSION_SEMANA, semana=sem, corrida_utc=iso(ahora), tipo=tipo, juegos=juegos, sin_ref=sin_ref)
+    previo = leer_boleto(sem)
+    if previo and _frescas(nuevo) < _frescas(previo):
+        log(f"Boleto semana {sem}: se conserva el de {NOMBRE_CORRIDA.get(previo['tipo'], previo['tipo'])} "
+            f"({fecha_cc(t_utc(previo['corrida_utc']))}) "
+            f"({_frescas(previo)} juegos con líneas frescas; esta corrida tiene {_frescas(nuevo)})")
+        return None
+    BOLETOS.mkdir(parents=True, exist_ok=True)
+    tmp = ruta_boleto(sem).with_suffix(".tmp")
+    tmp.write_text(json.dumps(nuevo, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(ruta_boleto(sem))
+    log(f"Boleto semana {sem}: {len(juegos)} juegos ({_frescas(nuevo)} con Pinnacle de ≤ 3 h y BetOnline)")
+    return nuevo
+
+
+def calcular_juego(j, ref=None):
+    """Probabilidades, precios de BetOnline y EV de un juego del boleto. ref: otra referencia (el cierre) en lugar de
+    la guardada; los precios y números de BetOnline son siempre los de la foto."""
+    r = ref or j["ref"]
+    b = j.get("bo") or {}
+    p_loc = sin_vig_potencia(r["ml_local"], r["ml_visit"])
+    p_sp = (sin_vig_potencia(r["sp_local"], r["sp_visit"])
+            if r.get("sp_local") is not None and r.get("sp_visit") is not None else None)
+    M = Margen(r["hcp_local"], p_sp)
+    base = j["ref"]                                    # el lado lo fija la foto, aunque el cierre cambie de favorito
+    p_base = sin_vig_potencia(base["ml_local"], base["ml_visit"])
+    fav_local = p_base > 0.5 or (abs(p_base - 0.5) < 1e-12 and base["hcp_local"] <= 0)
+    c = dict(fav=j["local"] if fav_local else j["visita"], fav_local=fav_local,
+             p_fav=p_loc if fav_local else 1 - p_loc, nflverse=r.get("fuente") == "nflverse")
+    ml = b.get("ml_local" if fav_local else "ml_visit")
+    c["ml"], c["ev_ml"] = ml, (None if ml is None else c["p_fav"] * decimal(ml) - 1)
+    hb, cs = b.get("hcp_local"), b.get("cuota_sp_local" if fav_local else "cuota_sp_visit")
+    c["h_sp"] = c["cuota_sp"] = c["p_sp"] = c["q_sp"] = c["ev_sp"] = None
+    if hb is not None and cs is not None:
+        h_fav = hb if fav_local else -hb
+        pw, pq = M.lado(fav_local, h_fav)
+        c.update(h_sp=h_fav, cuota_sp=cs, p_sp=pw, q_sp=pq, ev_sp=pw * decimal(cs) + pq - 1)
+    opciones = [(e, k) for e, k in ((c["ev_ml"], "ML"), (c["ev_sp"], "spread")) if e is not None]
+    c["mixto"] = max(opciones)[1] if opciones else None
+    c["wong"] = None
+    tot = j.get("total_nfl")
+    if hb is not None and tot is not None and tot < WONG_TOTAL_MAX:
+        es_l, lin = (True, hb) if hb > 0 else (False, -hb)
+        if any(abs(lin - w) < 1e-6 for w in WONG_LINEAS):
+            pw, pq = M.lado(es_l, lin + 6)
+            c["wong"] = dict(eq=j["local"] if es_l else j["visita"], es_local=es_l, lin=lin, p=pw, q=pq)
+    return c
+
+
+def pata_de(c, tipo):
+    """(p_gana, p_push, cuota decimal o None si BetOnline no tiene precio) de una pata ML o spread ya calculada."""
+    if tipo == "ML":
+        return (c["p_fav"], 0.0, None if c["ml"] is None else decimal(c["ml"]))
+    return (c["p_sp"], c["q_sp"], decimal(c["cuota_sp"]))
+
+
+def parlay(patas):
+    """P(cobrar), EV y cuota decimal de un parlay de patas independientes [(p_gana, p_push, D)]. Si a alguna pata le
+    falta el precio de BetOnline, P(cobrar) se calcula igual y el EV y el pago quedan vacíos."""
+    P = R = D = 1.0
+    falta = False
+    for pg, pq, d in patas:
+        P *= pg + pq
+        if d is None:
+            falta = True
+            continue
+        R *= pg * d + pq
+        D *= d
+    return dict(n=len(patas), p=P, ev=None if falta else R - 1, D=None if falta else D)
+
+
+def teaser(patas):
+    """Teaser Wong de 6 pts [(p_gana, p_push)] con la tabla de BetOnline con recargo (premisa 5): un push baja un
+    nivel; en 2 patas (o si queda una sola) se devuelve lo apostado."""
+    n = len(patas)
+    dp = [1.0] + [0.0] * n                             # P(ninguna pierde y k push)
+    for pg, pq in patas:
+        nuevo = [0.0] * (n + 1)
+        for k in range(n + 1):
+            if dp[k]:
+                nuevo[k] += dp[k] * pg
+                if k < n:
+                    nuevo[k + 1] += dp[k] * pq
+        dp = nuevo
+    R = 0.0
+    for k, pk in enumerate(dp):
+        m = n - k
+        R += pk * (1.0 if (n == 2 and k >= 1) or m <= 1 else decimal(TEASER_PAGOS[m]))
+    return dict(n=n, p=sum(dp), ev=R - 1, D=decimal(TEASER_PAGOS[n]))
+
+
+def resultado_lado(margen_local, es_local, h):
+    x = (margen_local if es_local else -margen_local) + h
+    return "push" if abs(x) < 1e-9 else ("gana" if x > 0 else "pierde")
+
+
+def americana_txt(D):
+    return f"+{(D - 1) * 100:.0f}" if D >= 2 else f"-{100 / (D - 1):.0f}"
+
+
+def ev_txt(x):
+    return "" if x is None else f"{100 * x:+.1f}".replace(".", ",") + " %"
+
+
+def costo_txt(ev):
+    if ev is None:
+        return ""
+    return f"${-10 * ev:.2f}".replace(".", ",") if ev < 0 else f"gana ${10 * ev:.2f}".replace(".", ",")
+
+
+def uno_de_txt(p):
+    if not p:
+        return ""
+    x = 1 / p
+    return f"1 de cada {x:.1f}".replace(".", ",") if x < 10 else "1 de cada " + f"{round(x):,}".replace(",", ".")
+
+
+def boleto_calculado(snap, g26, bot_dir, ahora=None):
+    """Todo lo que muestra el boleto, calculado a partir de la foto guardada (y, si ya se jugó, del cierre y el resultado).
+    El cierre solo existe para los juegos que ya empezaron (inicio ≤ ahora)."""
+    import polars as pl
+    info = {r["game_id"]: r for r in g26.filter(pl.col("week") == snap["semana"]).iter_rows(named=True)}
+    juegos = [j for j in snap["juegos"] if j["game_id"] in info]
+    calc = {j["game_id"]: calcular_juego(j) for j in juegos}
+    inicios = {j["game_id"]: t_utc(j["inicio_utc"]) for j in juegos}
+    empezados = {g: t for g, t in inicios.items() if ahora is not None and t <= ahora}
+    ci = cierre_pin(bot_dir, empezados) if bot_dir and empezados else {}
+    cierre = {}
+    for j in juegos:
+        cc = ci.get(j["game_id"])
+        if cc and cc["ml_local"] is not None and cc["ml_visit"] is not None and cc["hcp_local"] is not None:
+            try:
+                cierre[j["game_id"]] = calcular_juego(j, dict(fuente="pinnacle", ml_local=cc["ml_local"], ml_visit=cc["ml_visit"],
+                                                              hcp_local=cc["hcp_local"], sp_local=cc["cuota_sp_local"],
+                                                              sp_visit=cc["cuota_sp_visit"]))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass                                   # una foto de cierre rara no frena el boleto: queda sin EV de cierre
+    res = {gid: _num(info[gid].get("result")) for gid in calc}
+    return juegos, calc, cierre, res, info
+
+
+def boletos_de(juegos, calc):
+    """Los boletos del resumen: [(nombre, tipo, patas[(gid, clase)], aviso)]; clase = 'ML', 'spread' o 'wong'."""
+    todos = [j["game_id"] for j in juegos]
+    sin_ml = sum(1 for g in todos if calc[g]["ml"] is None)
+    out = [("Solo ML · todos los juegos", "parlay", [(g, "ML") for g in todos], sin_ml),
+           ("Mixto · todos (ML o spread, el de menor costo)", "parlay", [(g, calc[g]["mixto"] or "ML") for g in todos],
+            sum(1 for g in todos if not calc[g]["mixto"]))]
+    orden = sorted(todos, key=lambda g: -calc[g]["p_fav"])
+    for k in PARLAY_PATAS:
+        if k <= len(orden):
+            out.append((f"Parlay ML · las {k} más probables", "parlay", [(g, "ML") for g in orden[:k]],
+                        sum(1 for g in orden[:k] if calc[g]["ml"] is None)))
+    wong = sorted([g for g in calc if calc[g]["wong"]], key=lambda g: -calc[g]["wong"]["p"])
+    if len(wong) >= 3:
+        for k in range(3, min(len(wong), max(TEASER_PAGOS)) + 1):
+            out.append((f"Teaser Wong 6 pts · {k} patas", "teaser", [(g, "wong") for g in wong[:k]], 0))
+    else:
+        out.append(("Teaser Wong 6 pts", "sin_wong", [(g, "wong") for g in wong], 0))
+    return out
+
+
+def medir_boleto(tipo, patas, calc):
+    if tipo == "teaser":
+        return teaser([(calc[g]["wong"]["p"], calc[g]["wong"]["q"]) for g, _ in patas])
+    return parlay([pata_de(calc[g], c) for g, c in patas])
+
+
+def resultado_boleto(tipo, patas, calc, res):
+    """Texto del resultado cuando ya se jugaron todos los juegos del boleto."""
+    if not patas or any(res.get(g) is None for g, _ in patas):
+        hechos = sum(1 for g, _ in patas if res.get(g) is not None)
+        return f"pendiente ({hechos} de {len(patas)} jugados)" if hechos else ""
+    r = []
+    for g, c in patas:
+        x = calc[g]
+        if c == "ML":
+            r.append(resultado_lado(res[g], x["fav_local"], 0.0))
+        elif c == "spread":
+            r.append(resultado_lado(res[g], x["fav_local"], x["h_sp"]))
+        else:
+            r.append(resultado_lado(res[g], x["wong"]["es_local"], x["wong"]["lin"] + 6))
+    gan, psh = r.count("gana"), r.count("push")
+    if tipo == "teaser":
+        esp = sum(calc[g]["wong"]["p"] for g, _ in patas)
+    else:
+        esp = sum(pata_de(calc[g], c)[0] for g, c in patas)
+    estado = "perdió" if "pierde" in r else ("devuelto (todo push)" if gan == 0 else "cobró")
+    return f"{estado} · acertó {gan} de {len(patas)}" + (f" ({psh} push)" if psh else "") + \
+        f" · esperado {esp:.1f}".replace(".", ",")
+
+
+def grilla_boleto(snap, g26, bot_dir, ahora=None):
+    """Filas de la pestaña (NCOL_BOLETO columnas) y qué filas llevan formato: {'encab': [...], 'azul': [...]}."""
+    def fila(*xs):
+        xs = ["" if x is None else x for x in xs]
+        return xs + [""] * (NCOL_BOLETO - len(xs))
+    base = ("Ningún dinero por el motor (31A). El lado de cada pata lo pone el mercado (favorito de Pinnacle sin vig); "
+            "el modelo no elige (H29: el cierre le gana por 0,4 pts) y solo deja una marca. Los parlays son decisión de Ozz, "
+            "por diversión: el de todos los favoritos cobra ~1 de cada 300 y cuesta ~33 % de lo apostado (H25). El teaser "
+            "Wong es lo único con valor medido (H28): monto mínimo, preferir 4 patas; el pago exacto de 3 y 4 patas con "
+            "recargo se confirma en el boleto de BetOnline.")
+    meta = {"encab": [], "azul": []}
+    if not snap:
+        filas = [fila("Boleto (informativo)", "Todavía no hay boleto: se arma solo en la próxima corrida que cuenta "
+                      "(miércoles o sábado 10:15, o T−85) con los juegos del domingo y el lunes."), fila("Base", base)]
+        return filas, meta
+    juegos, calc, cierre, res, info = boleto_calculado(snap, g26, bot_dir, ahora)
+    hay_nfl = any(calc[j["game_id"]]["nflverse"] for j in juegos)
+    nombre = NOMBRE_CORRIDA.get(snap["tipo"], snap["tipo"])
+    detalle = (f"Armado en la corrida {nombre} ({fecha_cc(t_utc(snap['corrida_utc']))}, Caracas) con las fotos del bot. "
+               f"Probabilidad: Pinnacle sin vig (≤ 3 h)" + ("; * = sin Pinnacle de ≤ 3 h: consenso de nflverse" if hay_nfl else "")
+               + ". Precio: BetOnline (≤ 12 h). Se congela al empezar el primer juego del domingo; después de los juegos "
+               "se agregan el EV contra el cierre de Pinnacle y el resultado.")
+    filas = [fila(f"Boleto (informativo) · Semana {snap['semana']}", detalle), fila("Base", base), fila()]
+    meta["encab"].append(len(filas))
+    filas.append(fila("Boleto", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)", "Costo por $10",
+                      "EV vs cierre", "Resultado"))
+    for nombre_b, tipo, patas, sin_precio in boletos_de(juegos, calc):
+        if tipo == "sin_wong":
+            filas.append(fila(nombre_b, str(len(patas)), f"hay {len(patas)} patas azules: hacen falta 3"))
+            meta["azul"].append(len(filas) - 1)
+            continue
+        if not patas:
+            continue
+        m = medir_boleto(tipo, patas, calc)
+        evc = ""
+        if all(g in cierre for g, _ in patas):
+            try:
+                evc = ev_txt(medir_boleto(tipo, patas, {g: cierre[g] for g, _ in patas})["ev"])
+            except (TypeError, KeyError):
+                evc = ""
+        pago = "" if m["D"] is None else americana_txt(m["D"]) + (" (aprox.)" if tipo == "teaser" and m["n"] in (3, 4) else "")
+        filas.append(fila(nombre_b, f"{m['n']}" + (f" ({sin_precio} sin precio)" if sin_precio else ""), pago,
+                          pct(m["p"], 2 if m["p"] < 0.1 else 1), uno_de_txt(m["p"]), ev_txt(m["ev"]), costo_txt(m["ev"]),
+                          evc, resultado_boleto(tipo, patas, calc, res)))
+        if tipo == "teaser":
+            meta["azul"].append(len(filas) - 1)
+    filas.append(fila())
+    meta["encab"].append(len(filas))
+    filas.append(fila("Juego", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline",
+                      "Cubre (Pinnacle)", "EV spread", "Mixto usa", "Modelo (solo marca)", "Pata Wong +6", "Resultado"))
+    for j in juegos:
+        gid, c, g = j["game_id"], calc[j["game_id"]], info[j["game_id"]]
+        b = j.get("bo") or {}
+        edad = _num(b.get("horas"))
+        edad_t = "" if edad is None else (f" (hace {edad:.0f} h)" if edad >= 1 else f" (hace {60 * edad:.0f} min)")
+        ml = "sin precio" if c["ml"] is None else f"{c['ml']:+.0f}" + edad_t
+        sp = "sin precio" if c["h_sp"] is None else f"{c['fav']} {c['h_sp']:+.1f} ({c['cuota_sp']:+.0f})"
+        cubre = "" if c["p_sp"] is None else pct(c["p_sp"], 1) + (f" · push {pct(c['q_sp'], 1)}" if c["q_sp"] >= 0.005 else "")
+        mo = j.get("modelo")
+        if not mo:
+            marca = ""
+        elif mo.get("fuera"):
+            marca = f"fuera ({mo['fuera']})"
+        else:
+            pm = mo["p_local"] if c["fav_local"] else 1 - mo["p_local"]
+            otro = j["visita"] if c["fav_local"] else j["local"]
+            marca = f"de acuerdo · {pct(pm)}" if pm >= 0.5 else f"prefiere {otro} · {pct(1 - pm)}"
+        w = c["wong"]
+        wong = "" if not w else f"{w['eq']} +{w['lin'] + 6:.1f} · {pct(w['p'], 1)}"
+        r = res.get(gid)
+        resultado = ""
+        if r is not None:
+            partes = [resultado_txt(g), "ML " + {"gana": "ganó", "pierde": "perdió", "push": "empate"}[resultado_lado(r, c["fav_local"], 0.0)]]
+            if c["h_sp"] is not None:
+                partes.append("spread " + {"gana": "cubrió", "pierde": "no cubrió", "push": "push"}[resultado_lado(r, c["fav_local"], c["h_sp"])])
+            if w:
+                partes.append("Wong " + {"gana": "cubrió", "pierde": "no cubrió", "push": "push"}[resultado_lado(r, w["es_local"], w["lin"] + 6)])
+            resultado = " · ".join(partes)
+        filas.append(fila(f"{fecha_cc(t_utc(j['inicio_utc']), False)} · {j['visita']} @ {j['local']}",
+                          c["fav"] + ("*" if c["nflverse"] else ""), pct(c["p_fav"], 1), ml, ev_txt(c["ev_ml"]), sp, cubre,
+                          ev_txt(c["ev_sp"]), c["mixto"] or "", marca, wong, resultado))
+        if w:
+            meta["azul"].append(len(filas) - 1)
+    for gid in snap.get("sin_ref", []):
+        g = info.get(gid)
+        if g:
+            filas.append(fila(f"{fecha_cc(g['inicio'], False)} · {g['away_team']} @ {g['home_team']}", "sin líneas"))
+    filas.append(fila())
+    filas.append(fila("Notas", "EV = ganancia esperada por cada $1 contra Pinnacle sin vig (negativo = costo). Costo por "
+                      "$10 = lo que se pierde en promedio por cada $10 apostados. P(cobrar) supone patas independientes. "
+                      "Spread y teaser: distribución del margen 2012-2025 (juegos con spread a ≤ 1,5 pts) anclada a la línea "
+                      "de referencia. Teaser: tabla de BetOnline con recargo Wong (2 −120, 3 +151, 4 +248, 5 +420, 6 +600); "
+                      "un push baja un nivel. EV vs cierre: los mismos precios de BetOnline contra la última foto de "
+                      "Pinnacle antes de cada juego. Pata azul = pata Wong (underdog +1,5 a +2,5, total < 50)."))
+    return filas, meta
+
+
+def grilla_boleto_prueba():
+    """Boleto de muestra con todas las clases de fila (para 'hoja-prueba'; no sale de datos reales)."""
+    def fila(*xs):
+        return list(xs) + [""] * (NCOL_BOLETO - len(xs))
+    filas = [fila("Boleto (informativo) · PRUEBA", "detalle de la corrida"), fila("Base", "advertencias"), fila(),
+             fila("Boleto", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)", "Costo por $10", "EV vs cierre", "Resultado"),
+             fila("Solo ML · todos los juegos", "15", "+52300", "0,19 %", "1 de cada 532", "-30,1 %", "$3,01", "", ""),
+             fila("Teaser Wong 6 pts · 3 patas", "3", "+151 (aprox.)", "41,6 %", "1 de cada 2,4", "+3,8 %", "gana $0,38", "", ""),
+             fila(),
+             fila("Juego", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline", "Cubre (Pinnacle)",
+                  "EV spread", "Mixto usa", "Modelo (solo marca)", "Pata Wong +6", "Resultado"),
+             fila("dom 13:00 · PRU @ EBA", "EBA", "75,0 %", "-320", "-1,6 %", "EBA -2.5 (-110)", "51,0 %", "-2,6 %", "ML",
+                  "de acuerdo · 70 %", "PRU +8.5 · 74,0 %", ""),
+             fila(), fila("Notas", "notas")]
+    return filas, {"encab": [3, 7], "azul": [5, 8]}
+
+
+def crear_boleto(hoja, filas, meta, titulo=TITULO_BOLETO, sid=SID_BOLETO):
+    """(Re)crea la pestaña del boleto, primera a la izquierda, con su formato, y escribe las filas."""
+    ps = hoja.pestanas()
+    viejas = [i for nombre, i in ps.items() if nombre == titulo]       # solo la pestaña del boleto, por su nombre
+    if viejas:
+        hoja.lote([{"deleteSheet": {"sheetId": i}} for i in viejas])
+    otras = {i for nombre, i in ps.items() if nombre != titulo}
+    while sid in otras:                                                # nunca toca otra pestaña que use ese número
+        sid += 1
+    n = len(filas) + 2
+    fondo = lambda f0, f1, color: {"repeatCell": {"range": _rango(sid, f0, f1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {  # noqa: E731
+        "backgroundColorStyle": {"rgbColor": _rgb(color)}}}, "fields": "userEnteredFormat.backgroundColorStyle"}}
+    ancho = lambda c0, c1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0,  # noqa: E731
+                                                                        "endIndex": c1}, "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+    pedidos = [
+        {"addSheet": {"properties": {"sheetId": sid, "title": titulo, "index": 0,
+                                     "gridProperties": {"rowCount": n, "columnCount": NCOL_BOLETO, "frozenColumnCount": 1}}}},
+        # filas 1 y 2: A rótulo | B-L texto (la combinación no cruza el borde de la columna A inmovilizada)
+        {"mergeCells": {"range": _rango(sid, 0, 1, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
+        {"mergeCells": {"range": _rango(sid, 1, 2, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
+        {"repeatCell": {"range": _rango(sid, 0, 2, 0, 1), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat"}},
+        {"repeatCell": {"range": _rango(sid, 0, 1, 1, NCOL_BOLETO), "cell": {"userEnteredFormat": {"textFormat": {
+            "fontSize": 9, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}}}, "fields": "userEnteredFormat.textFormat"}},
+        {"repeatCell": {"range": _rango(sid, 0, 2, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
+                        "verticalAlignment": "MIDDLE"}}, "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
+        fondo(1, 2, COLORES["resumen"]),
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 2},
+                                       "properties": {"pixelSize": 66}, "fields": "pixelSize"}},
+        ancho(0, 1, 235), ancho(1, 2, 105), ancho(2, 3, 150), ancho(3, 4, 120), ancho(4, 5, 105), ancho(5, 6, 140),
+        ancho(6, 7, 135), ancho(7, 8, 110), ancho(8, 9, 240), ancho(9, 10, 170), ancho(10, 11, 160), ancho(11, 12, 300),
+    ]
+    for f in meta.get("azul", []):
+        pedidos.append(fondo(f, f + 1, COLORES["azul"]))
+    for f in meta.get("encab", []):
+        pedidos.append({"repeatCell": {"range": _rango(sid, f, f + 1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
+            "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
+            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,"
+                      "userEnteredFormat.verticalAlignment"}})
+    if filas and filas[-1][0] == "Notas":                 # la fila de notas: texto chico y ajustado
+        f = len(filas) - 1
+        pedidos += [{"mergeCells": {"range": _rango(sid, f, f + 1, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
+                    {"repeatCell": {"range": _rango(sid, f, f + 1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {
+                        "wrapStrategy": "WRAP", "textFormat": {"fontSize": 9}}},
+                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.textFormat"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": f, "endIndex": f + 1},
+                                                   "properties": {"pixelSize": 60}, "fields": "pixelSize"}}]
+    hoja.lote(pedidos)
+    hoja.escribir(f"'{titulo}'!A1:{chr(64 + NCOL_BOLETO)}{len(filas)}", filas)
+    return sid
+
+
+def actualizar_boleto(hoja, g26, bot_dir, ahora):
+    """Pestaña 'Boleto (informativo)' con el boleto guardado más reciente (o el aviso de que todavía no hay)."""
+    if hoja is None:
+        return
+    filas, meta = grilla_boleto(ultimo_boleto(), g26, bot_dir, ahora)
+    crear_boleto(hoja, filas, meta)
+
+
+def texto_boleto(snap, g26):
+    """Una línea para Telegram con lo esencial del boleto recién armado."""
+    if not snap:
+        return ""
+    juegos, calc, _, _, _ = boleto_calculado(snap, g26, None)
+    partes = []
+    for nombre_b, tipo, patas, _sp in boletos_de(juegos, calc):
+        if nombre_b.startswith("Solo ML") or nombre_b.startswith("Mixto") or (tipo == "teaser" and len(patas) in (3, 4)):
+            if patas:
+                m = medir_boleto(tipo, patas, calc)
+                corto = "teaser Wong" if tipo == "teaser" else ("solo ML" if nombre_b.startswith("Solo ML") else "mixto")
+                partes.append(f"{corto} {m['n']} patas: P(cobrar) {pct(m['p'], 2 if m['p'] < 0.1 else 1)} "
+                              f"({uno_de_txt(m['p'])}), " + (f"EV {ev_txt(m['ev'])}" if m["ev"] is not None
+                                                             else "sin precio de BetOnline en alguna pata"))
+        elif tipo == "sin_wong":
+            partes.append(f"teaser Wong: {len(patas)} patas azules (hacen falta 3)")
+    return ("🎫 Boleto semana " + str(snap["semana"]) + " (informativo, ningún dinero por el motor): " + " · ".join(partes)
+            + ". Detalle en la pestaña Boleto.")
 
 
 # --------------------------------------------------------------------------------------
@@ -1490,6 +2351,15 @@ def fila_base(ctx, gs, i, m, t_i, F, sem, tipo, ahora):
              ajuste_qb_visita_pts=round(float(F["adj"][i, 1]) * s2.RESP["a_p"], 2))
     f["nfl_spread_line"] = gs["spread_line"][i]; f["nfl_total_line"] = gs["total_line"][i]
     f["spread_modelo"] = round(-f["margen"], 2)                       # convención de la casa: local −3,5 = favorito
+    # v7 (ajuste 4, descriptivo): piezas del margen en puntos a favor del local, leídas de la fuerza del partido que ya
+    # se usó en la simulación (no se simula nada aparte): diferencia de EPA por pase y por corrida (fuerza propia +
+    # defensa rival), ajuste por QB y localía, por la respuesta lineal del simulador (RESP de s2-v1)
+    a_p, a_r = s2.RESP["a_p"], s2.RESP["a_r"]
+    adj, hh = float(F["adj"][i, 0] - F["adj"][i, 1]), float(F["h"][i])
+    f["comp_qb_pts"] = round(a_p * adj, 2)
+    f["comp_localia_pts"] = round((a_p + a_r) * 2 * hh, 2)
+    f["comp_pase_pts"] = round(a_p * (float(F["dp"][i, 0] - F["dp"][i, 1]) - adj - 2 * hh), 2)
+    f["comp_corrida_pts"] = round(a_r * (float(F["dr"][i, 0] - F["dr"][i, 1]) - 2 * hh), 2)
     return f
 
 
@@ -1582,6 +2452,7 @@ def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, sombra=None):
             mg, tt, F = simular_semana(ctx, gs, sem, args.n_sims)
             pin = lineas_bot(args.bot_dir, "pinnacle", gs["game_id"].to_list(), ahora, MAX_EDAD_PIN_H)
             bo = lineas_bot(args.bot_dir, "betonlineag", gs["game_id"].to_list(), ahora, MAX_EDAD_BO_H)
+            ap = apertura_pin(args.bot_dir, gs["game_id"].to_list(), ahora)          # v7: solo descriptivo
             for i in range(gs.height):     # solo arma la fila de salida de cada juego (la simulación ya corrió en paralelo)
                 gid = gs["game_id"][i]
                 m = mg[i]
@@ -1597,6 +2468,9 @@ def correr(tareas_a_correr, g_all, g26, args, ahora, ctx=None, sombra=None):
                 b = bo.get(gid)
                 if b:
                     f.update(bo_ts=b["ts"], bo_horas=b["horas"], bo_hcp_local=b["hcp_local"], bo_ml_local=b["ml_local"], bo_ml_visit=b["ml_visit"])
+                    f.update(bo_cuota_sp_local=b["cuota_sp_local"], bo_cuota_sp_visit=b["cuota_sp_visit"])     # v7
+                if gid in ap:
+                    f["pin_ap_ts"], f["pin_ap_hcp_local"] = ap[gid]                                           # v7
                 nsp = f["nfl_spread_line"]
                 if f.get("pin_hcp_local") is not None:
                     f["ref_spread"] = "pinnacle"; f["spread_ref"] = f["pin_hcp_local"]
@@ -1695,14 +2569,15 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
     t = pestana(semana)
     asegurar_pestana(hoja, semana)
     jg = g26.filter(pl.col("week") == semana).sort(["inicio", "game_id"])
-    claves = [r[0] if r else "" for r in hoja.leer(f"'{t}'!{COL_ID}5:{COL_ID}{FILAS_MAX}")]
+    claves = [r[0] if r else "" for r in hoja.leer(f"'{t}'!{COL_ID}5:{COL_ID}{4 + JUEGOS_MAX}")]
     while claves and not claves[-1]:
         claves.pop()
     for gid in jg["game_id"].to_list():                 # juegos nuevos al final; nunca se reordena
         if gid not in claves:
             claves.append(gid)
-    claves = claves[:FILAS_MAX - 4]
+    claves = claves[:JUEGOS_MAX]
     info = {r["game_id"]: r for r in jg.iter_rows(named=True)}
+    bloque, eq = filas_equipos(g26, semana)                 # v7, ajuste 8
     ult = ultimas_proyecciones(semana)
     filas, cierres = [], []
     for gid in claves:
@@ -1711,12 +2586,12 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
         if g is None:
             filas.append([""] * (NCOL - 1) + [gid]); continue
         loc, vis = g["home_team"], g["away_team"]
-        base = [fecha_cc(g["inicio"]), f"{vis} @ {loc}"]
+        base = [fecha_cc(g["inicio"]), f"{vis} ({record_txt(eq[vis])}) @ {loc} ({record_txt(eq[loc])})"]
         c = cierre_de(g, u)
         cierres.append(c)
         if not u:
             lin = linea_txt(loc, vis, -g["spread_line"] if g["spread_line"] is not None else None)
-            filas.append(base + [lin + (" (nflverse)" if lin else "")] + [""] * 10 + columnas_cierre(c) + ["", "", gid])
+            filas.append(base + [lin + (" (nflverse)" if lin else "")] + [""] * (N_PROY - 3) + columnas_cierre(c) + ["", "", gid])
             continue
         marca = {"nflverse": " (cierre)" if u.get("tipo") == "retro" else " (nflverse)"}.get(u.get("ref_spread"), "")
         ref = linea_txt(loc, vis, u["spread_ref"]) + marca
@@ -1724,12 +2599,14 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
         fila = base + [ref, linea_txt(loc, vis, u["spread_modelo"]), dif_txt(loc, vis, u["spread_modelo"], u["spread_ref"]),
                        "" if tot_c is None else f"{tot_c:.1f}", f"{float(u['total']):.1f}",
                        gana_txt(loc, vis, u["p_local"]), gana_txt(loc, vis, u.get("pin_p_ml_local")),
-                       senal_ml_txt(u), senal_sp_txt(u), wong_txt(u), estado_txt(u)]
+                       celda_senal(u, "ml"), celda_senal(u, "sp"), wong_txt(u), estado_txt(u), porque_txt(u)]
         qb = (nombres_qb.get(u["qb_visita_id"], u["qb_visita_id"]) + " @ " + nombres_qb.get(u["qb_local_id"], u["qb_local_id"]))
         filas.append(fila + columnas_cierre(c) + [qb, f"{u['tipo']} {fecha_cc(t_utc(u['corrida_utc']), False)}", gid])
     n = len(claves)
     if n:
         hoja.escribir(f"'{t}'!A5:{COL_ID}{4 + n}", [["" if x is None else x for x in f] for f in filas])
+    ult_col = chr(64 + len(ENCAB_EQUIPOS))
+    hoja.escribir(f"'{t}'!A{FILA_EQUIPOS}:{ult_col}{FILA_EQUIPOS + len(bloque) - 1}", bloque)
     nota = (" · semana retrospectiva: proyecciones hechas después de los juegos" if semana < SEMANA_AUTO
             else " · semana informativa, fuera de 31A" if semana < SEMANA_31A else "")
     hoja.escribir(f"'{t}'!A1:C1", [[f"Semana {semana} · NFL {TEMPORADA}", "",
@@ -1739,9 +2616,10 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
     hoja.escribir(f"'{t}'!A3:C3", [["Resumen", "", resumen_txt(cierres, jg.height) + (" " + conf + "." if conf else "")]])
 
 
-def escribir_semanas(hoja, g26, semanas, nombres_qb, ahora, estado):
+def escribir_semanas(hoja, g26, semanas, nombres_qb, ahora, estado, bot_dir=None):
     """Reescribe las pestañas de esas semanas (de la más vieja a la más nueva, así la más nueva queda primera) y anota
-    los resultados ya mostrados. Devuelve las semanas que fallaron."""
+    los resultados ya mostrados; al final (v7) rehace la pestaña del boleto, que queda primera. Devuelve las semanas
+    que fallaron (un error en el boleto se anota en el log pero no frena nada)."""
     import polars as pl
     fallas = []
     for s_ in sorted(set(semanas)):
@@ -1753,7 +2631,14 @@ def escribir_semanas(hoja, g26, semanas, nombres_qb, ahora, estado):
         except Exception as e:  # noqa: BLE001
             fallas.append(s_)
             log(f"Hoja: error al escribir la pestaña {pestana(s_)} ({type(e).__name__}: {str(e)[:300]})")
+    try:
+        actualizar_boleto(hoja, g26, bot_dir, ahora)
+        log(f"hoja: pestaña {TITULO_BOLETO} actualizada")
+    except Exception as e:  # noqa: BLE001
+        log(f"Hoja: error al escribir la pestaña {TITULO_BOLETO} ({type(e).__name__}: {str(e)[:300]})")
     return fallas
+
+
 def texto_telegram(resumenes):
     lin = []
     for tipo, clave, filas, avisos in resumenes:
@@ -1775,7 +2660,8 @@ def texto_telegram(resumenes):
         if bs:
             lin.append(f"⚠️ Revisión de sesgo de la semana: spread {bs[0].get('sesgo_spread_semana')} / total {bs[0].get('sesgo_total_semana')}")
         lin += [f"Aviso: {a}" for a in avisos]
-        lin.append("* = consenso de nflverse (no hay Pinnacle de ≤ 3 h). 🔴 revisar (modelo y mercado muy distintos, o QB dudoso) · 🟢 candidata del modelo · 🔵 pata Wong.")
+        lin.append("* = consenso de nflverse (no hay Pinnacle de ≤ 3 h). 🔴 fuera: no se usa el modelo (modelo y mercado muy "
+                   "distintos, o QB dudoso) · 🟢 señal que cuenta para el registro 29A (ningún dinero por el motor, 31A) · 🔵 pata Wong.")
         lin.append("")
     return "\n".join(lin).strip()
 
@@ -1862,6 +2748,11 @@ def main():
         if args.modo != "auto":
             print("Ya hay una corrida de semana.py en marcha.")
         return
+    _LOG_BOT.clear()
+    mig = migrar_registro()                            # v7: columnas nuevas al final del registro (una sola vez)
+    if mig:
+        log(f"{VERSION_SEMANA}: registro con las columnas de v7 ({mig[1]} filas; ningún valor cambió); "
+            f"el original quedó en {mig[0].name}")
     estado = leer_estado()
     g_all, g26 = calendario(MAX_EDAD_CAL_H)
     hoja = abrir_hoja(args)
@@ -1894,6 +2785,15 @@ def main():
             print(f"Hoja: conecta, pero falló la pestaña de prueba ({type(e).__name__}: {str(e)[:300]})")
             return
         print("Hoja OK: pestaña de prueba con el formato semanal creada, escrita y borrada")
+        # v7: boleto de prueba con el mismo formato (encabezados, filas azules, notas); se borra al terminar
+        try:
+            filas, meta = grilla_boleto_prueba()
+            sid_b = crear_boleto(hoja, filas, meta, TITULO_BOLETO_PRUEBA, SID_BOLETO_PRUEBA)
+            hoja.lote([{"deleteSheet": {"sheetId": sid_b}}])
+        except Exception as e:  # noqa: BLE001
+            print(f"Hoja: falló el boleto de prueba ({type(e).__name__}: {str(e)[:300]})")
+            return
+        print("Hoja OK: boleto de prueba con el formato real creado, escrito y borrado")
         return
 
     if args.modo == "estado":
@@ -1927,6 +2827,11 @@ def main():
                   f"{estado.get('gemini_prueba', {}).get(hoy, 0)}/{GEMINI_MAX_PRUEBA_DIA} de piloto")
         else:
             print("Agente Gemini (sombra): apagado (no hay credenciales/gemini.key)")
+        b = ultimo_boleto()
+        print(f"Boleto (informativo): semana {b['semana']}, armado en la corrida {NOMBRE_CORRIDA.get(b['tipo'], b['tipo'])} "
+              f"({fecha_cc(t_utc(b['corrida_utc']))}) · "
+              f"{len(b['juegos'])} juegos, {_frescas(b)} con líneas frescas" if b else
+              "Boleto (informativo): todavía no hay (se arma en la próxima corrida que cuenta)")
         return
 
     if args.modo == "qb":
@@ -1943,8 +2848,8 @@ def main():
             print("Hoja: no configurada (falta semana.ini o la credencial) o no se pudo abrir.")
             return
         semanas = [args.semana] if args.semana else semanas_con_datos(g26)
-        log(f"{VERSION_SEMANA}: rehago las pestañas {semanas} (sin simular)")
-        escribir_semanas(hoja, g26, semanas, nombres_de_qb(g26, leer_roster()), ahora, estado)
+        log(f"{VERSION_SEMANA}: rehago las pestañas {semanas} y el boleto (sin simular)")
+        escribir_semanas(hoja, g26, semanas, nombres_de_qb(g26, leer_roster()), ahora, estado, args.bot_dir)
         guardar_estado(estado)
         log("== LISTO")
         return
@@ -1953,7 +2858,7 @@ def main():
         log(f"{VERSION_SEMANA}: retrospectiva de los juegos de {TEMPORADA} ya jugados")
         filas, ctx = retro(g_all, g26, args, ahora)
         if hoja is not None and filas:
-            escribir_semanas(hoja, g26, {f["semana"] for f in filas}, ctx["nombres_qb"], ahora, estado)
+            escribir_semanas(hoja, g26, {f["semana"] for f in filas}, ctx["nombres_qb"], ahora, estado, args.bot_dir)
             guardar_estado(estado)
         if filas and not args.sin_telegram:
             ctx["s2"].telegram(texto_retro(filas, g26))
@@ -1968,7 +2873,7 @@ def main():
             if nuevos and (falla is None or (ahora - falla).total_seconds() > 1800):
                 # solo cierre de juegos: reescribe esas pestañas, sin simular (si la hoja falló, reintenta cada 30 min)
                 log(f"{VERSION_SEMANA}: resultados nuevos en las semanas {sorted(nuevos)}")
-                if escribir_semanas(hoja, g26, nuevos.keys(), nombres_de_qb(g26, leer_roster()), ahora, estado):
+                if escribir_semanas(hoja, g26, nuevos.keys(), nombres_de_qb(g26, leer_roster()), ahora, estado, args.bot_dir):
                     estado["ultima_falla_hoja"] = iso(ahora)
                 else:
                     estado.pop("ultima_falla_hoja", None)
@@ -1990,14 +2895,28 @@ def main():
         elif tipo == "t85":
             estado["grupos"][clave] = iso(ahora)
     guardar_estado(estado)
+    boletos = []                                      # v7: boleto informativo, solo en las corridas que cuentan
+    for tipo, _, filas, _ in resumenes:
+        for s_ in sorted({f["semana"] for f in filas}):
+            try:
+                b = armar_boleto(g26, s_, args.bot_dir, ahora, tipo)
+                if b:
+                    boletos.append(b)
+            except Exception as e:  # noqa: BLE001
+                log(f"Boleto: no se pudo armar el de la semana {s_} ({type(e).__name__}: {str(e)[:200]})")
     if hoja is not None:
         sems = {f["semana"] for _, _, filas, _ in resumenes for f in filas} | set(resultados_nuevos(g26, estado).keys())
-        escribir_semanas(hoja, g26, sems, nombres_qb, ahora, estado)
+        escribir_semanas(hoja, g26, sems, nombres_qb, ahora, estado, args.bot_dir)
         guardar_estado(estado)
     if resumenes and not args.sin_telegram:
         sys.path.insert(0, str(BASE))
         import sprint2 as s2
-        s2.telegram(texto_telegram(resumenes))
+        txt = texto_telegram(resumenes)
+        try:
+            txt += ("\n\n" + texto_boleto(boletos[-1], g26)) if boletos else ""
+        except Exception as e:  # noqa: BLE001
+            log(f"Boleto: no se pudo resumir para Telegram ({type(e).__name__})")
+        s2.telegram(txt)
     if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
         gemini_sombra(sombra, ahora, estado)
         guardar_estado(estado)
