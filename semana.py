@@ -65,7 +65,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v7 (3-oct-2026)"
+VERSION_SEMANA = "semana-v8 (3-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -101,6 +101,12 @@ VERSION_SEMANA = "semana-v7 (3-oct-2026)"
 #     los juegos de cada "Semana N", el bloque de los 32 equipos ordenados por récord con lo que pasó ANTES de esa
 #     semana: récord, ganados esperados por el mercado, ATS contra el cierre, QB del último juego, puntos a favor y en
 #     contra, rival de esta semana y la semana pasada. Sale solo de nflverse (descriptivo; no toca el modelo).
+# v8 (3-oct, pedido de Ozz: "que la entienda un niño de 10 años y un abuelo de 76"; v7 no llegó a instalarse): la hoja
+#     se lee en palabras. Cada "Semana N" empieza con la parte simple (partido, cuándo, favorito de las apuestas, qué tan
+#     seguro con "7 de cada 10" y una barrita, la máquina en prueba en palabras, teaser y resultado) y deja todo el
+#     detalle técnico de v7 a la derecha, en gris, después de una columna vacía. El bloque de equipos y el Boleto van en
+#     frases (el Boleto conserva su tabla técnica a la derecha). Solo cambia la presentación: proyección, registro,
+#     selecciones, boleto y agente Gemini quedan como en v7.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -131,8 +137,8 @@ WONG_LINEAS, WONG_TOTAL_MAX = (1.5, 2.0, 2.5), 50.0   # H26/H28
 FILAS_MAX = 60                     # filas por pestaña semanal (v7: encabezado en la 4, juegos 5-24, equipos 26-59)
 JUEGOS_MAX = 20                    # filas de juegos de cada semana (5 a 24)
 FILA_EQUIPOS = 26                  # v7, ajuste 8: título del bloque de equipos (encabezado en la 27, equipos desde la 28)
-ENCAB_EQUIPOS = ["Equipo", "Récord", "Esperados (mercado)", "ATS (vs cierre)", "QB del último juego",
-                 "Puntos a favor / en contra", "Esta semana", "Semana pasada"]
+ENCAB_EQUIPOS = ["Equipo", "Ganados-perdidos", "Las apuestas esperaban (ganados)", "Contra la línea de las apuestas",
+                 "Puntos por partido", "Esta semana", "La semana pasada"]
 BE_ESTANDAR = -110                 # precio para "necesita X %" cuando BetOnline no tiene la línea de Pinnacle
 
 CAMPOS = ["corrida_utc", "tipo", "version", "game_id", "semana", "game_type", "inicio_utc", "local", "visita",
@@ -415,31 +421,31 @@ def pestana(sem):
     return f"Semana {sem}"
 
 
-# Columnas de la pestaña semanal (v4: todo lo escribe la EC2; la hoja es de solo lectura)
-#   A-N proyección · O-S cierre (se llenan solas con el resultado) · T-V datos de control (gris chico)
-#   v7: "Revisar / estado" → "Estado" y columna nueva N "Por qué difiere"
-ENCAB = ["Inicio (Caracas)", "Juego", "Línea mercado", "Línea modelo", "Modelo vs mercado", "Total consenso",
-         "Total modelo", "Gana (modelo)", "Gana (Pinnacle)", "Señal ML", "Señal spread", "Pata Wong (BetOnline)",
-         "Estado", "Por qué difiere", "Resultado", "Error modelo / cierre", "Lado del modelo", "Total real",
-         "Pata Wong +6", "QB usados", "Corrida", "game_id"]
-NCOL = len(ENCAB)                                   # 22 (A-V)
-COL_ID = "V"
-N_PROY = 14                                         # A-N: proyección (las reglas de color rojo y gris cubren estas)
+# Columnas de la pestaña semanal (v8). A-G: parte simple (lo que se lee) · H: separador · I-AB: detalle técnico de v7, en gris
+#   (proyección I-T, cierre U-Y, control Z-AB). Todo lo escribe la EC2; la hoja es de solo lectura.
+ENCAB_SIMPLE = ["Partido", "Cuándo", "Favorito (las apuestas)", "¿Qué tan seguro?",
+                "La máquina (en prueba, no apostar por ella)", "Teaser (6 puntos extra)", "Resultado"]
+ENCAB_TEC = ["Línea mercado", "Línea modelo", "Modelo vs mercado", "Total consenso", "Total modelo", "Gana (modelo)",
+             "Gana (Pinnacle)", "Señal ML", "Señal spread", "Pata Wong (BetOnline)", "Estado", "Por qué difiere",
+             "Resultado (técnico)", "Error modelo / cierre", "Lado del modelo", "Total real", "Pata Wong +6", "QB usados",
+             "Corrida", "game_id"]
+ENCAB = ENCAB_SIMPLE + [""] + ENCAB_TEC
+NCOL = len(ENCAB)                                   # 28 (A-AB)
+COL_ID = "AB"
+NS = len(ENCAB_SIMPLE)                              # 7: A-G
+T0 = NS + 1                                         # 8: primera columna técnica (I)
 COLORES = {"verde": "#D9EAD3", "azul": "#9FC5E8", "rojo": "#F4CCCC", "cierre": "#D0E0E3", "resumen": "#F3F3F3",
            "encab": "#1F3864", "gris": "#999999", "gris_texto": "#808080", "blanco": "#FFFFFF",
-           "cubrio": "#B7E1CD", "no_cubrio": "#F4C7C3"}
-LEYENDA = ["Colores", "",
-           "Verde: señal del modelo que cuenta para el registro 29A (sin validar; H29: el cierre le gana por 0,4 pts). "
-           "Ningún dinero por el motor (31A).",
-           "", "", "",
-           "Azul: pata Wong para teaser de 6 pts (underdog +1,5 a +2,5, total < 50). Lo único con valor medido (H28).",
-           "", "",
-           "Rojo (Fuera): el modelo y el mercado difieren mucho, o el QB es dudoso. En ese juego no se usa el modelo: "
-           "sus señales quedan excluidas.",
-           "", "", "", "",
-           "Cierre (se llena solo al terminar el juego): verde = cubrió, rojo = no cubrió. Error = puntos de diferencia con el resultado.",
-           "", "", "", "",
-           "Gris en cursiva: proyección retro, hecha después del juego. No cuenta para 31A ni para el CLV.", "", ""]
+           "cubrio": "#B7E1CD", "no_cubrio": "#F4C7C3", "encab_tec": "#7F7F7F"}
+COMO_LEER = ("El favorito es el equipo que las apuestas creen que gana; «por 7 puntos» es por cuánto creen que gana. "
+             "«7 de cada 10» quiere decir que, si el partido se jugara 10 veces, ganaría unas 7. La máquina es nuestro "
+             "programa: está a prueba y no se apuesta por ella. Azul: ese equipo sirve para el teaser (6 puntos extra). "
+             "Más a la derecha, en gris, está el detalle técnico: no hace falta leerlo.")
+LEYENDA_TEC = ("Detalle técnico (no hace falta leerlo). Verde: señal del modelo que cuenta para el registro 29A (sin validar; "
+               "H29: el cierre le gana por 0,4 pts; ningún dinero por el motor, 31A). Azul: pata Wong (H28). Rojo (Fuera): el "
+               "modelo y el mercado difieren mucho, o el QB es dudoso: no se usa el modelo. Gris en cursiva: retro (hecha "
+               "después del juego; no cuenta). Cierre: verde = cubrió, rojo = no cubrió. Líneas en convención de la casa: "
+               "DAL -3.5 = DAL favorito por 3,5.")
 
 
 def _rgb(h):
@@ -455,87 +461,81 @@ TITULO_PRUEBA, SID_PRUEBA = "Prueba (se borra sola)", 1999     # pestaña tempor
 
 
 def crear_pestana(hoja, sem, titulo=None, sid=None):
-    """Crea la pestaña 'Semana N' (primera a la izquierda) con encabezado, leyenda, fila resumen y formatos.
-    Columnas A-B inmovilizadas (inicio y juego): ninguna celda combinada cruza ese borde, porque Sheets
-    rechaza toda la tanda con 400 ("no puedes combinar columnas inmovilizadas con columnas móviles")."""
+    """Crea la pestaña 'Semana N' (primera a la izquierda). v8: parte simple A-G (A inmovilizada), separador H y detalle
+    técnico I-AB en gris; bloque de equipos debajo de los juegos. Ninguna celda combinada cruza el borde A|B (Sheets
+    rechaza toda la tanda con 400 si una combinación cruza las columnas inmovilizadas)."""
     sid = 1000 + sem if sid is None else sid
     t = titulo or pestana(sem)
     F = FILAS_MAX
-    G = 4 + JUEGOS_MAX                                  # fin de las filas de juegos (las reglas de color no tocan el bloque de equipos)
+    G = 4 + JUEGOS_MAX                                  # fin de las filas de juegos (los colores no tocan el bloque de equipos)
     E = FILA_EQUIPOS - 1                                # fila del título del bloque de equipos (índice desde 0)
     fondo = lambda r, color: {"repeatCell": {"range": r, "cell": {"userEnteredFormat": {"backgroundColorStyle": {"rgbColor": _rgb(color)}}},  # noqa: E731
                                              "fields": "userEnteredFormat.backgroundColorStyle"}}
+    texto = lambda r, fmt, campos="userEnteredFormat.textFormat": {"repeatCell": {"range": r, "cell": {"userEnteredFormat": fmt},  # noqa: E731
+                                                                                 "fields": campos}}
     regla = lambda rangos, formula, fmt, idx: {"addConditionalFormatRule": {"index": idx, "rule": {  # noqa: E731
         "ranges": rangos, "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]}, "format": fmt}}}}
     fmt_fondo = lambda color, negrita=False: {"backgroundColorStyle": {"rgbColor": _rgb(color)}, "textFormat": {"bold": negrita}}  # noqa: E731
+    gris_it = {"textFormat": {"italic": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}
     ancho = lambda c0, c1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c1},  # noqa: E731
                                                               "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+    alto = lambda f0, f1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": f0, "endIndex": f1},  # noqa: E731
+                                                             "properties": {"pixelSize": px}, "fields": "pixelSize"}}
     combinar = lambda c0, c1, f=0: {"mergeCells": {"range": _rango(sid, f, f + 1, c0, c1), "mergeType": "MERGE_ALL"}}  # noqa: E731
+    encab = lambda f, c0, c1, color: texto(_rango(sid, f, f + 1, c0, c1), {  # noqa: E731
+        "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
+        "backgroundColorStyle": {"rgbColor": _rgb(color)}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"},
+        "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment")
+    ajuste = "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"
     pedidos = [
         {"addSheet": {"properties": {"sheetId": sid, "title": t, "index": 0,
-                                     "gridProperties": {"rowCount": F, "columnCount": NCOL, "frozenRowCount": 4, "frozenColumnCount": 2}}}},
-        # fila 1: A-B "Semana N · NFL 2026" | C-V detalle de la corrida
-        combinar(0, 2, 0), combinar(2, NCOL, 0),
-        # fila 2 (leyenda): A-B | C-F verde | G-I azul | J-N rojo | O-S cierre | T-V gris  (ninguna cruza el borde B|C)
-        combinar(0, 2, 1), combinar(2, 6, 1), combinar(6, 9, 1), combinar(9, 14, 1), combinar(14, 19, 1), combinar(19, NCOL, 1),
-        # fila 3 (resumen de la semana): A-B rótulo | C-V texto
-        combinar(0, 2, 2), combinar(2, NCOL, 2),
-        {"repeatCell": {"range": _rango(sid, 0, 1, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13}}},
-                        "fields": "userEnteredFormat.textFormat"}},
-        {"repeatCell": {"range": _rango(sid, 0, 1, 2, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
-            "fontSize": 9, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}, "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat.textFormat,userEnteredFormat.verticalAlignment"}},
-        {"repeatCell": {"range": _rango(sid, 1, 3, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                        "fields": "userEnteredFormat.textFormat"}},
-        fondo(_rango(sid, 1, 2, 2, 6), COLORES["verde"]), fondo(_rango(sid, 1, 2, 6, 9), COLORES["azul"]),
-        fondo(_rango(sid, 1, 2, 9, 14), COLORES["rojo"]), fondo(_rango(sid, 1, 2, 14, 19), COLORES["cierre"]),
-        fondo(_rango(sid, 1, 2, 19, NCOL), COLORES["resumen"]),
-        {"repeatCell": {"range": _rango(sid, 1, 2, 19, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
-            "italic": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}}, "fields": "userEnteredFormat.textFormat"}},
-        {"repeatCell": {"range": _rango(sid, 1, 3, 0, NCOL), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
-                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 1, "endIndex": 2},
-                                       "properties": {"pixelSize": 72}, "fields": "pixelSize"}},
-        fondo(_rango(sid, 2, 3, 0, NCOL), COLORES["resumen"]),
-        {"repeatCell": {"range": _rango(sid, 3, 4, 0, NCOL), "cell": {"userEnteredFormat": {
-            "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
-            "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
-        {"repeatCell": {"range": _rango(sid, 4, G, 19, NCOL), "cell": {"userEnteredFormat": {"textFormat": {
-            "fontSize": 8, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}}}, "fields": "userEnteredFormat.textFormat"}},
-        ancho(0, 1, 110), ancho(1, 2, 165), ancho(2, 3, 115), ancho(3, 4, 95), ancho(4, 5, 110), ancho(5, 7, 75),
-        ancho(7, 9, 85), ancho(9, 10, 215), ancho(10, 11, 230), ancho(11, 12, 140), ancho(12, 13, 220), ancho(13, 14, 360),
-        ancho(14, 15, 125), ancho(15, 16, 105), ancho(16, 17, 120), ancho(17, 18, 85), ancho(18, 19, 130), ancho(19, 20, 210),
-        ancho(20, 21, 115), ancho(21, 22, 125),
-        # colores de las filas (el orden importa: en cada celda manda la primera regla que se cumple)
-        regla([_rango(sid, 4, G, 11, 12)], "=LEN($L5)>0", fmt_fondo(COLORES["azul"], True), 0),
-        regla([_rango(sid, 4, G, 0, N_PROY)], '=LEFT($U5,5)="retro"',
-              {"textFormat": {"italic": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}, 1),
-        regla([_rango(sid, 4, G, 0, N_PROY)], '=LEFT($M5,5)="Fuera"', fmt_fondo(COLORES["rojo"]), 2),
-        # verde solo en la celda que trae una señal de verdad ("sin señal", "sin Pinnacle 3 h", "retro (n/a)" y
-        # "excluida (…)" no se pintan)
-        regla([_rango(sid, 4, G, 9, 11)], '=AND(LEFT($M5,9)="candidata",LEN(J5)>0,LEFT(J5,3)<>"sin",'
-                                          'LEFT(J5,5)<>"retro",LEFT(J5,8)<>"excluida")', fmt_fondo(COLORES["verde"], True), 3),
-        regla([_rango(sid, 4, G, 16, 17)], '=LEFT($Q5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 4),
-        regla([_rango(sid, 4, G, 16, 17)], '=LEFT($Q5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 5),
-        regla([_rango(sid, 4, G, 18, 19)], '=LEFT($S5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 6),
-        regla([_rango(sid, 4, G, 18, 19)], '=LEFT($S5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 7),
-        # v7, ajuste 8: bloque de equipos (título A-B | C-V, como las filas 1 y 3; encabezado A-H)
-        combinar(0, 2, E), combinar(2, NCOL, E), fondo(_rango(sid, E, E + 1, 0, NCOL), COLORES["resumen"]),
-        {"repeatCell": {"range": _rango(sid, E, E + 1, 0, NCOL), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
-                        "verticalAlignment": "MIDDLE", "textFormat": {"bold": False}}},
-                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment,userEnteredFormat.textFormat"}},
-        {"repeatCell": {"range": _rango(sid, E, E + 1, 0, 2), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                        "fields": "userEnteredFormat.textFormat"}},
-        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": E, "endIndex": E + 1},
-                                       "properties": {"pixelSize": 48}, "fields": "pixelSize"}},
-        {"repeatCell": {"range": _rango(sid, E + 1, E + 2, 0, len(ENCAB_EQUIPOS)), "cell": {"userEnteredFormat": {
-            "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
-            "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
+                                     "gridProperties": {"rowCount": F, "columnCount": NCOL, "frozenRowCount": 4, "frozenColumnCount": 1}}}},
+        # filas 1-3: A rótulo | B-G texto simple | I-AB texto técnico (ninguna combinación cruza el borde A|B)
+        combinar(1, NS, 0), combinar(T0, NCOL, 0), combinar(1, NS, 1), combinar(T0, NCOL, 1),
+        combinar(1, NS, 2), combinar(T0, NCOL, 2),
+        texto(_rango(sid, 0, 1, 0, 1), {"textFormat": {"bold": True, "fontSize": 13}}),
+        texto(_rango(sid, 1, 3, 0, 1), {"textFormat": {"bold": True}}),
+        texto(_rango(sid, 0, 3, 0, NCOL), {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+        fondo(_rango(sid, 1, 3, 0, NS), COLORES["resumen"]),
+        texto(_rango(sid, 0, 3, T0, NCOL), {"textFormat": {"fontSize": 8, "italic": True,
+                                                           "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris_texto"])}}}),
+        alto(1, 2, 64), alto(2, 3, 48),
+        # fila 4: encabezados (simple en azul oscuro, técnico en gris)
+        encab(3, 0, NS, COLORES["encab"]), encab(3, T0, NCOL, COLORES["encab_tec"]),
+        # juegos: la parte simple con texto ajustado; la técnica chica y gris
+        texto(_rango(sid, 4, G, 0, NS), {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+        texto(_rango(sid, 4, G, T0, NCOL), {"textFormat": {"fontSize": 8, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}}),
+        ancho(0, 1, 180), ancho(1, 2, 95), ancho(2, 3, 135), ancho(3, 4, 180), ancho(4, 5, 190), ancho(5, 6, 120),
+        ancho(6, 7, 200), ancho(7, 8, 30),
+        ancho(8, 9, 115), ancho(9, 10, 95), ancho(10, 11, 110), ancho(11, 13, 75), ancho(13, 15, 85), ancho(15, 16, 215),
+        ancho(16, 17, 230), ancho(17, 18, 140), ancho(18, 19, 220), ancho(19, 20, 360), ancho(20, 21, 125), ancho(21, 22, 105),
+        ancho(22, 23, 120), ancho(23, 24, 85), ancho(24, 25, 130), ancho(25, 26, 210), ancho(26, 27, 115), ancho(27, 28, 125),
+        # colores (en cada celda manda la primera regla que se cumple)
+        # parte simple
+        regla([_rango(sid, 4, G, 5, 6)], "=LEN($F5)>0", fmt_fondo(COLORES["azul"], True), 0),
+        regla([_rango(sid, 4, G, 4, 5)], '=LEFT($E5,16)="No le hagas caso"', fmt_fondo(COLORES["rojo"]), 1),
+        regla([_rango(sid, 4, G, 6, 7)], '=ISNUMBER(SEARCH("✔",$G5))', fmt_fondo(COLORES["cubrio"]), 2),
+        regla([_rango(sid, 4, G, 6, 7)], '=ISNUMBER(SEARCH("✘",$G5))', fmt_fondo(COLORES["no_cubrio"]), 3),
+        regla([_rango(sid, 4, G, 0, 5)], '=LEFT($AA5,5)="retro"', gris_it, 4),
+        # detalle técnico (las mismas reglas de v7, corridas a I-AB)
+        regla([_rango(sid, 4, G, 17, 18)], "=LEN($R5)>0", fmt_fondo(COLORES["azul"], True), 5),
+        regla([_rango(sid, 4, G, T0, 20)], '=LEFT($AA5,5)="retro"', gris_it, 6),
+        regla([_rango(sid, 4, G, T0, 20)], '=LEFT($S5,5)="Fuera"', fmt_fondo(COLORES["rojo"]), 7),
+        regla([_rango(sid, 4, G, 15, 17)], '=AND(LEFT($S5,9)="candidata",LEN(P5)>0,LEFT(P5,3)<>"sin",'
+                                           'LEFT(P5,5)<>"retro",LEFT(P5,8)<>"excluida")', fmt_fondo(COLORES["verde"], True), 8),
+        regla([_rango(sid, 4, G, 22, 23)], '=LEFT($W5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 9),
+        regla([_rango(sid, 4, G, 22, 23)], '=LEFT($W5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 10),
+        regla([_rango(sid, 4, G, 24, 25)], '=LEFT($Y5,6)="cubrió"', fmt_fondo(COLORES["cubrio"]), 11),
+        regla([_rango(sid, 4, G, 24, 25)], '=LEFT($Y5,2)="no"', fmt_fondo(COLORES["no_cubrio"]), 12),
+        # bloque de equipos: título A | B-G, encabezado A-G, filas con texto ajustado
+        combinar(1, NS, E), fondo(_rango(sid, E, E + 1, 0, NS), COLORES["resumen"]),
+        texto(_rango(sid, E, E + 1, 0, NS), {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+        texto(_rango(sid, E, E + 1, 0, 1), {"textFormat": {"bold": True}}),
+        alto(E, E + 1, 52),
+        encab(E + 1, 0, len(ENCAB_EQUIPOS), COLORES["encab"]),
+        texto(_rango(sid, E + 2, F, 0, len(ENCAB_EQUIPOS)), {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
     ]
     hoja.lote(pedidos)
-    hoja.escribir(f"'{t}'!A2", [LEYENDA])
     hoja.escribir(f"'{t}'!A4", [ENCAB])
     return sid
 
@@ -719,6 +719,142 @@ def estado_txt(f):
 
 
 # --------------------------------------------------------------------------------------
+# v8: textos en palabras para la parte simple ("que lo entienda un niño de 10 años y un abuelo de 76")
+# --------------------------------------------------------------------------------------
+def apodo(t):
+    """'BUF' → 'Bills' (el apodo del equipo)."""
+    return EQUIPOS.get(t, t).split()[-1]
+
+
+def cuando_txt(t):
+    """Hora de Caracas en 12 horas: 'Dom 4 oct · 1:00 pm'."""
+    c = t.astimezone(CARACAS)
+    h = c.hour % 12 or 12
+    return f"{DIAS[c.weekday()].capitalize()} {c.day} {MESES[c.month - 1]} · {h}:{c.minute:02d} {'am' if c.hour < 12 else 'pm'}"
+
+
+def partido_txt(g, eq):
+    """'Patriots (1-2) visitan a Bills (3-0)'; en cancha neutral, 'Colts (1-2) vs Commanders (1-2), cancha neutral'."""
+    vis, loc = g["away_team"], g["home_team"]
+    v, l_ = f"{apodo(vis)} ({record_txt(eq[vis])})", f"{apodo(loc)} ({record_txt(eq[loc])})"
+    return f"{v} vs {l_}, cancha neutral" if g.get("location") == "Neutral" else f"{v} visitan a {l_}"
+
+
+def favorito_de(g, u):
+    """Lo que dicen las apuestas antes del juego: Pinnacle sin vig de la última proyección (≤ 3 h) o, si no hay, el
+    consenso de nflverse. Devuelve dict(fav, local, puntos, p) o None. El favorito es el del spread; su probabilidad
+    sale del moneyline sin vig (método de potencia)."""
+    h = _num((u or {}).get("pin_hcp_local")) if u else None
+    p_loc = _num((u or {}).get("pin_p_ml_local")) if u else None
+    if h is None or p_loc is None:
+        sl, ml_l, ml_v = _num(g.get("spread_line")), _num(g.get("home_moneyline")), _num(g.get("away_moneyline"))
+        if sl is None:
+            return None
+        h = -sl
+        p_loc = sin_vig_potencia(ml_l, ml_v) if ml_l is not None and ml_v is not None else None
+    if p_loc is None:
+        return None
+    local = h < 0 or (abs(h) < 0.05 and p_loc >= 0.5)
+    return dict(fav=g["home_team"] if local else g["away_team"], dog=g["away_team"] if local else g["home_team"],
+                local=local, puntos=abs(h), p=p_loc if local else 1 - p_loc)
+
+
+def puntos_txt(x):
+    """7.0 → '7'; 2.5 → '2,5'."""
+    return f"{x:.0f}" if abs(x - round(x)) < 1e-9 else _dec(x)
+
+
+def favorito_txt(f):
+    """'Bills, por 7 puntos' (el favorito de las apuestas y por cuánto creen que gana)."""
+    if f is None:
+        return "Todavía no hay apuestas"
+    if f["puntos"] < 0.05:
+        return f"Parejo (las apuestas se inclinan un poquito por {apodo(f['fav'])})"
+    return f"{apodo(f['fav'])}, por {puntos_txt(f['puntos'])} puntos"
+
+
+def etiqueta_seguro(k):
+    """La palabra sale del mismo número que se muestra ('k de cada 10'), para que nunca se contradigan."""
+    return "parejo" if k <= 5 else ("algo favorito" if k == 6 else ("favorito claro" if k <= 8 else "muy favorito"))
+
+
+def seguro_txt(f):
+    """'●●●●●●●○○○ 7 de cada 10 · favorito claro' (probabilidad de ganar del favorito, sin vig)."""
+    if f is None:
+        return ""
+    k = min(10, max(0, int(f["p"] * 10 + 0.5)))
+    return f"{'●' * k}{'○' * (10 - k)} {apodo(f['fav'])} gana {k} de cada 10 · {etiqueta_seguro(k)}"
+
+
+def maquina_txt(u, f):
+    """Lo que opina el modelo, en palabras (en prueba: no se apuesta por él)."""
+    if not u or _num(u.get("p_local")) is None:
+        return "Todavía no corrió"
+    if f is None:
+        return ""
+    retro = u.get("tipo") == "retro"
+    if fuera(u):
+        if es_dudoso(u):
+            return "No le hagas caso en este juego (no se sabe bien quién juega de QB)"
+        return "No le hagas caso en este juego (ve algo muy distinto a las apuestas)"
+    pm = float(u["p_local"]) if f["local"] else 1 - float(u["p_local"])
+    if pm < 0.5:
+        txt = f"Cree que gana {apodo(f['dog'])}"
+    elif pm < f["p"] - 0.06:
+        txt = f"También va con {apodo(f['fav'])}, pero lo ve más parejo"
+    elif pm > f["p"] + 0.06:
+        txt = f"Va con {apodo(f['fav'])} y lo ve más fácil"
+    else:
+        txt = "Opina igual"
+    return ("Retro (hecha después del juego, no cuenta): " + txt[0].lower() + txt[1:]) if retro else txt
+
+
+def teaser_txt(u):
+    if not u or not u.get("wong"):
+        return ""
+    eq = u["local"] if u["wong"] == "local" else u["visita"]
+    return f"Sirve: {apodo(eq)} +{float(u['wong_linea']) + 6:.1f}"
+
+
+def resultado_simple(g, f, u):
+    """'Ganó Bills 24-16 · el favorito acertó ✔' (+ el teaser, si había pata)."""
+    res = _num(g.get("result"))
+    if res is None or g.get("home_score") is None:
+        return ""
+    hs, as_ = int(g["home_score"]), int(g["away_score"])
+    if res == 0:
+        txt = f"Empate {hs}-{as_}"
+    else:
+        gan = g["home_team"] if res > 0 else g["away_team"]
+        txt = f"Ganó {apodo(gan)} {max(hs, as_)}-{min(hs, as_)}"
+        if f is not None and f["puntos"] >= 0.05:
+            txt += " · el favorito acertó ✔" if gan == f["fav"] else " · el favorito falló ✘"
+    if u and u.get("wong"):
+        lin = _num(u.get("wong_linea"))
+        if lin is not None:
+            x = (res if u["wong"] == "local" else -res) + lin + 6
+            txt += " · teaser " + ("✔" if x > 0 else ("empate" if x == 0 else "✘"))
+    return txt
+
+
+def resumen_simple(filas_info, n_juegos):
+    """Fila 3, en palabras: cuántos se jugaron, cuántas veces ganó el favorito contra lo que se esperaba, y la máquina."""
+    jugados = [(g, f, u) for g, f, u in filas_info if _num(g.get("result")) is not None]
+    if not jugados:
+        return f"Todavía no se juega ningún partido de esta semana ({n_juegos} en total)."
+    con_fav = [(g, f) for g, f, _ in jugados if f is not None and f["puntos"] >= 0.05 and g["result"] != 0]
+    acierta = sum(1 for g, f in con_fav if (g["result"] > 0) == f["local"])
+    esperado = sum(f["p"] for _, f in con_fav)
+    txt = (f"Jugados {len(jugados)} de {n_juegos}. El favorito ganó {acierta} de {len(con_fav)} "
+           f"(las apuestas esperaban {_dec(esperado)}).")
+    maq = [(g, u) for g, _, u in jugados if u and _num(u.get("p_local")) is not None and g["result"] != 0]
+    if maq:
+        ok = sum(1 for g, u in maq if (float(u["p_local"]) > 0.5) == (g["result"] > 0))
+        txt += f" La máquina (en prueba) acertó el ganador {ok} de {len(maq)}."
+    return txt
+
+
+# --------------------------------------------------------------------------------------
 # Cierre de cada juego (se llena solo con el resultado de nflverse)
 # --------------------------------------------------------------------------------------
 def resultado_txt(g):
@@ -861,38 +997,56 @@ def record_txt(d):
 
 
 def filas_equipos(g26, semana):
-    """Bloque de equipos de la pestaña semanal: título, encabezado y una fila por equipo, de mejor a peor récord
-    (desempate: diferencia de puntos; después, por nombre)."""
+    """Bloque de equipos de la pestaña semanal, en palabras: título, encabezado y una fila por equipo, de mejor a peor
+    récord (desempate: diferencia de puntos; después, por nombre). Solo juegos de semanas anteriores."""
     import polars as pl
     eq = equipos_antes(g26, semana)
     esta = {}
     for r in g26.filter(pl.col("week") == semana).iter_rows(named=True):
-        neutral = " (neutral)" if r.get("location") == "Neutral" else ""
-        esta[r["home_team"]] = f"vs {r['away_team']}{neutral}"
-        esta[r["away_team"]] = f"@ {r['home_team']}{neutral}"
+        if r.get("location") == "Neutral":
+            esta[r["home_team"]] = f"juega con {apodo(r['away_team'])} (cancha neutral)"
+            esta[r["away_team"]] = f"juega con {apodo(r['home_team'])} (cancha neutral)"
+        else:
+            esta[r["home_team"]] = f"recibe a {apodo(r['away_team'])}"
+            esta[r["away_team"]] = f"visita a {apodo(r['home_team'])}"
     orden = sorted(eq, key=lambda t: (-((eq[t]["g"] + 0.5 * eq[t]["e"]) / eq[t]["n"]) if eq[t]["n"] else 0.0,
-                                      -(eq[t]["pf"] - eq[t]["pc"]), t))
+                                      -(eq[t]["pf"] - eq[t]["pc"]), apodo(t)))
     filas = []
     for t in orden:
         d = eq[t]
         if not d["n"]:
-            filas.append([t, "0-0", "", "", "", "", esta.get(t, "descanso"), "sin juegos todavía"])
+            filas.append([apodo(t), "0-0", "", "", "", esta.get(t, "descansa"), "todavía no ha jugado"])
             continue
         u = d["ult"]
-        res = "G" if u["m"] > 0 else ("P" if u["m"] < 0 else "E")
-        lin = "" if u["hcp"] is None else (" · " + t + (" PK" if abs(u["hcp"]) < 0.05 else f" {u['hcp']:+.1f}"))
-        cub = "" if u["x"] is None else (" · " + ("push" if u["x"] == 0 else ("cubrió" if u["x"] > 0 else "no cubrió")
-                                                   + f" por {abs(u['x']):.1f}"))
-        ats = f"{d['ats'][0]}-{d['ats'][1]}" + (f"-{d['ats'][2]}" if d["ats"][2] else "")
-        filas.append([t, record_txt(d), _dec(d["esp"]) + ("" if d["n_esp"] == d["n"] else f" ({d['n_esp']} de {d['n']})"),
-                      ats, _qb_corto(u["qb"]), f"{_dec(d['pf'] / d['n'])} / {_dec(d['pc'] / d['n'])}", esta.get(t, "descanso"),
-                      f"S{u['semana']} {res} {u['pts']}-{u['opp']} {'vs' if u['local'] else '@'} {u['rival']}{lin}{cub}"])
-    titulo = ["Equipos", "",
-              f"Cómo llegan a la semana {semana} (solo juegos de semanas anteriores; nflverse). Descriptivo: el récord y "
-              "las rachas ya los descuenta el mercado (H4, H14, H23). Esperados = suma de la probabilidad sin vig del "
-              "moneyline de cierre de cada juego (si ganó más de lo esperado, el mercado lo subestimó o tuvo suerte). "
-              "ATS = contra el spread de cierre de nflverse. Semana pasada: resultado, línea de cierre del equipo y por "
-              "cuánto cubrió o no."]
+        if u["m"] > 0:
+            txt = f"Le ganó {u['pts']}-{u['opp']} a {apodo(u['rival'])}"
+        elif u["m"] < 0:
+            txt = f"Perdió {u['pts']}-{u['opp']} con {apodo(u['rival'])}"
+        else:
+            txt = f"Empató {u['pts']}-{u['opp']} con {apodo(u['rival'])}"
+        if u["qb"]:
+            txt += f", con {_qb_corto(u['qb'])} de QB"
+        if u["hcp"] is not None and u["x"] is not None:
+            if abs(u["hcp"]) < 0.05:
+                txt += ". Era parejo"
+            elif u["hcp"] < 0:
+                txt += f". Era favorito por {puntos_txt(abs(u['hcp']))}"
+            else:
+                txt += f". Las apuestas lo daban perdedor por {puntos_txt(u['hcp'])}"
+            txt += (" y quedó justo en la línea" if u["x"] == 0 else
+                    (f" y cubrió por {puntos_txt(abs(u['x']))}" if u["x"] > 0 else f" y no cubrió (le faltaron {puntos_txt(abs(u['x']))})"))
+        txt += "."
+        if u["semana"] != semana - 1:
+            txt = f"(Semana {u['semana']}, su último partido) " + txt
+        a, b, c = d["ats"]
+        linea = f"cubrió {a} de {a + b + c}" + (f" ({c} justo en la línea)" if c else "")
+        esperado = _dec(d["esp"]) + ("" if d["n_esp"] == d["n"] else f" (de {d['n_esp']} partidos)")
+        filas.append([apodo(t), record_txt(d), esperado, linea,
+                      f"anota {_dec(d['pf'] / d['n'])} · recibe {_dec(d['pc'] / d['n'])}", esta.get(t, "descansa"), txt])
+    titulo = ["Cómo vienen los equipos",
+              f"Antes de la semana {semana}, de mejor a peor. «Las apuestas esperaban» = cuántos partidos creían las apuestas "
+              "que iba a ganar; ganar más de lo esperado puede ser suerte, y las apuestas ya lo saben (H4, H14, H23). "
+              "«Contra la línea» = cuántas veces ganó por más (o perdió por menos) de lo que decían las apuestas."]
     return [titulo + [""] * (len(ENCAB_EQUIPOS) - len(titulo)), list(ENCAB_EQUIPOS)] + filas, eq
 
 
@@ -1038,7 +1192,9 @@ TEASER_PAGOS = {2: -120, 3: 151, 4: 248, 5: 420, 6: 600, 7: 900, 8: 1300}   # pr
 PARLAY_PATAS = range(3, 9)                         # tabla de P(cobrar) de 3 a 8 patas
 DIST_TEMPORADAS = (2012, 2025)
 NUCLEO_PTS, NUCLEO_MIN_N, NUCLEO_MAX_PTS = 1.5, 150, 4.0
-NCOL_BOLETO = 12
+NCOL_BOLETO = 14                                   # v8: A rótulo · B en palabras · C separador · D-N detalle técnico
+NT_BOLETO = 11                                     # columnas técnicas (D-N)
+SEMANAS_TEMPORADA = 18                             # para decir "unas N temporadas"
 _MARGENES = {}
 
 
@@ -1368,35 +1524,116 @@ def resultado_boleto(tipo, patas, calc, res):
         f" · esperado {esp:.1f}".replace(".", ",")
 
 
+def dinero_txt(x, decimales=0):
+    return "$" + (f"{x:,.0f}".replace(",", ".") if decimales == 0 else f"{x:.{decimales}f}".replace(".", ","))
+
+
+def frecuencia_txt(p):
+    """0.575 → 'pasa 6 de cada 10 semanas'; 0.0018 → 'pasa 1 de cada 556 semanas (unas 31 temporadas)'."""
+    if not p:
+        return "no pasa nunca"
+    if p >= 0.1:
+        return f"pasa {min(10, int(p * 10 + 0.5))} de cada 10 semanas"
+    x = 1 / p
+    txt = f"pasa 1 de cada {round(x):,} semanas".replace(",", ".")
+    return txt + (f" (unas {x / SEMANAS_TEMPORADA:.0f} temporadas)" if x >= 2 * SEMANAS_TEMPORADA else "")
+
+
+def frase_boleto(tipo, patas, m, res_txt):
+    """Una frase por boleto: cuánto cobras por $10, cada cuánto pasa y cuánto pierdes (o ganas) en promedio."""
+    n = len(patas)
+    partes = []
+    if m["D"] is None:
+        partes.append("no se sabe cuánto paga (falta el precio de BetOnline de algún partido)")
+    else:
+        quien = "los" if n > 1 else "el"
+        partes.append(f"Cobras {dinero_txt(10 * m['D'])} si {'aciertan' if tipo == 'teaser' else 'aciertas'} {quien} {n}")
+    partes.append(frecuencia_txt(m["p"]))
+    if m["ev"] is not None:
+        partes.append(f"en promedio {'pierdes' if m['ev'] < 0 else 'ganas'} {dinero_txt(abs(10 * m['ev']), 2)} de cada $10")
+    txt = " · ".join(partes)
+    txt = txt[0].upper() + txt[1:]
+    if tipo == "teaser":
+        txt += " ← lo único con ventaja medida: con poquito dinero"
+    return txt + (f". {res_txt}" if res_txt else "")
+
+
+def resultado_boleto_simple(tipo, patas, calc, res):
+    if not patas:
+        return ""
+    hechos = sum(1 for g, _ in patas if res.get(g) is not None)
+    if hechos < len(patas):
+        return f"Van {hechos} de {len(patas)} partidos jugados." if hechos else ""
+    r = []
+    for g, c in patas:
+        x = calc[g]
+        if c == "ML":
+            r.append(resultado_lado(res[g], x["fav_local"], 0.0))
+        elif c == "spread":
+            r.append(resultado_lado(res[g], x["fav_local"], x["h_sp"]))
+        else:
+            r.append(resultado_lado(res[g], x["wong"]["es_local"], x["wong"]["lin"] + 6))
+    gan = r.count("gana")
+    esp = sum((calc[g]["wong"]["p"] if tipo == "teaser" else pata_de(calc[g], c)[0]) for g, c in patas)
+    if "pierde" in r:
+        return f"Resultado: perdió ✘ (acertó {gan} de {len(patas)}; se esperaban {_dec(esp)})."
+    return "Resultado: se devolvió la plata (todo empate con la línea)." if gan == 0 else f"Resultado: cobró ✔ (acertó {gan} de {len(patas)})."
+
+
+def nombre_boleto(tipo, nombre_b, patas, calc, juegos):
+    n = len(patas)
+    if nombre_b.startswith("Solo ML"):
+        return f"Los {n} favoritos juntos (a ganador)"
+    if nombre_b.startswith("Mixto"):
+        return f"Los {n} favoritos juntos (a ganador o con línea, lo más barato)"
+    if tipo == "parlay":
+        return f"Los {n} más seguros juntos: " + ", ".join(apodo(calc[g]["fav"]) for g, _ in patas)
+    if tipo == "teaser":
+        return f"Teaser de {n} perros con 6 puntos extra: " + ", ".join(apodo(calc[g]["wong"]["eq"]) for g, _ in patas)
+    return "Teaser de perros (6 puntos extra)"
+
+
 def grilla_boleto(snap, g26, bot_dir, ahora=None):
-    """Filas de la pestaña (NCOL_BOLETO columnas) y qué filas llevan formato: {'encab': [...], 'azul': [...]}."""
-    def fila(*xs):
-        xs = ["" if x is None else x for x in xs]
-        return xs + [""] * (NCOL_BOLETO - len(xs))
-    base = ("Ningún dinero por el motor (31A). El lado de cada pata lo pone el mercado (favorito de Pinnacle sin vig); "
-            "el modelo no elige (H29: el cierre le gana por 0,4 pts) y solo deja una marca. Los parlays son decisión de Ozz, "
-            "por diversión: el de todos los favoritos cobra ~1 de cada 300 y cuesta ~33 % de lo apostado (H25). El teaser "
-            "Wong es lo único con valor medido (H28): monto mínimo, preferir 4 patas; el pago exacto de 3 y 4 patas con "
-            "recargo se confirma en el boleto de BetOnline.")
+    """Filas de la pestaña (NCOL_BOLETO columnas: A rótulo, B en palabras, C vacía, D-N técnico) y qué filas llevan
+    formato: {'encab': [...], 'azul': [...]}."""
+    def fila(a="", b="", *tec):
+        tec = ["" if x is None else x for x in tec]
+        return [a, b, ""] + tec + [""] * (NT_BOLETO - len(tec))
+    base = ("Esto es para jugar por diversión, con poquito dinero. Juntar muchos partidos casi nunca paga: los favoritos "
+            "de toda la semana juntos salen más o menos 1 de cada 300 semanas y te cuestan un tercio de lo que apuestas. "
+            "Lo único que ha mostrado ventaja es el teaser de perros (6 puntos extra), y aun así con poquito dinero. La "
+            "máquina no elige nada aquí: los equipos los ponen las apuestas.")
+    base_tec = ("Ningún dinero por el motor (31A). El lado de cada pata lo pone el mercado (favorito de Pinnacle sin vig); "
+                "el modelo no elige (H29: el cierre le gana por 0,4 pts) y solo deja una marca. Los parlays son decisión de "
+                "Ozz, por diversión: el de todos los favoritos cobra ~1 de cada 300 y cuesta ~33 % de lo apostado (H25). El "
+                "teaser Wong es lo único con valor medido (H28): monto mínimo, preferir 4 patas; el pago exacto de 3 y 4 "
+                "patas con recargo se confirma en el boleto de BetOnline.")
     meta = {"encab": [], "azul": []}
     if not snap:
-        filas = [fila("Boleto (informativo)", "Todavía no hay boleto: se arma solo en la próxima corrida que cuenta "
-                      "(miércoles o sábado 10:15, o T−85) con los juegos del domingo y el lunes."), fila("Base", base)]
+        filas = [fila("Boleto", "Todavía no hay boleto: se arma solo el miércoles o el sábado a las 10:15, o 85 minutos "
+                      "antes de un partido, con los partidos del domingo y el lunes."), fila("Antes de apostar", base, base_tec)]
         return filas, meta
     juegos, calc, cierre, res, info = boleto_calculado(snap, g26, bot_dir, ahora)
     hay_nfl = any(calc[j["game_id"]]["nflverse"] for j in juegos)
     nombre = NOMBRE_CORRIDA.get(snap["tipo"], snap["tipo"])
-    detalle = (f"Armado en la corrida {nombre} ({fecha_cc(t_utc(snap['corrida_utc']))}, Caracas) con las fotos del bot. "
-               f"Probabilidad: Pinnacle sin vig (≤ 3 h)" + ("; * = sin Pinnacle de ≤ 3 h: consenso de nflverse" if hay_nfl else "")
-               + ". Precio: BetOnline (≤ 12 h). Se congela al empezar el primer juego del domingo; después de los juegos "
-               "se agregan el EV contra el cierre de Pinnacle y el resultado.")
-    filas = [fila(f"Boleto (informativo) · Semana {snap['semana']}", detalle), fila("Base", base), fila()]
+    corrida = t_utc(snap["corrida_utc"])
+    detalle = (f"Armado el {cuando_txt(corrida)} (hora de Caracas) con los precios de BetOnline de esa hora. Se congela "
+               "cuando empieza el primer partido del domingo; después de los partidos dice qué pasó."
+               + (" * = esa semana no había línea fresca de Pinnacle: se usó el consenso." if hay_nfl else ""))
+    detalle_tec = (f"Detalle técnico · corrida {nombre} ({fecha_cc(corrida)}, Caracas) con las fotos del bot. Probabilidad: "
+                   f"Pinnacle sin vig (≤ 3 h)" + ("; * = sin Pinnacle de ≤ 3 h: consenso de nflverse" if hay_nfl else "")
+                   + ". Precio: BetOnline (≤ 12 h). EV vs cierre: los mismos precios contra la última foto de Pinnacle "
+                   "antes de cada juego.")
+    filas = [fila(f"Boleto · Semana {snap['semana']}", detalle, detalle_tec), fila("Antes de apostar", base, base_tec), fila()]
     meta["encab"].append(len(filas))
-    filas.append(fila("Boleto", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)", "Costo por $10",
-                      "EV vs cierre", "Resultado"))
+    filas.append(fila("Si apuestas $10 a…", "Qué pasa", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)",
+                      "Costo por $10", "EV vs cierre", "Resultado"))
     for nombre_b, tipo, patas, sin_precio in boletos_de(juegos, calc):
         if tipo == "sin_wong":
-            filas.append(fila(nombre_b, str(len(patas)), f"hay {len(patas)} patas azules: hacen falta 3"))
+            filas.append(fila(nombre_boleto(tipo, nombre_b, patas, calc, juegos),
+                              f"Esta semana hay {len(patas)} perro{'s' if len(patas) != 1 else ''} que sirve"
+                              f"{'n' if len(patas) != 1 else ''} y hacen falta 3: no hay teaser.",
+                              str(len(patas)), f"hay {len(patas)} patas azules: hacen falta 3"))
             meta["azul"].append(len(filas) - 1)
             continue
         if not patas:
@@ -1409,14 +1646,16 @@ def grilla_boleto(snap, g26, bot_dir, ahora=None):
             except (TypeError, KeyError):
                 evc = ""
         pago = "" if m["D"] is None else americana_txt(m["D"]) + (" (aprox.)" if tipo == "teaser" and m["n"] in (3, 4) else "")
-        filas.append(fila(nombre_b, f"{m['n']}" + (f" ({sin_precio} sin precio)" if sin_precio else ""), pago,
+        filas.append(fila(nombre_boleto(tipo, nombre_b, patas, calc, juegos),
+                          frase_boleto(tipo, patas, m, resultado_boleto_simple(tipo, patas, calc, res)),
+                          f"{m['n']}" + (f" ({sin_precio} sin precio)" if sin_precio else ""), pago,
                           pct(m["p"], 2 if m["p"] < 0.1 else 1), uno_de_txt(m["p"]), ev_txt(m["ev"]), costo_txt(m["ev"]),
                           evc, resultado_boleto(tipo, patas, calc, res)))
         if tipo == "teaser":
             meta["azul"].append(len(filas) - 1)
     filas.append(fila())
     meta["encab"].append(len(filas))
-    filas.append(fila("Juego", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline",
+    filas.append(fila("Partido", "En palabras", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline",
                       "Cubre (Pinnacle)", "EV spread", "Mixto usa", "Modelo (solo marca)", "Pata Wong +6", "Resultado"))
     for j in juegos:
         gid, c, g = j["game_id"], calc[j["game_id"]], info[j["game_id"]]
@@ -1439,6 +1678,10 @@ def grilla_boleto(snap, g26, bot_dir, ahora=None):
         wong = "" if not w else f"{w['eq']} +{w['lin'] + 6:.1f} · {pct(w['p'], 1)}"
         r = res.get(gid)
         resultado = ""
+        k = min(10, max(0, int(c["p_fav"] * 10 + 0.5)))
+        frase = f"Favorito: {apodo(c['fav'])}{'*' if c['nflverse'] else ''} · gana {k} de cada 10"
+        if w:
+            frase += f" · para el teaser sirve {apodo(w['eq'])} +{w['lin'] + 6:.1f}"
         if r is not None:
             partes = [resultado_txt(g), "ML " + {"gana": "ganó", "pierde": "perdió", "push": "empate"}[resultado_lado(r, c["fav_local"], 0.0)]]
             if c["h_sp"] is not None:
@@ -1446,7 +1689,18 @@ def grilla_boleto(snap, g26, bot_dir, ahora=None):
             if w:
                 partes.append("Wong " + {"gana": "cubrió", "pierde": "no cubrió", "push": "push"}[resultado_lado(r, w["es_local"], w["lin"] + 6)])
             resultado = " · ".join(partes)
-        filas.append(fila(f"{fecha_cc(t_utc(j['inicio_utc']), False)} · {j['visita']} @ {j['local']}",
+            hs, as_ = int(g["home_score"]), int(g["away_score"])
+            if r == 0:
+                frase += f". Empate {hs}-{as_} (a ganador se devuelve)"
+            else:
+                gan = g["home_team"] if r > 0 else g["away_team"]
+                frase += f". Ganó {apodo(gan)} {max(hs, as_)}-{min(hs, as_)} " + ("✔" if gan == c["fav"] else "✘")
+            if w:
+                frase += " · teaser " + {"gana": "✔", "pierde": "✘", "push": "empate"}[resultado_lado(r, w["es_local"], w["lin"] + 6)]
+        neutral = j.get("local") and g.get("location") == "Neutral"
+        partido = (f"{apodo(j['visita'])} vs {apodo(j['local'])} (cancha neutral)" if neutral
+                   else f"{apodo(j['visita'])} visitan a {apodo(j['local'])}")
+        filas.append(fila(f"{partido} · {cuando_txt(t_utc(j['inicio_utc']))}", frase,
                           c["fav"] + ("*" if c["nflverse"] else ""), pct(c["p_fav"], 1), ml, ev_txt(c["ev_ml"]), sp, cubre,
                           ev_txt(c["ev_sp"]), c["mixto"] or "", marca, wong, resultado))
         if w:
@@ -1454,36 +1708,46 @@ def grilla_boleto(snap, g26, bot_dir, ahora=None):
     for gid in snap.get("sin_ref", []):
         g = info.get(gid)
         if g:
-            filas.append(fila(f"{fecha_cc(g['inicio'], False)} · {g['away_team']} @ {g['home_team']}", "sin líneas"))
+            filas.append(fila(f"{apodo(g['away_team'])} visitan a {apodo(g['home_team'])}", "Todavía no hay apuestas para este partido.",
+                              "sin líneas"))
     filas.append(fila())
-    filas.append(fila("Notas", "EV = ganancia esperada por cada $1 contra Pinnacle sin vig (negativo = costo). Costo por "
-                      "$10 = lo que se pierde en promedio por cada $10 apostados. P(cobrar) supone patas independientes. "
-                      "Spread y teaser: distribución del margen 2012-2025 (juegos con spread a ≤ 1,5 pts) anclada a la línea "
-                      "de referencia. Teaser: tabla de BetOnline con recargo Wong (2 −120, 3 +151, 4 +248, 5 +420, 6 +600); "
-                      "un push baja un nivel. EV vs cierre: los mismos precios de BetOnline contra la última foto de "
-                      "Pinnacle antes de cada juego. Pata azul = pata Wong (underdog +1,5 a +2,5, total < 50)."))
+    filas.append(fila("Para entender",
+                      "«En promedio pierdes $3,81 de cada $10» quiere decir que si jugaras ese boleto muchas semanas, perderías "
+                      "unos $3,81 cada vez. «Pasa 1 de cada 556 semanas» quiere decir que cobrarías más o menos una vez en 556 "
+                      "semanas; una temporada tiene unas 18. «Gana 7 de cada 10» quiere decir que si el partido se jugara 10 "
+                      "veces, ese equipo ganaría unas 7. En azul: el teaser de perros y los perros que sirven para él.",
+                      "EV = ganancia esperada por cada $1 contra Pinnacle sin vig (negativo = costo). Costo por $10 = lo que "
+                      "se pierde en promedio por cada $10. P(cobrar) supone patas independientes. Spread y teaser: "
+                      "distribución del margen 2012-2025 (juegos con spread a ≤ 1,5 pts) anclada a la línea de referencia. "
+                      "Teaser: tabla de BetOnline con recargo Wong (2 −120, 3 +151, 4 +248, 5 +420, 6 +600); un push baja "
+                      "un nivel. Pata Wong = underdog +1,5 a +2,5 con total < 50."))
     return filas, meta
 
 
 def grilla_boleto_prueba():
     """Boleto de muestra con todas las clases de fila (para 'hoja-prueba'; no sale de datos reales)."""
-    def fila(*xs):
-        return list(xs) + [""] * (NCOL_BOLETO - len(xs))
-    filas = [fila("Boleto (informativo) · PRUEBA", "detalle de la corrida"), fila("Base", "advertencias"), fila(),
-             fila("Boleto", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)", "Costo por $10", "EV vs cierre", "Resultado"),
-             fila("Solo ML · todos los juegos", "15", "+52300", "0,19 %", "1 de cada 532", "-30,1 %", "$3,01", "", ""),
-             fila("Teaser Wong 6 pts · 3 patas", "3", "+151 (aprox.)", "41,6 %", "1 de cada 2,4", "+3,8 %", "gana $0,38", "", ""),
+    def fila(a="", b="", *tec):
+        return [a, b, ""] + list(tec) + [""] * (NT_BOLETO - len(tec))
+    filas = [fila("Boleto · PRUEBA", "detalle en palabras", "detalle técnico"), fila("Antes de apostar", "advertencias", "base"),
              fila(),
-             fila("Juego", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline", "Cubre (Pinnacle)",
-                  "EV spread", "Mixto usa", "Modelo (solo marca)", "Pata Wong +6", "Resultado"),
-             fila("dom 13:00 · PRU @ EBA", "EBA", "75,0 %", "-320", "-1,6 %", "EBA -2.5 (-110)", "51,0 %", "-2,6 %", "ML",
-                  "de acuerdo · 70 %", "PRU +8.5 · 74,0 %", ""),
-             fila(), fila("Notas", "notas")]
+             fila("Si apuestas $10 a…", "Qué pasa", "Patas", "Pago", "P(cobrar)", "1 de cada", "EV (corrida)", "Costo por $10",
+                  "EV vs cierre", "Resultado"),
+             fila("Los 15 favoritos juntos (a ganador)", "Cobras $3.439 si aciertas los 15 · pasa 1 de cada 556 semanas",
+                  "15", "+34294", "0,18 %", "1 de cada 556", "-38,1 %", "$3,81", "", ""),
+             fila("Teaser de 3 perros con 6 puntos extra: Giants, Broncos, Falcons", "Cobras $25 si aciertan los 3",
+                  "3", "+151 (aprox.)", "43,8 %", "1 de cada 2,3", "+10,1 %", "gana $1,01", "", ""),
+             fila(),
+             fila("Partido", "En palabras", "Lado (favorito)", "Gana (Pinnacle)", "ML BetOnline", "EV ML", "Spread BetOnline",
+                  "Cubre (Pinnacle)", "EV spread", "Mixto usa", "Modelo (solo marca)", "Pata Wong +6", "Resultado"),
+             fila("Pruebas visitan a Ensayos · Dom 4 oct · 1:00 pm", "Favorito: Ensayos · gana 7 de cada 10", "EBA", "75,0 %",
+                  "-320", "-1,6 %", "EBA -2.5 (-110)", "51,0 %", "-2,6 %", "ML", "de acuerdo · 70 %", "PRU +8.5 · 74,0 %", ""),
+             fila(), fila("Para entender", "notas en palabras", "notas técnicas")]
     return filas, {"encab": [3, 7], "azul": [5, 8]}
 
 
 def crear_boleto(hoja, filas, meta, titulo=TITULO_BOLETO, sid=SID_BOLETO):
-    """(Re)crea la pestaña del boleto, primera a la izquierda, con su formato, y escribe las filas."""
+    """(Re)crea la pestaña del boleto, primera a la izquierda, con su formato, y escribe las filas. v8: A inmovilizada,
+    B en palabras (ancha), C separador, D-N detalle técnico chico y gris."""
     ps = hoja.pestanas()
     viejas = [i for nombre, i in ps.items() if nombre == titulo]       # solo la pestaña del boleto, por su nombre
     if viejas:
@@ -1492,44 +1756,47 @@ def crear_boleto(hoja, filas, meta, titulo=TITULO_BOLETO, sid=SID_BOLETO):
     while sid in otras:                                                # nunca toca otra pestaña que use ese número
         sid += 1
     n = len(filas) + 2
-    fondo = lambda f0, f1, color: {"repeatCell": {"range": _rango(sid, f0, f1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {  # noqa: E731
+    D = 3                                                              # primera columna técnica
+    fondo = lambda f0, f1, c0, c1, color: {"repeatCell": {"range": _rango(sid, f0, f1, c0, c1), "cell": {"userEnteredFormat": {  # noqa: E731
         "backgroundColorStyle": {"rgbColor": _rgb(color)}}}, "fields": "userEnteredFormat.backgroundColorStyle"}}
     ancho = lambda c0, c1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0,  # noqa: E731
                                                                         "endIndex": c1}, "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+    alto = lambda f0, f1, px: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": f0,  # noqa: E731
+                                                                       "endIndex": f1}, "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+    texto = lambda f0, f1, c0, c1, fmt, campos: {"repeatCell": {"range": _rango(sid, f0, f1, c0, c1), "cell": {"userEnteredFormat": fmt},  # noqa: E731
+                                                                "fields": campos}}
+    combinar = lambda f, c0, c1: {"mergeCells": {"range": _rango(sid, f, f + 1, c0, c1), "mergeType": "MERGE_ALL"}}  # noqa: E731
+    ajuste = "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"
     pedidos = [
         {"addSheet": {"properties": {"sheetId": sid, "title": titulo, "index": 0,
                                      "gridProperties": {"rowCount": n, "columnCount": NCOL_BOLETO, "frozenColumnCount": 1}}}},
-        # filas 1 y 2: A rótulo | B-L texto (la combinación no cruza el borde de la columna A inmovilizada)
-        {"mergeCells": {"range": _rango(sid, 0, 1, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": _rango(sid, 1, 2, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
-        {"repeatCell": {"range": _rango(sid, 0, 2, 0, 1), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                        "fields": "userEnteredFormat.textFormat"}},
-        {"repeatCell": {"range": _rango(sid, 0, 1, 1, NCOL_BOLETO), "cell": {"userEnteredFormat": {"textFormat": {
-            "fontSize": 9, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}}}, "fields": "userEnteredFormat.textFormat"}},
-        {"repeatCell": {"range": _rango(sid, 0, 2, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
-                        "verticalAlignment": "MIDDLE"}}, "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
-        fondo(1, 2, COLORES["resumen"]),
-        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": 2},
-                                       "properties": {"pixelSize": 66}, "fields": "pixelSize"}},
-        ancho(0, 1, 235), ancho(1, 2, 105), ancho(2, 3, 150), ancho(3, 4, 120), ancho(4, 5, 105), ancho(5, 6, 140),
-        ancho(6, 7, 135), ancho(7, 8, 110), ancho(8, 9, 240), ancho(9, 10, 170), ancho(10, 11, 160), ancho(11, 12, 300),
+        # filas 1 y 2: A rótulo | B en palabras | D-N técnico combinado (nada cruza el borde de la columna A)
+        combinar(0, D, NCOL_BOLETO), combinar(1, D, NCOL_BOLETO),
+        texto(0, 2, 0, 1, {"textFormat": {"bold": True}}, "userEnteredFormat.textFormat"),
+        texto(0, n, 0, 2, {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+        texto(0, 2, D, NCOL_BOLETO, {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+        texto(0, n, D, NCOL_BOLETO, {"textFormat": {"fontSize": 8, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["gris"])}}},
+              "userEnteredFormat.textFormat"),
+        fondo(1, 2, 0, 2, COLORES["resumen"]),
+        alto(0, 1, 56), alto(1, 2, 96),
+        ancho(0, 1, 250), ancho(1, 2, 430), ancho(2, 3, 25),
+        ancho(3, 4, 105), ancho(4, 5, 150), ancho(5, 6, 120), ancho(6, 7, 105), ancho(7, 8, 140), ancho(8, 9, 135),
+        ancho(9, 10, 110), ancho(10, 11, 240), ancho(11, 12, 170), ancho(12, 13, 160), ancho(13, 14, 300),
     ]
     for f in meta.get("azul", []):
-        pedidos.append(fondo(f, f + 1, COLORES["azul"]))
+        pedidos.append(fondo(f, f + 1, 0, 2, COLORES["azul"]))
     for f in meta.get("encab", []):
-        pedidos.append({"repeatCell": {"range": _rango(sid, f, f + 1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {
-            "textFormat": {"bold": True, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
-            "backgroundColorStyle": {"rgbColor": _rgb(COLORES["encab"])}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,"
-                      "userEnteredFormat.verticalAlignment"}})
-    if filas and filas[-1][0] == "Notas":                 # la fila de notas: texto chico y ajustado
+        for c0, c1, color in ((0, 2, COLORES["encab"]), (D, NCOL_BOLETO, COLORES["encab_tec"])):
+            pedidos.append(texto(f, f + 1, c0, c1, {
+                "textFormat": {"bold": True, "fontSize": 10, "foregroundColorStyle": {"rgbColor": _rgb(COLORES["blanco"])}},
+                "backgroundColorStyle": {"rgbColor": _rgb(color)}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"},
+                "userEnteredFormat.textFormat,userEnteredFormat.backgroundColorStyle,userEnteredFormat.wrapStrategy,"
+                "userEnteredFormat.verticalAlignment"))
+    if filas and filas[-1][0] == "Para entender":       # la fila de notas: técnico combinado, alto para leer completo
         f = len(filas) - 1
-        pedidos += [{"mergeCells": {"range": _rango(sid, f, f + 1, 1, NCOL_BOLETO), "mergeType": "MERGE_ALL"}},
-                    {"repeatCell": {"range": _rango(sid, f, f + 1, 0, NCOL_BOLETO), "cell": {"userEnteredFormat": {
-                        "wrapStrategy": "WRAP", "textFormat": {"fontSize": 9}}},
-                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.textFormat"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": f, "endIndex": f + 1},
-                                                   "properties": {"pixelSize": 60}, "fields": "pixelSize"}}]
+        pedidos += [combinar(f, D, NCOL_BOLETO), texto(f, f + 1, 0, 1, {"textFormat": {"bold": True}}, "userEnteredFormat.textFormat"),
+                    texto(f, f + 1, D, NCOL_BOLETO, {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}, ajuste),
+                    alto(f, f + 1, 110)]
     hoja.lote(pedidos)
     hoja.escribir(f"'{titulo}'!A1:{chr(64 + NCOL_BOLETO)}{len(filas)}", filas)
     return sid
@@ -2561,8 +2828,9 @@ def ultimas_proyecciones(semana):
 
 
 def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
-    """Pestaña 'Semana N' completa: una fila fija por juego (por hora de inicio) con la última proyección, las
-    columnas de cierre si ya hay resultado, y la fila resumen. Todo sale del registro, la retro y nflverse."""
+    """Pestaña 'Semana N' completa: una fila fija por juego (por hora de inicio) con la parte simple (A-G) y el detalle
+    técnico de v7 (I-AB), el resumen de la semana en palabras y en técnico, y el bloque de equipos. Todo sale del
+    registro, la retro y nflverse."""
     import polars as pl
     if hoja is None or semana is None:
         return
@@ -2577,43 +2845,51 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
             claves.append(gid)
     claves = claves[:JUEGOS_MAX]
     info = {r["game_id"]: r for r in jg.iter_rows(named=True)}
-    bloque, eq = filas_equipos(g26, semana)                 # v7, ajuste 8
+    bloque, eq = filas_equipos(g26, semana)
     ult = ultimas_proyecciones(semana)
-    filas, cierres = [], []
+    filas, cierres, filas_info = [], [], []
     for gid in claves:
         g = info.get(gid)
         u = ult.get(gid)
         if g is None:
             filas.append([""] * (NCOL - 1) + [gid]); continue
         loc, vis = g["home_team"], g["away_team"]
-        base = [fecha_cc(g["inicio"]), f"{vis} ({record_txt(eq[vis])}) @ {loc} ({record_txt(eq[loc])})"]
+        f = favorito_de(g, u)
+        filas_info.append((g, f, u))
+        simple = [partido_txt(g, eq), cuando_txt(g["inicio"]), favorito_txt(f), seguro_txt(f), maquina_txt(u, f),
+                  teaser_txt(u), resultado_simple(g, f, u)]
         c = cierre_de(g, u)
         cierres.append(c)
         if not u:
             lin = linea_txt(loc, vis, -g["spread_line"] if g["spread_line"] is not None else None)
-            filas.append(base + [lin + (" (nflverse)" if lin else "")] + [""] * (N_PROY - 3) + columnas_cierre(c) + ["", "", gid])
-            continue
-        marca = {"nflverse": " (cierre)" if u.get("tipo") == "retro" else " (nflverse)"}.get(u.get("ref_spread"), "")
-        ref = linea_txt(loc, vis, u["spread_ref"]) + marca
-        tot_c = _num(u.get("nfl_total_line"))
-        fila = base + [ref, linea_txt(loc, vis, u["spread_modelo"]), dif_txt(loc, vis, u["spread_modelo"], u["spread_ref"]),
-                       "" if tot_c is None else f"{tot_c:.1f}", f"{float(u['total']):.1f}",
-                       gana_txt(loc, vis, u["p_local"]), gana_txt(loc, vis, u.get("pin_p_ml_local")),
-                       celda_senal(u, "ml"), celda_senal(u, "sp"), wong_txt(u), estado_txt(u), porque_txt(u)]
-        qb = (nombres_qb.get(u["qb_visita_id"], u["qb_visita_id"]) + " @ " + nombres_qb.get(u["qb_local_id"], u["qb_local_id"]))
-        filas.append(fila + columnas_cierre(c) + [qb, f"{u['tipo']} {fecha_cc(t_utc(u['corrida_utc']), False)}", gid])
+            tec = [lin + (" (nflverse)" if lin else "")] + [""] * 11 + columnas_cierre(c) + ["", "", gid]
+        else:
+            marca = {"nflverse": " (cierre)" if u.get("tipo") == "retro" else " (nflverse)"}.get(u.get("ref_spread"), "")
+            tot_c = _num(u.get("nfl_total_line"))
+            qb = (nombres_qb.get(u["qb_visita_id"], u["qb_visita_id"]) + " @ " + nombres_qb.get(u["qb_local_id"], u["qb_local_id"]))
+            tec = [linea_txt(loc, vis, u["spread_ref"]) + marca, linea_txt(loc, vis, u["spread_modelo"]),
+                   dif_txt(loc, vis, u["spread_modelo"], u["spread_ref"]), "" if tot_c is None else f"{tot_c:.1f}",
+                   f"{float(u['total']):.1f}", gana_txt(loc, vis, u["p_local"]), gana_txt(loc, vis, u.get("pin_p_ml_local")),
+                   celda_senal(u, "ml"), celda_senal(u, "sp"), wong_txt(u), estado_txt(u), porque_txt(u)] + \
+                columnas_cierre(c) + [qb, f"{u['tipo']} {fecha_cc(t_utc(u['corrida_utc']), False)}", gid]
+        filas.append(simple + [""] + tec)
     n = len(claves)
     if n:
-        hoja.escribir(f"'{t}'!A5:{COL_ID}{4 + n}", [["" if x is None else x for x in f] for f in filas])
+        hoja.escribir(f"'{t}'!A5:{COL_ID}{4 + n}", [["" if x is None else x for x in f_] for f_ in filas])
     ult_col = chr(64 + len(ENCAB_EQUIPOS))
     hoja.escribir(f"'{t}'!A{FILA_EQUIPOS}:{ult_col}{FILA_EQUIPOS + len(bloque) - 1}", bloque)
-    nota = (" · semana retrospectiva: proyecciones hechas después de los juegos" if semana < SEMANA_AUTO
-            else " · semana informativa, fuera de 31A" if semana < SEMANA_31A else "")
-    hoja.escribir(f"'{t}'!A1:C1", [[f"Semana {semana} · NFL {TEMPORADA}", "",
-                                    f"motor s2-v1 en modo registro (sin validar) · actualizado {fecha_cc(ahora)} (Caracas) · "
-                                    f"líneas en convención de la casa: DAL -3.5 = DAL favorito por 3,5" + nota]])
+    nota = (" Semana de repaso: la máquina se corrió después de los partidos." if semana < SEMANA_AUTO
+            else " Semana de práctica: todavía no cuenta para la prueba de la máquina." if semana < SEMANA_31A else "")
+    nota_tec = (" · semana retrospectiva: proyecciones hechas después de los juegos" if semana < SEMANA_AUTO
+                else " · semana informativa, fuera de 31A" if semana < SEMANA_31A else "")
     conf = confiabilidad_txt(confiabilidad_qb(g26, semana))
-    hoja.escribir(f"'{t}'!A3:C3", [["Resumen", "", resumen_txt(cierres, jg.height) + (" " + conf + "." if conf else "")]])
+    tec1 = (f"Detalle técnico · motor s2-v1 en modo registro (sin validar) · actualizado {fecha_cc(ahora)} (Caracas)" + nota_tec)
+    hoja.escribir(f"'{t}'!A1:{COL_ID}3", [
+        [f"Semana {semana}", f"NFL {TEMPORADA} · actualizado {cuando_txt(ahora)} (hora de Caracas)." + nota] + [""] * 6 + [tec1] + [""] * 19,
+        ["Cómo leer", COMO_LEER] + [""] * 6 + [LEYENDA_TEC] + [""] * 19,
+        ["Cómo va", resumen_simple(filas_info, jg.height)] + [""] * 6 +
+        [resumen_txt(cierres, jg.height) + (" " + conf + "." if conf else "")] + [""] * 19,
+    ])
 
 
 def escribir_semanas(hoja, g26, semanas, nombres_qb, ahora, estado, bot_dir=None):
