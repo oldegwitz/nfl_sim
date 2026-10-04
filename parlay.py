@@ -3,16 +3,19 @@
 """
 parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/registro_42_parlays.md).
 
-  leer RUTA        lee el boleto de BetOnline con Gemini (foto, PDF o texto; puede traer varios boletos), lo cruza con
-                   el calendario y lo deja pendiente («foto RUTA» sigue funcionando: es lo que llamaba orden-v4)
+  leer RUTA [--nombre NOMBRE] [--formato pdf|texto|imagen]
+                   lee el boleto de BetOnline con Gemini (foto, PDF o texto; puede traer varios boletos), lo cruza con
+                   el calendario y lo deja pendiente. --nombre: cómo se llamará (con varios boletos: NOMBRE 1, NOMBRE 2…);
+                   sin nombre, al guardarlo se llama «Parlay N». --formato: el que eligió Ozz; si el archivo es de otro
+                   tipo, se rechaza sin gastar Gemini (código 3). «foto RUTA» sigue funcionando (orden-v4)
   si | no          guarda o descarta lo pendiente
   lista            los parlays guardados
-  estado [N]       estado de un parlay (el último si no se dice): juego a juego, P(cobrar) ahora, EV contra el cierre
+  estado [N|NOMBRE]  estado de un parlay (el último si no se dice): juego a juego, P(cobrar) ahora, EV contra el cierre
   jugadas EQUIPO   las últimas 10 jugadas del juego de ese equipo
-  borrar N         saca un parlay de la lista (queda en el registro marcado como borrado)
+  borrar N|NOMBRE  saca un parlay de la lista (queda en el registro marcado como borrado)
   prueba           comprobación de la instalación (no gasta Gemini)
-  diagnostico [RUTA]  prueba contra Google cada forma de pedir la lectura (última imagen y último PDF guardados y un texto);
-                   los 400 no se cobran; cada lectura buena ~USD 0,005 (máximo ~USD 0,05); no cuenta para el tope
+  diagnostico [RUTA]  prueba contra Google cada forma de la cadena del bot con la última imagen, el último PDF y un texto,
+                   y muestra lo que leyó; los 400 no se cobran; ≈USD 0,05 como máximo; no cuenta para el tope
 
 Lo llama orden.py (bot del motor) como proceso aparte, igual que a semana.py. Es descriptivo: no cuenta para 31A ni para
 el CLV de 29A, no toca s2-v1 (no importa sprint2.py) y no escribe en la hoja.
@@ -33,7 +36,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.2 (4-oct-2026)"   # v1.1: foto, PDF o texto; varios boletos · v1.2: respaldo ante el 400 de Google, diagnóstico
+VERSION = "parlay-v1.3 (4-oct-2026)"   # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -606,6 +609,21 @@ def _menciona(txt, eq):
     return any(a and re.search(rf"(^|\s){re.escape(a)}(\s|$)", t) for a in [ab] + alias.get(ab, []))
 
 
+def limpiar_nombre(x):
+    """Nombre que puso Ozz: sin espacios de más, sin «/» al inicio, máximo NOMBRE_MAX letras. '' si no sirve."""
+    x = re.sub(r"\s+", " ", str(x or "")).strip().lstrip("/").strip()
+    return x[:NOMBRE_MAX].strip()
+
+
+def nombre_de(b):
+    """Nombre del boleto guardado; los de v1-v1.2 no tienen: «Parlay 3», «Teaser 4»…"""
+    return b.get("nombre") or f"{(b.get('tipo') or 'parlay').capitalize()} {b.get('id', '')}".strip()
+
+
+def _clave_nombre(x):
+    return re.sub(r"\s+", " ", normal(x)).strip()
+
+
 class Parlays:
     def __init__(self, espn=None, bot_dir=BOT_DIR, ahora=None):
         self.espn = espn or ESPN()
@@ -736,8 +754,9 @@ class Parlays:
             avisos.append("patas con el juego ya empezado o terminado: " + ", ".join(map(str, empezados)))
         return b, avisos, fil
 
-    def preparar(self, lectura, archivo=None):
-        """lectura: {"boletos": [...]} (v1.1) o un solo boleto (v1). Deja todos pendientes hasta /si."""
+    def preparar(self, lectura, archivo=None, nombre=None):
+        """lectura: {"boletos": [...]} (v1.1) o un solo boleto (v1). Deja todos pendientes hasta /si.
+        nombre (v1.3): el que eligió Ozz; con varios boletos se numeran (Domingo 1, Domingo 2…)."""
         tab = self.espn.tablero()
         lista = juegos_del_tablero(tab)
         lecturas = lectura.get("boletos") if isinstance(lectura.get("boletos"), list) else [lectura]
@@ -745,15 +764,20 @@ class Parlays:
         hechos = [self.preparar_uno(x, lista, tab, archivo) for x in lecturas]
         if not hechos:
             return "No encontré ningún boleto con patas. Mándamelo otra vez con todas las patas a la vista."
+        nombre = limpiar_nombre(nombre)
+        for i, (b, _, _) in enumerate(hechos, 1):
+            if nombre:
+                b["nombre"] = nombre if len(hechos) == 1 else f"{nombre} {i}"
         _guardar_json(PENDIENTE, dict(boletos=[h[0] for h in hechos], avisos=[h[1] for h in hechos], creado=S.iso(self.ahora)))
-        partes = [self.texto_pendiente(b, av, fil, rotulo=(f"Boleto {chr(65 + i)}" if len(hechos) > 1 else None))
+        partes = [self.texto_pendiente(b, av, fil, rotulo=(f"«{b['nombre']}»" if b.get("nombre") and len(hechos) > 1 else
+                                                           f"Boleto {chr(65 + i)}" if len(hechos) > 1 else None))
                   for i, (b, av, fil) in enumerate(hechos)]
         pie = (f"¿Los guardo? /si guarda los {len(hechos)} · /no descarta todo" if len(hechos) > 1 else
                "¿Lo guardo? /si para guardar · /no para descartar")
         return "\n\n".join(partes) + "\n\n" + pie + " (si leí mal, mándalo otra vez más claro)"
 
     def texto_pendiente(self, b, avisos, fil, rotulo=None):
-        cab = (f"{rotulo}: " if rotulo else "Leí este boleto: ") + \
+        cab = (f"{rotulo}: " if rotulo else f"Leí «{b['nombre']}»: " if b.get("nombre") else "Leí este boleto: ") + \
             f"{b['tipo'].lower()} de {len(b['patas'])} patas, {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
         out = [cab + (f" (n.º {b['numero']})" if b.get("numero") else "") + ":"]
         for f in fil:
@@ -777,19 +801,33 @@ class Parlays:
         if not pen:
             return "No hay ningún boleto esperando confirmación. Mándame el boleto (foto, PDF o texto)."
         if pen.get("crudo"):          # leído por Gemini pero sin cruzar (ESPN no respondió): se cruza ahora y se vuelve a preguntar
-            return self.preparar(pen["crudo"], archivo=pen.get("archivo"))
+            return self.preparar(pen["crudo"], archivo=pen.get("archivo"), nombre=pen.get("nombre"))
         boletos = pen.get("boletos") or ([pen["boleto"]] if pen.get("boleto") else [])
         lista = self.todos()
-        ids = []
+        usados = {_clave_nombre(nombre_de(x)) for x in lista if x.get("estado") != "borrado"}
+        hechos = []
         for b in boletos:
             b.update(id=1 + max([x["id"] for x in lista], default=0), cargado=S.iso(self.ahora), estado="vivo", version=VERSION)
+            base = limpiar_nombre(b.get("nombre")) or f"{b['tipo'].capitalize()} {b['id']}"
+            nom, k = base, 2
+            while _clave_nombre(nom) in usados or nom.isdigit():
+                nom, k = f"{base} ({k})", k + 1
+            b["nombre"] = nom
+            usados.add(_clave_nombre(nom))
             lista.append(b)
-            ids.append(b["id"])
+            hechos.append(b)
         self._guardar(lista)
         PENDIENTE.unlink()
-        if len(ids) == 1:
-            return f"Guardado como parlay {ids[0]}. Pide /parlay {ids[0]} cuando quieras ver cómo va."
-        return f"Guardados como parlays {', '.join(map(str, ids))}. Pide /parlay N para ver cada uno."
+        def automatico(b):
+            return b["nombre"].lower() == f"{b['tipo']} {b['id']}".lower()
+        if len(hechos) == 1:
+            b = hechos[0]
+            pide = f"/parlay {b['id']}" if automatico(b) else f"/parlay {b['nombre']} o /parlay {b['id']}"
+            return f"Guardado como «{b['nombre']}» (n.º {b['id']}). Pide {pide} cuando quieras ver cómo va."
+        b = hechos[0]
+        pide = (f"Pide /parlay y el número para ver cada uno (por ejemplo, /parlay {b['id']})." if automatico(b) else
+                f"Pide /parlay {b['nombre']} (o su número) para ver cada uno.")
+        return "Guardados: " + " · ".join(f"«{x['nombre']}» (n.º {x['id']})" for x in hechos) + ". " + pide
 
     def descartar(self):
         if PENDIENTE.exists():
@@ -797,14 +835,35 @@ class Parlays:
             return "Descartado. No guardé nada."
         return "No había nada por confirmar."
 
-    def borrar(self, n):
+    def buscar(self, ref, lista=None):
+        """ref: número o nombre (sin importar mayúsculas ni acentos). Devuelve (boleto, None) o (None, mensaje).
+        Un nombre incompleto sirve si apunta a uno solo («domingo» → «Domingo 1» si no hay otro)."""
+        lista = [b for b in (lista if lista is not None else self.todos()) if b.get("estado") != "borrado"]
+        ref = str(ref or "").strip()
+        if ref.isdigit():
+            b = next((x for x in lista if x["id"] == int(ref)), None)
+            return (b, None) if b else (None, f"No encuentro el parlay {ref}. /parlays muestra la lista.")
+        k = _clave_nombre(ref)
+        if not k:
+            return None, "Dime cuál: el número o el nombre."
+        exactos = [x for x in lista if _clave_nombre(nombre_de(x)) == k]
+        if exactos:
+            return exactos[-1], None
+        cand = [x for x in lista if _clave_nombre(nombre_de(x)).startswith(k)]
+        if len(cand) == 1:
+            return cand[0], None
+        if cand:
+            return None, "Hay varios: " + " · ".join(f"/parlay {nombre_de(x)}" for x in cand[-6:])
+        return None, f"No encuentro «{ref}». /parlays muestra la lista."
+
+    def borrar(self, ref):
         lista = self.todos()
-        for b in lista:
-            if b["id"] == n and b.get("estado") != "borrado":
-                b.update(estado="borrado", borrado=S.iso(self.ahora))
-                self._guardar(lista)
-                return f"Parlay {n} borrado de la lista (queda en el registro marcado como borrado)."
-        return f"No encuentro el parlay {n}."
+        b, msg = self.buscar(ref, lista)
+        if b is None:
+            return msg.replace("/parlay ", "/borrar_parlay ")
+        b.update(estado="borrado", borrado=S.iso(self.ahora))
+        self._guardar(lista)
+        return f"«{nombre_de(b)}» (n.º {b['id']}) borrado de la lista (queda en el registro marcado como borrado)."
 
     # -- cierre: anota el resultado cuando se decide
     def cerrar_resultados(self):
@@ -834,7 +893,7 @@ class Parlays:
             self._guardar(lista)
 
     # -- textos para Telegram
-    def texto_estado(self, n=None):
+    def texto_estado(self, ref=None):
         try:
             self.cerrar_resultados()
         except Exception as e:  # noqa: BLE001
@@ -842,9 +901,12 @@ class Parlays:
         lista = [b for b in self.todos() if b.get("estado") != "borrado"]
         if not lista:
             return "No hay parlays guardados. Mándame el boleto de BetOnline (foto, PDF o texto)."
-        b = lista[-1] if n is None else next((x for x in lista if x["id"] == n), None)
-        if b is None:
-            return f"No encuentro el parlay {n}. /parlays muestra la lista."
+        if ref is None or not str(ref).strip():
+            b = lista[-1]
+        else:
+            b, msg = self.buscar(ref, lista)
+            if b is None:
+                return msg
         juegos = self._juegos(b.get("semana"), b.get("temporada"), [p.get("evento") for p in b["patas"]])
         fa = self.filas(b, juegos, modo="ahora", con_resumen=True)
         fc = self.filas(b, juegos, modo="cierre")
@@ -857,7 +919,8 @@ class Parlays:
         per = len(post) - gan - push
         vivas = len(fa) - len(post)
         estado = "PERDIDO" if per else ("COBRADO" if vivas == 0 else "vivo")
-        out = [f"🎟 Parlay {b['id']} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}" + (f" · n.º {b['numero']}" if b.get("numero") else ""),
+        out = [f"🎟 {nombre_de(b)} (n.º {b['id']}) · {b.get('tipo', 'parlay').lower()} de {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
+               + (f" · boleto {b['numero']}" if b.get("numero") else ""),
                f"{estado}: {gan} ganadas · {per} perdidas · {push} push · {vivas} por decidir"]
         if estado == "vivo":
             out.append(f"P(cobrar) ahora ≈ {pct(pc, 1)}" + (f" ({uno_de_cada(pc)})" if uno_de_cada(pc) else "") + f" · al cargar {pct(b.get('previo', {}).get('p_cobrar'), 1)}")
@@ -895,8 +958,8 @@ class Parlays:
         for b in reversed(lista[-12:]):
             pr = b.get("previo", {})
             fin = b.get("resultado") or f"en juego · /parlay {b['id']}"
-            out.append(f"{b['id']} · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → {dinero(b.get('pago'))} · "
-                       f"P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
+            out.append(f"{b['id']} · «{nombre_de(b)}» · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → "
+                       f"{dinero(b.get('pago'))} · P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
         cer = [b for b in lista if b.get("cierre")]
         if cer:
             ac = sum(b["cierre"]["aciertos"] for b in cer)
@@ -959,25 +1022,29 @@ CAMPOS_LOG = ["hora_utc", "fecha_ccs", "version", "modelo", "entrada", "variante
               "tok_entrada", "tok_salida", "tok_razonamiento", "costo_usd", "foto", "boletos", "patas", "detalle"]
 MAX_TEXTO = 8000
 MAX_ARCHIVO = 15 * 1024 * 1024
-# v1.2: Google respondió 400 «Request contains an invalid argument» a imagen y PDF con el esquema anidado (4-oct, 10 de 10).
-# La misma vía con texto y esquema anidado sí funciona en el agente de QB (35A, piloto 3: 15 de 15 con HTTP 200), así que la
-# sospecha es la combinación de archivo + formato de salida (vista previa) o el razonamiento con archivo; lo aclara `diagnostico`.
-# Cadena de respaldo, en este orden; un 400 pasa a la siguiente (Google no cobra las peticiones rechazadas):
-#   esquema              salida con esquema (boletos → patas), como v1.1
-#   esquema-simple       salida con esquema de un solo boleto, sin enum ni límites (menos anidado)
-#   sin-esquema          sin responseFormat: el JSON se pide en el texto y se extrae de la respuesta (como g1-texto de 35A)
-#   sin-esquema/minima   lo mismo, sin thinkingConfig (la petición más simple posible)
-CADENA_GEMINI = (("esquema", True), ("esquema-simple", True), ("sin-esquema", True), ("sin-esquema", False))
-
-
-def nombre_variante(formato, pensar):
-    return formato if pensar else f"{formato}/minima"
+# v1.2: Google respondió 400 «Request contains an invalid argument» a las 10 primeras lecturas reales (v1.1).
+# Diagnóstico del 4-oct (HECHO, registro 42): el 400 lo provoca ESQUEMA_BOLETO (lista dentro de lista con minItems/maxItems y
+# enum), también con texto; con archivo funcionan el esquema de un solo boleto, sin esquema y la mínima.
+# v1.3: cadena, en este orden; un 400 pasa a la siguiente (Google no cobra las peticiones rechazadas):
+#   esquema-varios       lista de boletos con el boleto simple (sin minItems, maxItems, enum ni required); admite varios boletos
+#   sin-esquema          sin responseFormat: el JSON se pide en el texto y se extrae (como g1-texto de 35A); leyó bien el PDF
+#                        real de 1 boleto y 15 patas
+#   sin-esquema/minima   lo mismo, sin thinkingConfig
+# Salen ESQUEMA_BOLETO (rechazado por Google) y el esquema de un solo boleto (junta varios boletos en uno).
 _PATA_SIMPLE = {"type": "object", "properties": {k: {"type": "string"} for k in ("texto", "equipo", "partido", "tipo", "linea", "lado", "cuota")}}
 ESQUEMA_SIMPLE = {"type": "object", "properties": {"tipo": {"type": "string"}, "monto": {"type": "string"}, "pago": {"type": "string"},
                                                    "numero": {"type": "string"}, "patas": {"type": "array", "items": _PATA_SIMPLE}}}
 PROMPT_JSON = ('\nAnswer ONLY with a JSON object and nothing else, of this form: {"boletos": [{"tipo": "PARLAY", "monto": "10", '
                '"pago": "315.12", "numero": "", "patas": [{"texto": "...", "equipo": "...", "partido": "...", "tipo": "SPREAD", '
                '"linea": "-7", "lado": "", "cuota": "-110"}]}]}')
+CADENA_GEMINI = (("esquema-varios", True), ("sin-esquema", True), ("sin-esquema", False))
+ESQUEMA_VARIOS = {"type": "object", "properties": {"boletos": {"type": "array", "items": ESQUEMA_SIMPLE}}}
+FORMATOS = {"pdf": ("application/pdf",), "imagen": ("image/png", "image/jpeg", "image/webp"), "texto": ("text/plain",)}
+NOMBRE_MAX = 30
+
+
+def nombre_variante(formato, pensar):
+    return formato if pensar else f"{formato}/minima"
 
 
 def tipo_entrada(datos):
@@ -997,7 +1064,7 @@ def tipo_entrada(datos):
     return "text/plain" if 3 <= len(t) <= MAX_TEXTO else None
 
 
-def gemini_cuerpo(contenido, mime, variante="esquema", campo="inlineData", pensar=True):
+def gemini_cuerpo(contenido, mime, variante="esquema-varios", campo="inlineData", pensar=True):
     """Cuerpo de generateContent. campo: 'inlineData' (camelCase, como semana.py) o 'inline_data' (solo para el diagnóstico)."""
     import base64
     if mime == "text/plain":
@@ -1010,10 +1077,10 @@ def gemini_cuerpo(contenido, mime, variante="esquema", campo="inlineData", pensa
     if pensar:
         gc["thinkingConfig"] = {"thinkingLevel": GEMINI_NIVEL}
     texto = PROMPT_BOLETO
-    if variante == "esquema":
+    if variante == "esquema-varios":
+        gc["responseFormat"] = {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_VARIOS}}
+    elif variante == "esquema":          # v1.1 (rechazado por Google); solo queda para comparar a mano
         gc["responseFormat"] = {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_BOLETO}}
-    elif variante == "esquema-simple":
-        gc["responseFormat"] = {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_SIMPLE}}
     else:
         texto += PROMPT_JSON
     return {"contents": [{"role": "user", "parts": [{"text": texto}, parte]}], "generationConfig": gc}
@@ -1139,15 +1206,30 @@ def registrar_llamada(reg):
         w.writerow(reg)
 
 
-def procesar_entrada(ruta, P=None, post=None):
+def chequear_formato(datos, formato):
+    """v1.3: si Ozz eligió un formato, la entrada tiene que ser de ese tipo (por el contenido). None si está bien."""
+    if not formato:
+        return None
+    mime = tipo_entrada(datos)
+    if mime in FORMATOS.get(formato, ()):
+        return None
+    que = {"application/pdf": "un PDF", "text/plain": "texto"}.get(mime, "una imagen" if mime else "un archivo que no reconozco")
+    pide = {"pdf": "el PDF (📎 → Archivo)", "imagen": "la foto o captura", "texto": "el texto del boleto"}.get(formato, "el boleto")
+    return f"Elegiste {formato.upper() if formato == 'pdf' else formato}, pero me llegó {que}. Mándame {pide}, o /cancelar."
+
+
+def procesar_entrada(ruta, P=None, post=None, nombre=None, formato=None):
     """Del bot: guarda una copia de la entrada (foto, PDF o texto), la lee con Gemini si queda cupo, cruza cada boleto con el
-    calendario y los deja pendientes de /si."""
+    calendario y los deja pendientes de /si. nombre y formato: los que eligió Ozz en el paso «Parlay» (v1.3)."""
     ruta = Path(ruta)
     ahora = ahora_utc()
     hoy = ahora.astimezone(CCS).date().isoformat()
     datos = ruta.read_bytes()
     if not datos or len(datos) > MAX_ARCHIVO:
         return "El archivo está vacío o es demasiado grande. Mándame una foto, un PDF o el texto del boleto."
+    distinto = chequear_formato(datos, formato)
+    if distinto:
+        return distinto
     mime = tipo_entrada(datos)
     if mime is None:
         return "No reconozco ese archivo. Mándame el boleto como foto (JPG o PNG), PDF o texto."
@@ -1155,11 +1237,11 @@ def procesar_entrada(ruta, P=None, post=None):
     if fotos_hoy(hoy) >= tope:
         return f"Ya usé las {tope} lecturas de boletos de hoy (semana.ini [parlays] tope_fotos_dia). Mañana se renueva."
     FOTOS.mkdir(parents=True, exist_ok=True)
-    nombre = ahora.strftime("%Y%m%d_%H%M%S_%f") + {"image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf",
-                                                  "text/plain": ".txt"}.get(mime, ".jpg")
-    (FOTOS / nombre).write_bytes(datos)
+    copia = ahora.strftime("%Y%m%d_%H%M%S_%f") + {"image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf",
+                                                 "text/plain": ".txt"}.get(mime, ".jpg")
+    (FOTOS / copia).write_bytes(datos)
     lectura, reg = gemini_leer_boleto(datos, mime, post=post)
-    reg.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, foto=nombre)
+    reg.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, foto=copia)
     registrar_llamada(reg)
     if reg.get("estado") == "sin llave":
         return "No encuentro la llave de Gemini (credenciales/gemini.key): no puedo leer boletos."
@@ -1178,9 +1260,9 @@ def procesar_entrada(ruta, P=None, post=None):
                  if (reg.get("costo_usd") or 0) > 0 else "Google no lo cobró: no cuenta para el tope del día.")
         return f"No pude leer {que} del boleto ({por_que}; probé {n} forma{'s' if n != 1 else ''}).{extra} {cobro}"
     try:
-        return (P or Parlays()).preparar(lectura, archivo=nombre)
+        return (P or Parlays()).preparar(lectura, archivo=copia, nombre=nombre)
     except Exception as e:  # noqa: BLE001 — la lectura ya se pagó: se guarda y se cruza con /si
-        _guardar_json(PENDIENTE, dict(crudo=lectura, archivo=nombre, creado=S.iso(ahora)))
+        _guardar_json(PENDIENTE, dict(crudo=lectura, archivo=copia, nombre=limpiar_nombre(nombre) or None, creado=S.iso(ahora)))
         n = len(lectura.get("boletos") or [])
         return (f"Leí {n} boleto{'s' if n != 1 else ''}, pero no pude cruzarlo{'s' if n != 1 else ''} con los juegos "
                 f"({type(e).__name__}). En un minuto manda /si: lo cruzo y te lo muestro antes de guardar (no vuelve a gastar Gemini).")
@@ -1189,11 +1271,36 @@ def procesar_entrada(ruta, P=None, post=None):
 procesar_foto = procesar_entrada        # nombre de v1
 
 
+def leer_cli(resto, post=None):
+    """leer RUTA [--nombre NOMBRE] [--formato pdf|texto|imagen] → (código, mensaje). Código 3: formato distinto al elegido
+    (orden.py sigue esperando el archivo correcto); no gasta Gemini."""
+    ruta, nombre, formato, i = None, None, None, 0
+    while i < len(resto):
+        if resto[i] == "--nombre" and i + 1 < len(resto):
+            nombre, i = resto[i + 1], i + 2
+        elif resto[i] == "--formato" and i + 1 < len(resto):
+            formato, i = resto[i + 1].lower(), i + 2
+        else:
+            ruta, i = ruta or resto[i], i + 1
+    if not ruta:
+        return 2, "Falta la ruta del boleto."
+    if formato and formato not in FORMATOS:
+        return 2, f"Formato desconocido: {formato} (pdf, texto o imagen)."
+    try:
+        datos = Path(ruta).read_bytes()
+    except OSError:
+        return 1, "No encuentro el archivo del boleto."
+    distinto = chequear_formato(datos, formato)
+    if distinto:
+        return 3, distinto
+    return 0, procesar_entrada(ruta, post=post, nombre=nombre, formato=formato)
+
+
 def diagnostico(ruta=None, post=None):
-    """Prueba contra Google cada forma de pedir la lectura, por separado y sin respaldo: con la última imagen guardada
-    (salidas/parlays/boletos), el último PDF guardado y un texto corto (o solo con RUTA si se da). Un 400 no se cobra;
-    cada lectura buena cuesta ~USD 0,005 (máximo ~USD 0,05 en total). No cuenta para el tope del día. Las pruebas 1-4 de
-    la imagen son, en orden, la cadena que usa el bot: la primera que diga OK es la que leerá los boletos."""
+    """Prueba contra Google cada forma de la cadena del bot (CADENA_GEMINI), por separado y sin respaldo: con la última
+    imagen y el último PDF guardados (salidas/parlays/boletos) y un texto corto, o solo con RUTA si se da. Muestra lo que
+    leyó la forma que usará el bot, para compararlo con el boleto real. Un 400 no se cobra; ≈USD 0,05 como máximo.
+    No cuenta para el tope del día."""
     if not S.GEMINI_LLAVE.exists():
         return "No encuentro la llave de Gemini (credenciales/gemini.key)."
     llave = S.GEMINI_LLAVE.read_text(encoding="utf-8").strip()
@@ -1202,52 +1309,51 @@ def diagnostico(ruta=None, post=None):
         g = sorted((x for x in FOTOS.glob("*") if x.suffix.lower() in sufijos), key=lambda x: x.stat().st_mtime)
         return g[-1] if g else None
 
-    completas = [(nombre_variante(f, p), f, "inlineData", p) for f, p in CADENA_GEMINI] + [
-        ("esquema, sin razonamiento", "esquema", "inlineData", False),
-        ("esquema, campo inline_data", "esquema", "inline_data", True)]
-    pruebas = []          # (grupo, nombre, ruta, datos, mime, formato, campo, pensar)
     if ruta is not None:
-        rutas = [(Path(ruta), completas)]
+        rutas = [Path(ruta)]
     else:
-        img, pdf = ultimo((".jpg", ".png", ".webp")), ultimo((".pdf",))
-        rutas = ([(img, completas)] if img else []) + ([(pdf, [completas[0], completas[2]])] if pdf else [])
-    for r_, lista in rutas:
+        rutas = [x for x in (ultimo((".jpg", ".png", ".webp")), ultimo((".pdf",))) if x]
+    entradas = []
+    for r_ in rutas:
         datos = r_.read_bytes()
         mime = tipo_entrada(datos)
         if mime is None:
             return f"No reconozco {r_.name} como imagen, PDF ni texto."
-        pruebas += [(r_.name, nom, r_, datos, mime, f, c, p) for nom, f, c, p in lista]
-    txt = b"Parlay $10: BUF -7 -110, CHI ML -175"
-    pruebas += [("texto corto", nom, None, txt, "text/plain", f, "inlineData", True)
-                for nom, f in (("esquema", "esquema"), ("sin-esquema", "sin-esquema"))]
+        entradas.append((r_.name, datos, mime))
+    entradas.append(("texto corto", b"Parlay $10: BUF -7 -110, CHI ML -175", "text/plain"))
     out = [f"Diagnóstico de lectura · {S.GEMINI_MODELO} · {VERSION}"]
     if not rutas:
         out.append("(no hay boletos guardados en salidas/parlays/boletos: solo pruebo el texto)")
-    costo, ahora, grupo, ok = 0.0, ahora_utc(), None, {}
-    for i, (g, nom, r_, datos, mime, f, campo, pensar) in enumerate(pruebas, 1):
-        if g != grupo:
-            grupo = g
-            out.append(f"— {g} ({mime}, {len(datos) // 1024} KB)" if r_ else f"— {g}")
-        lectura, r = gemini_una(llave, datos, mime, f, post=post, campo=campo, pensar=pensar)
-        costo += r.get("costo_usd") or 0.0
-        ok[(g, nom)] = bool(lectura)
-        if lectura:
-            res = f"OK · {r.get('boletos')} boleto(s), {r.get('patas')} patas · {r.get('latencia_s')} s"
-        else:
-            res = f"FALLA · {r.get('http', '')} {r.get('estado')}: {(r.get('detalle') or '')[:160]} · {r.get('latencia_s', '')} s"
-        out.append(f"{i}. {nom} → {res}")
-        registrar_llamada(dict(r, hora_utc=S.iso(ahora), fecha_ccs=ahora.astimezone(CCS).date().isoformat(), version=VERSION,
-                               modelo=S.GEMINI_MODELO, entrada="diagnostico", intentos=1, foto=r_.name if r_ else "",
-                               variante=f"{nombre_variante(f, pensar)}/{campo}"))
-    out.append("Conclusión:")
-    for r_, _ in rutas:
-        cadena = [nombre_variante(f, p) for f, p in CADENA_GEMINI if ok.get((r_.name, nombre_variante(f, p)))]
-        que, lo = ("el PDF", "lo") if r_.suffix.lower() == ".pdf" else ("las imágenes", "las")
-        out.append(f"· {que}: " + (f"el bot {lo} leerá con «{cadena[0]}»" if cadena else
-                                   "ninguna forma de la cadena funcionó: no mandes boletos así hasta la próxima versión"))
-    txt_ok = [n for (g, n), v in ok.items() if g == "texto corto" and v]
-    out.append("· texto: " + ("funciona (" + ", ".join(txt_ok) + ")" if txt_ok else
-                              "tampoco funciona: el problema no es el archivo (llave, modelo o cuenta)"))
+    costo, ahora, k, conclusion = 0.0, ahora_utc(), 0, []
+    for nom, datos, mime in entradas:
+        out.append(f"— {nom} ({mime}" + (f", {len(datos) // 1024} KB)" if mime != "text/plain" else ")"))
+        usada = None
+        for f, pensar in CADENA_GEMINI:
+            k += 1
+            var = nombre_variante(f, pensar)
+            lectura, r = gemini_una(llave, datos, mime, f, post=post, pensar=pensar)
+            costo += r.get("costo_usd") or 0.0
+            if lectura:
+                out.append(f"{k}. {var} → OK · {r.get('boletos')} boleto(s), {r.get('patas')} patas · {r.get('latencia_s')} s")
+                if usada is None:
+                    usada = var
+                    for i, bo in enumerate(lectura["boletos"], 1):
+                        out.append(f"   lectura de «{var}», boleto {i}: {str(bo.get('tipo') or '?')} · monto {bo.get('monto') or '?'}"
+                                   f" · pago {bo.get('pago') or '?'}")
+                        for j, pa in enumerate(bo.get("patas") or [], 1):
+                            out.append(f"     {j}) {str(pa.get('texto') or pa.get('equipo') or '?')[:70]}")
+            else:
+                out.append(f"{k}. {var} → FALLA · {r.get('http', '')} {r.get('estado')}: {(r.get('detalle') or '')[:160]} · {r.get('latencia_s', '')} s")
+            registrar_llamada(dict(r, hora_utc=S.iso(ahora), fecha_ccs=ahora.astimezone(CCS).date().isoformat(), version=VERSION,
+                                   modelo=S.GEMINI_MODELO, entrada="diagnostico", intentos=1, variante=var,
+                                   foto=nom if mime != "text/plain" else ""))
+        que = {"application/pdf": "el PDF", "text/plain": "el texto"}.get(mime, "las imágenes")
+        conclusion.append(f"· {que}: " + (f"el bot usará «{usada}» (la primera que funcionó, en el orden del bot)" if usada else
+                                          "ninguna forma funcionó: no mandes boletos así hasta la próxima versión"))
+    out += ["Conclusión:"] + conclusion
+    if not any("usará" in c for c in conclusion):
+        out.append("· como tampoco funcionó el texto, el problema no es el archivo (llave, modelo o cuenta)")
+    out.append("Compara la lectura con tu boleto: tipo, monto, pago y cada pata.")
     out.append(f"Costo del diagnóstico ≈ USD {costo:.4f} (los 400 no se cobran). No cuenta para el tope del día.".replace(".", ",", 1))
     return "\n".join(out)
 
@@ -1287,7 +1393,9 @@ def main(argv):
     cmd, resto = argv[0], argv[1:]
     try:
         if cmd in ("leer", "foto") and resto:
-            print(procesar_entrada(resto[0]))
+            codigo, texto = leer_cli(resto)
+            print(texto)
+            return codigo
         elif cmd == "si":
             print(Parlays().confirmar())
         elif cmd == "no":
@@ -1295,11 +1403,11 @@ def main(argv):
         elif cmd == "lista":
             print(Parlays().texto_lista())
         elif cmd == "estado":
-            print(Parlays().texto_estado(int(resto[0]) if resto and resto[0].isdigit() else None))
+            print(Parlays().texto_estado(" ".join(resto) if resto else None))
         elif cmd == "jugadas":
             print(Parlays().texto_jugadas(resto[0] if resto else ""))
-        elif cmd == "borrar" and resto and resto[0].isdigit():
-            print(Parlays().borrar(int(resto[0])))
+        elif cmd == "borrar" and resto:
+            print(Parlays().borrar(" ".join(resto)))
         elif cmd == "prueba":
             print(prueba_instalacion())
         elif cmd == "diagnostico":

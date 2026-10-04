@@ -14,10 +14,13 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /piloto [variante] → piloto del agente Gemini con los criterios P1-P4 (semana.py gemini-piloto); variante opcional:
              g1 (por omisión), g1-low, g1-texto o g1-high. Tipo 'prueba': no cuenta para el piso de 35A.
   Parlays (v4, decisión 42; parlay.py, descriptivo, no cuenta para nada):
-  boleto como foto, PDF o texto (v4.1; texto pegado o escrito, solo o con /cargar) → Gemini lo lee y el bot repite lo
-             que entendió (puede traer varios boletos); /si los guarda, /no los descarta
-  /parlays → la lista · /parlay [N] → estado juego a juego (el último si no se dice N)
-  /jugadas EQUIPO → últimas 10 jugadas de ese juego · /borrar_parlay N → lo saca de la lista
+  «Parlay» (v4.2, también «Teaser» o «Boleto») → el bot pregunta el nombre y el formato (botones PDF, Texto, Imagen) y
+             espera ese formato: otro tipo de archivo se rechaza y sigue esperando; /cancelar sale. Se olvida a los 15 min.
+  boleto como foto, PDF o texto directo (v4.1; texto pegado o escrito, solo o con /cargar) → igual, sin nombre (al guardarlo
+             se llama «Parlay N»)
+  Gemini lo lee y el bot repite lo que entendió (puede traer varios boletos: Nombre 1, Nombre 2…); /si guarda, /no descarta
+  /parlays → la lista · /parlay [N o NOMBRE] → estado juego a juego (el último si no se dice)
+  /jugadas EQUIPO → últimas 10 jugadas de ese juego · /borrar_parlay N o NOMBRE → lo saca de la lista
   /ayuda   → esta lista
 
 Las corridas pedidas por Telegram se registran (tipo "telegram") y actualizan la hoja, pero NO son la proyección
@@ -28,7 +31,9 @@ registran solo por su tipo, porque el texto de una excepción puede traer la URL
 Lo arranca el servicio nfl-sim-orden (instalar_orden.sh).
 """
 import configparser
+import json
 import re
+import unicodedata
 import datetime as dt
 import subprocess
 import sys
@@ -36,7 +41,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4.1 (4-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays (foto, /parlays, /parlay, /jugadas) · v4.1: PDF y texto
+VERSION = "orden-v4.2 (4-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -48,6 +53,16 @@ DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 LIMITE_S = 900                        # una corrida nunca debería pasar de ~2 min; tope de seguridad
 LIMITE_PARLAY_S = 180                 # parlay.py: lectura del boleto (≤ 100 s) o consultas a ESPN
 FOTO_MAX_BYTES = 15 * 1024 * 1024
+FLUJO_MAX_S = 15 * 60                 # v4.2: el paso «Parlay» se olvida si pasan 15 min sin terminarlo
+NOMBRE_MAX = 30
+DISPARADORES = ("parlay", "teaser", "boleto", "nuevo parlay", "nuevo boleto")
+FORMATOS = {"pdf": "pdf", "texto": "texto", "imagen": "imagen", "foto": "imagen", "captura": "imagen", "image": "imagen",
+            "text": "texto"}
+TECLADO_FORMATO = json.dumps({"keyboard": [[{"text": "PDF"}, {"text": "Texto"}, {"text": "Imagen"}], [{"text": "Cancelar"}]],
+                              "resize_keyboard": True, "one_time_keyboard": True})
+SIN_TECLADO = json.dumps({"remove_keyboard": True})
+PIDE = {"pdf": "Mándame el PDF como archivo (📎 → Archivo).", "imagen": "Mándame la foto o la captura del boleto.",
+        "texto": "Pega o escribe el boleto en un solo mensaje (por ejemplo: Parlay $10: BUF -7 -110, CHI ML -175)."}
 ORDENES = {
     "/correr": (["correr", "--tipo", "telegram"], "Proyecto los juegos de la semana que no empezaron y actualizo la hoja (≈1 min)."),
     "/hoja": (["hoja"], "Rehago las pestañas desde el registro, sin simular (segundos)."),
@@ -74,9 +89,10 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/estado — qué toca y cuándo\n"
          "/qb — QB de cada juego por fuente y su confiabilidad\n"
          "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
-         "Parlays: mándame el boleto de BetOnline como foto, PDF o texto (pegado, o /cargar y el texto); /si lo guarda, /no lo descarta\n"
-         "/parlays — tus parlays · /parlay N — cómo va, juego a juego (sin N: el último)\n"
-         "/jugadas BUF — últimas 10 jugadas de ese juego · /borrar_parlay N\n"
+         "Parlays: escribe «Parlay» y te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
+         "   O mándame el boleto directo como foto, PDF o texto (pegado, o /cargar y el texto). /si lo guarda, /no lo descarta\n"
+         "/parlays — tus parlays · /parlay Domingo (o el número) — cómo va, juego a juego (sin nada: el último)\n"
+         "/jugadas BUF — últimas 10 jugadas de ese juego · /borrar_parlay Domingo (o el número)\n"
          "/ayuda — esta lista\n"
          "Las corridas pedidas aquí se registran pero no cuentan para 31A ni para el CLV. Los parlays son por diversión: el motor no apuesta.")
 
@@ -114,9 +130,12 @@ class Telegram:
             log(f"Telegram {metodo}: error de red ({type(e).__name__})")
             return {"ok": False}
 
-    def enviar(self, chat, texto):
-        for i in range(0, max(len(texto), 1), 3900):          # Telegram admite ~4096 caracteres por mensaje
-            self.llamar("sendMessage", chat_id=chat, text=texto[i:i + 3900], disable_web_page_preview="true")
+    def enviar(self, chat, texto, teclado=None):
+        """teclado (v4.2): reply_markup en JSON (botones o quitarlos); va solo en el último pedazo."""
+        trozos = [texto[i:i + 3900] for i in range(0, max(len(texto), 1), 3900)]   # Telegram admite ~4096 caracteres por mensaje
+        for k, t in enumerate(trozos):
+            extra = {"reply_markup": teclado} if teclado and k == len(trozos) - 1 else {}
+            self.llamar("sendMessage", chat_id=chat, text=t, disable_web_page_preview="true", **extra)
 
     def bajar_archivo(self, file_id, destino):
         """Baja una foto que mandó Ozz (getFile + descarga). Devuelve True/False; nunca registra la URL (lleva el token)."""
@@ -185,19 +204,22 @@ PARECE_BOLETO = re.compile(r"(?<![\d.])[+-]\d{3,4}(?!\d)|[+-]\d{1,2}(?:\.5|½)|\
                            r"\bparlay\b|\bteaser\b|\bpick\b", re.IGNORECASE)
 
 
-def leer_boleto(tg, chat, ruta, que):
-    """Pasa la entrada guardada a parlay.py (leer) y responde. La copia de entrada se borra: parlay.py guarda la suya."""
-    tg.enviar(chat, f"Leyendo {que} (≈10-40 s)…")
-    codigo, texto = correr_parlay(["leer", str(ruta)])
+def leer_boleto(tg, chat, ruta, que, extra=()):
+    """Pasa la entrada guardada a parlay.py (leer) y responde. La copia de entrada se borra: parlay.py guarda la suya.
+    extra (v4.2): --nombre y --formato del paso «Parlay». Devuelve el código de parlay.py (3 = formato distinto)."""
+    tg.enviar(chat, f"Leyendo {que} (≈10-40 s)…", teclado=SIN_TECLADO if extra else None)
+    codigo, texto = correr_parlay(["leer", str(ruta), *extra])
     try:
         ruta.unlink()
     except OSError:
         pass
     tg.enviar(chat, texto)
-    log(f"orden boleto ({que}): {'listo' if codigo == 0 else 'falló'} ({codigo})")
+    log(f"orden boleto ({que}): {'listo' if codigo == 0 else 'formato distinto' if codigo == 3 else 'falló'} ({codigo})")
+    return codigo
 
 
-def atender_archivo(tg, chat, msg):
+def atender_archivo(tg, chat, msg, extra=()):
+    """True si el mensaje traía un archivo (y se atendió). Con extra (v4.2) devuelve el código de parlay.py."""
     hallado = archivo_del_mensaje(msg)
     if not hallado:
         return False
@@ -208,16 +230,16 @@ def atender_archivo(tg, chat, msg):
     log(f"orden: boleto ({'pdf' if es_pdf else 'imagen'})")
     if tam and tam > FOTO_MAX_BYTES:
         tg.enviar(chat, "El archivo pesa demasiado (más de 15 MB). Mándame una captura o el PDF de una sola página.")
-        return True
+        return 3 if extra else True
     destino = ENTRADA_FOTOS / f"{dt.datetime.now(dt.timezone.utc):%Y%m%d_%H%M%S}_{msg.get('message_id', 0)}.entrada"
     if not tg.bajar_archivo(file_id, destino):
         tg.enviar(chat, "No pude bajar el archivo de Telegram. Mándalo otra vez.")
-        return True
-    leer_boleto(tg, chat, destino, que)
-    return True
+        return 3 if extra else True
+    codigo = leer_boleto(tg, chat, destino, que, extra)
+    return codigo if extra else True
 
 
-def atender_texto_boleto(tg, chat, msg, texto):
+def atender_texto_boleto(tg, chat, msg, texto, extra=()):
     texto = (texto or "").strip()
     if len(texto) < 3:
         tg.enviar(chat, "Escribe o pega el boleto después de /cargar, por ejemplo:\n/cargar Parlay $10: BUF -7 -110, CHI ML -175, Over 44.5 NYG/ARI -110")
@@ -226,17 +248,108 @@ def atender_texto_boleto(tg, chat, msg, texto):
     destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_text(texto[:8000], encoding="utf-8")
     log("orden: boleto (texto)")
-    leer_boleto(tg, chat, destino, "el texto del boleto")
+    return leer_boleto(tg, chat, destino, "el texto del boleto", extra)
+
+
+# ---------------------------------------------------------------- v4.2: paso «Parlay» (nombre → formato → boleto)
+FLUJO = {}          # en memoria: un reinicio del servicio lo olvida (igual que pasar 15 min)
+
+
+def _norm(x):
+    x = unicodedata.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9/ ]", " ", x)).strip()
+
+
+def flujo_vigente():
+    if FLUJO and time.time() - FLUJO.get("t", 0) > FLUJO_MAX_S:
+        log("orden: el paso «Parlay» venció (15 min sin terminarlo)")
+        FLUJO.clear()
+    return FLUJO
+
+
+def empezar_flujo(tg, chat):
+    FLUJO.clear()
+    FLUJO.update(paso="nombre", t=time.time())
+    tg.enviar(chat, f"¿Cómo lo llamo? (por ejemplo: Domingo o Teaser NFC; máximo {NOMBRE_MAX} letras). /cancelar para salir.",
+              teclado=SIN_TECLADO)
+
+
+def tipo_del_mensaje(msg):
+    """'pdf', 'imagen', 'texto', 'otro' (archivo de otro tipo, sticker…) o '' (nada)."""
+    if msg.get("photo"):
+        return "imagen"
+    doc = msg.get("document")
+    if doc:
+        mime, nombre = str(doc.get("mime_type", "")).lower(), str(doc.get("file_name", "")).lower()
+        if mime == "application/pdf" or nombre.endswith(".pdf"):
+            return "pdf"
+        if mime.startswith("image/") or nombre.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            return "imagen"
+        return "otro"
+    if (msg.get("text") or "").strip():
+        return "texto"
+    return "otro" if msg else ""
+
+
+def atender_flujo(tg, chat, msg):
+    """True si el mensaje era parte del paso «Parlay»; False para que main lo atienda como siempre (otras órdenes)."""
+    f = flujo_vigente()
+    if not f:
+        return False
+    crudo = (msg.get("text") or "").strip()
+    n = _norm(crudo)
+    if n in ("cancelar", "/cancelar") or n.split(" ")[0].split("@")[0] == "/cancelar":
+        FLUJO.clear()
+        tg.enviar(chat, "Cancelado. No leí nada.", teclado=SIN_TECLADO)
+        log("orden: paso «Parlay» cancelado")
+        return True
+    if crudo.startswith("/"):
+        return False                   # otra orden: se atiende como siempre y el paso sigue esperando
+    f["t"] = time.time()
+    tipo = tipo_del_mensaje(msg)
+    if f["paso"] == "nombre":
+        nombre = re.sub(r"\s+", " ", crudo).strip()
+        if tipo != "texto" or not nombre:
+            tg.enviar(chat, "Primero dime cómo lo llamo (o /cancelar).")
+        elif len(nombre) > NOMBRE_MAX:
+            tg.enviar(chat, f"Ese nombre es largo: máximo {NOMBRE_MAX} letras. ¿Cómo lo llamo?")
+        elif nombre.isdigit():
+            tg.enviar(chat, "Usa letras, no solo números (los números ya identifican a cada parlay). ¿Cómo lo llamo?")
+        else:
+            f.update(paso="formato", nombre=nombre)
+            tg.enviar(chat, f"«{nombre}». ¿En qué formato lo mandas?", teclado=TECLADO_FORMATO)
+        return True
+    if f["paso"] == "formato":
+        formato = FORMATOS.get(n) if tipo == "texto" else None
+        if not formato:
+            tg.enviar(chat, "Elige con los botones: PDF, Texto o Imagen (o Cancelar).", teclado=TECLADO_FORMATO)
+            return True
+        f.update(paso="archivo", formato=formato)
+        tg.enviar(chat, PIDE[formato] + " /cancelar para salir.", teclado=SIN_TECLADO)
+        return True
+    formato = f["formato"]
+    if tipo != formato or (formato == "texto" and len(crudo) < 3):
+        llego = {"pdf": "un PDF", "imagen": "una imagen", "texto": "un texto", "otro": "otro tipo de archivo"}.get(tipo, "algo que no es un boleto")
+        tg.enviar(chat, f"Elegiste {'PDF' if formato == 'pdf' else formato} y me llegó {llego}. {PIDE[formato]} O /cancelar para salir.")
+        log(f"orden: paso «Parlay» rechazó {tipo or 'nada'} (esperaba {formato})")
+        return True
+    extra = ["--nombre", f["nombre"], "--formato", formato]
+    log(f"orden: paso «Parlay» con {formato}")
+    codigo = atender_texto_boleto(tg, chat, msg, crudo, extra) if formato == "texto" else atender_archivo(tg, chat, msg, extra)
+    if codigo != 3:                    # 3 = parlay.py vio otro tipo por el contenido o falló la descarga: sigue esperando
+        FLUJO.clear()
+    return True
 
 
 def atender_parlay(tg, chat, texto, partes):
     args, con_numero, con_equipo = ORDENES_PARLAY[texto]
     resto = partes[1:2]
-    if con_numero:
-        if resto and resto[0].isdigit():
-            args = args + [resto[0]]
+    if con_numero:                     # v4.2: número o nombre (puede tener espacios: «Domingo 1»)
+        cual = " ".join(partes[1:])[:60].strip()
+        if cual:
+            args = args + [cual]
         elif texto == "/borrar_parlay":
-            tg.enviar(chat, "Dime cuál: /borrar_parlay 3")
+            tg.enviar(chat, "Dime cuál: /borrar_parlay Domingo (o el número)")
             return
     if con_equipo:
         if not resto or not re.fullmatch(r"[A-Za-z]{2,3}", resto[0]):
@@ -274,6 +387,25 @@ def main():
             if str((msg.get("chat") or {}).get("id")) != chat:
                 if msg:
                     log(f"mensaje ignorado de un chat no autorizado ({(msg.get('chat') or {}).get('id')})")
+                continue
+            n = _norm(msg.get("text") or "")
+            if n in DISPARADORES:      # v4.2: «Parlay» empieza (o reinicia) el paso guiado
+                log("orden: paso «Parlay»")
+                empezar_flujo(tg, chat)
+                continue
+            try:
+                if atender_flujo(tg, chat, msg):
+                    continue
+            except Exception as e:  # noqa: BLE001 — un paso raro no tumba el servicio
+                log(f"paso «Parlay»: error ({type(e).__name__})")
+                FLUJO.clear()
+                tg.enviar(chat, "Algo falló en el paso «Parlay». Escribe Parlay para empezar de nuevo.", teclado=SIN_TECLADO)
+                continue
+            if n in ("cancelar", "/cancelar") or n.split(" ")[0].split("@")[0] == "/cancelar":
+                tg.enviar(chat, "No había nada en curso.", teclado=SIN_TECLADO)
+                continue
+            if n in FORMATOS:
+                tg.enviar(chat, "El paso «Parlay» venció (15 min) o no había empezado. Escribe Parlay para empezar.", teclado=SIN_TECLADO)
                 continue
             try:
                 if atender_archivo(tg, chat, msg):
