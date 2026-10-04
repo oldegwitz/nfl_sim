@@ -11,6 +11,8 @@ parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/regi
   jugadas EQUIPO   las últimas 10 jugadas del juego de ese equipo
   borrar N         saca un parlay de la lista (queda en el registro marcado como borrado)
   prueba           comprobación de la instalación (no gasta Gemini)
+  diagnostico [RUTA]  prueba contra Google cada forma de pedir la lectura (última imagen y último PDF guardados y un texto);
+                   los 400 no se cobran; cada lectura buena ~USD 0,005 (máximo ~USD 0,05); no cuenta para el tope
 
 Lo llama orden.py (bot del motor) como proceso aparte, igual que a semana.py. Es descriptivo: no cuenta para 31A ni para
 el CLV de 29A, no toca s2-v1 (no importa sprint2.py) y no escribe en la hoja.
@@ -31,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.1 (4-oct-2026)"   # v1.1: el boleto entra como foto, PDF o texto; varios boletos por entrada
+VERSION = "parlay-v1.2 (4-oct-2026)"   # v1.1: foto, PDF o texto; varios boletos · v1.2: respaldo ante el 400 de Google, diagnóstico
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -953,10 +955,29 @@ _BOLETO = {
     "required": ["tipo", "patas"]}
 ESQUEMA_BOLETO = {"type": "object", "properties": {"boletos": {"type": "array", "minItems": 1, "maxItems": MAX_BOLETOS, "items": _BOLETO}},
                   "required": ["boletos"]}
-CAMPOS_LOG = ["hora_utc", "fecha_ccs", "version", "modelo", "entrada", "estado", "http", "latencia_s", "tok_entrada", "tok_salida",
-              "tok_razonamiento", "costo_usd", "foto", "boletos", "patas", "detalle"]
+CAMPOS_LOG = ["hora_utc", "fecha_ccs", "version", "modelo", "entrada", "variante", "intentos", "estado", "http", "latencia_s",
+              "tok_entrada", "tok_salida", "tok_razonamiento", "costo_usd", "foto", "boletos", "patas", "detalle"]
 MAX_TEXTO = 8000
 MAX_ARCHIVO = 15 * 1024 * 1024
+# v1.2: Google respondió 400 «Request contains an invalid argument» a imagen y PDF con el esquema anidado (4-oct, 10 de 10).
+# La misma vía con texto y esquema anidado sí funciona en el agente de QB (35A, piloto 3: 15 de 15 con HTTP 200), así que la
+# sospecha es la combinación de archivo + formato de salida (vista previa) o el razonamiento con archivo; lo aclara `diagnostico`.
+# Cadena de respaldo, en este orden; un 400 pasa a la siguiente (Google no cobra las peticiones rechazadas):
+#   esquema              salida con esquema (boletos → patas), como v1.1
+#   esquema-simple       salida con esquema de un solo boleto, sin enum ni límites (menos anidado)
+#   sin-esquema          sin responseFormat: el JSON se pide en el texto y se extrae de la respuesta (como g1-texto de 35A)
+#   sin-esquema/minima   lo mismo, sin thinkingConfig (la petición más simple posible)
+CADENA_GEMINI = (("esquema", True), ("esquema-simple", True), ("sin-esquema", True), ("sin-esquema", False))
+
+
+def nombre_variante(formato, pensar):
+    return formato if pensar else f"{formato}/minima"
+_PATA_SIMPLE = {"type": "object", "properties": {k: {"type": "string"} for k in ("texto", "equipo", "partido", "tipo", "linea", "lado", "cuota")}}
+ESQUEMA_SIMPLE = {"type": "object", "properties": {"tipo": {"type": "string"}, "monto": {"type": "string"}, "pago": {"type": "string"},
+                                                   "numero": {"type": "string"}, "patas": {"type": "array", "items": _PATA_SIMPLE}}}
+PROMPT_JSON = ('\nAnswer ONLY with a JSON object and nothing else, of this form: {"boletos": [{"tipo": "PARLAY", "monto": "10", '
+               '"pago": "315.12", "numero": "", "patas": [{"texto": "...", "equipo": "...", "partido": "...", "tipo": "SPREAD", '
+               '"linea": "-7", "lado": "", "cuota": "-110"}]}]}')
 
 
 def tipo_entrada(datos):
@@ -976,46 +997,68 @@ def tipo_entrada(datos):
     return "text/plain" if 3 <= len(t) <= MAX_TEXTO else None
 
 
-def gemini_cuerpo(contenido, mime):
+def gemini_cuerpo(contenido, mime, variante="esquema", campo="inlineData", pensar=True):
+    """Cuerpo de generateContent. campo: 'inlineData' (camelCase, como semana.py) o 'inline_data' (solo para el diagnóstico)."""
     import base64
     if mime == "text/plain":
         parte = {"text": "TICKET TEXT:\n" + contenido.decode("utf-8").strip()}
+    elif campo == "inline_data":
+        parte = {"inline_data": {"mime_type": mime, "data": base64.b64encode(contenido).decode("ascii")}}
     else:
         parte = {"inlineData": {"mimeType": mime, "data": base64.b64encode(contenido).decode("ascii")}}
-    return {"contents": [{"role": "user", "parts": [{"text": PROMPT_BOLETO}, parte]}],
-            "generationConfig": {"thinkingConfig": {"thinkingLevel": GEMINI_NIVEL}, "maxOutputTokens": 8192,
-                                 "responseFormat": {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_BOLETO}}}}
+    gc = {"maxOutputTokens": 8192}
+    if pensar:
+        gc["thinkingConfig"] = {"thinkingLevel": GEMINI_NIVEL}
+    texto = PROMPT_BOLETO
+    if variante == "esquema":
+        gc["responseFormat"] = {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_BOLETO}}
+    elif variante == "esquema-simple":
+        gc["responseFormat"] = {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_SIMPLE}}
+    else:
+        texto += PROMPT_JSON
+    return {"contents": [{"role": "user", "parts": [{"text": texto}, parte]}], "generationConfig": gc}
 
 
-def gemini_leer_boleto(contenido, mime, post=None):
-    """Una consulta. Devuelve (lectura {"boletos": [...]} o None, registro). Nunca imprime ni registra la llave."""
+def motivo_google(r):
+    """El mensaje de error de Google y, si los trae, los campos señalados (BadRequest.fieldViolations) y el motivo
+    (ErrorInfo.reason). Nunca incluye la llave (Google no la devuelve; igual se borra cualquier 'key=' por si acaso)."""
+    try:
+        err = (r.json() or {}).get("error") or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    partes = [str(err.get("message") or "")]
+    for d in err.get("details") or []:
+        if not isinstance(d, dict):
+            continue
+        for v in d.get("fieldViolations") or []:
+            if isinstance(v, dict):
+                partes.append(f"[{v.get('field', '')}: {v.get('description', '')}]")
+        if d.get("reason"):
+            partes.append(f"[{d['reason']}]")
+    return re.sub(r"key=[\w-]+", "key=…", " ".join(p for p in partes if p))
+
+
+def gemini_una(llave, contenido, mime, variante, post=None, campo="inlineData", pensar=True):
+    """Una llamada. Devuelve (lectura o None, dict con http, detalle, latencia, tokens, costo). Nunca registra la llave."""
     import requests
-    reg = dict(modelo=S.GEMINI_MODELO, version=VERSION, entrada={"application/pdf": "pdf", "text/plain": "texto"}.get(mime, "imagen"))
-    if not S.GEMINI_LLAVE.exists():
-        return None, dict(reg, estado="sin llave")
-    llave = S.GEMINI_LLAVE.read_text(encoding="utf-8").strip()
     t0 = time.time()
     try:
         r = (post or requests.post)(f"{S.GEMINI_URL}/models/{S.GEMINI_MODELO}:generateContent",
                                     headers={"x-goog-api-key": llave, "Content-Type": "application/json"},
-                                    json=gemini_cuerpo(contenido, mime), timeout=(10, 90))
+                                    json=gemini_cuerpo(contenido, mime, variante, campo, pensar), timeout=(10, 90))
     except Exception as e:  # noqa: BLE001 — solo el tipo
-        return None, dict(reg, estado="error de red", detalle=type(e).__name__, latencia_s=round(time.time() - t0, 2))
-    reg["latencia_s"], reg["http"] = round(time.time() - t0, 2), r.status_code
+        return None, dict(estado="error de red", detalle=type(e).__name__, latencia_s=round(time.time() - t0, 2))
+    out = dict(http=r.status_code, latencia_s=round(time.time() - t0, 2))
     if r.status_code != 200:
-        try:
-            msg = str(((r.json() or {}).get("error") or {}).get("message") or "")
-        except Exception:  # noqa: BLE001
-            msg = ""
-        return None, dict(reg, estado="error HTTP", detalle=msg[:300])
+        return None, dict(out, estado="error HTTP", detalle=motivo_google(r)[:300])
     try:
         datos = r.json()
     except ValueError:
-        return None, dict(reg, estado="respuesta inválida", detalle="no es JSON")
+        return None, dict(out, estado="respuesta inválida", detalle="no es JSON")
     u = datos.get("usageMetadata") or {}
-    reg.update(tok_entrada=int(u.get("promptTokenCount") or 0), tok_salida=int(u.get("candidatesTokenCount") or 0),
+    out.update(tok_entrada=int(u.get("promptTokenCount") or 0), tok_salida=int(u.get("candidatesTokenCount") or 0),
                tok_razonamiento=int(u.get("thoughtsTokenCount") or 0))
-    reg["costo_usd"] = round(reg["tok_entrada"] * S.PRECIO_ENTRADA + (reg["tok_salida"] + reg["tok_razonamiento"]) * S.PRECIO_SALIDA, 6)
+    out["costo_usd"] = round(out["tok_entrada"] * S.PRECIO_ENTRADA + (out["tok_salida"] + out["tok_razonamiento"]) * S.PRECIO_SALIDA, 6)
     cand = (datos.get("candidates") or [{}])[0] or {}
     texto = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []) if isinstance(p, dict) and not p.get("thought"))
     obj = S._objeto_json(texto)
@@ -1023,8 +1066,32 @@ def gemini_leer_boleto(contenido, mime, post=None):
         obj = {"boletos": [obj]}
     boletos = [b for b in ((obj or {}).get("boletos") or []) if isinstance(b, dict) and isinstance(b.get("patas"), list) and b["patas"]]
     if not boletos:
-        return None, dict(reg, estado="respuesta inválida", detalle=(texto or "sin texto")[:200])
-    return {"boletos": boletos}, dict(reg, estado="ok", boletos=len(boletos), patas=sum(len(b["patas"]) for b in boletos))
+        return None, dict(out, estado="respuesta inválida", detalle=(texto or "sin texto")[:200])
+    return {"boletos": boletos}, dict(out, estado="ok", boletos=len(boletos), patas=sum(len(b["patas"]) for b in boletos))
+
+
+def gemini_leer_boleto(contenido, mime, post=None):
+    """Prueba la cadena CADENA_GEMINI en orden; un 400 (no se cobra) pasa a la siguiente; una respuesta cobrada que no
+    trae un boleto legible pasa a la siguiente solo una vez (máximo 2 cobradas por boleto). Otros errores (403, 429, 5xx,
+    red) cortan. Devuelve (lectura {"boletos": [...]} o None, registro con el costo sumado y el último motivo)."""
+    reg = dict(modelo=S.GEMINI_MODELO, version=VERSION, entrada={"application/pdf": "pdf", "text/plain": "texto"}.get(mime, "imagen"))
+    if not S.GEMINI_LLAVE.exists():
+        return None, dict(reg, estado="sin llave")
+    llave = S.GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+    detalles, costo, ultimo, var, i, malas = [], 0.0, {}, "", 0, 0
+    for i, (formato, pensar) in enumerate(CADENA_GEMINI, 1):
+        var = nombre_variante(formato, pensar)
+        lectura, r = gemini_una(llave, contenido, mime, formato, post=post, pensar=pensar)
+        costo += r.get("costo_usd") or 0.0
+        ultimo = r
+        if lectura:
+            return lectura, {**reg, **r, "variante": var, "intentos": i, "costo_usd": round(costo, 6), "detalle": " | ".join(detalles)[:600]}
+        detalles.append(f"{var}: {r.get('http', '')} {r.get('detalle', '')}".strip())
+        malas += r.get("estado") == "respuesta inválida"
+        if not (r.get("http") == 400 or r.get("estado") == "respuesta inválida") or malas >= 2:
+            break
+    return None, {**reg, **ultimo, "variante": var, "intentos": i, "costo_usd": round(costo, 6),
+                  "detalle": " | ".join(detalles)[:600], "motivo": (ultimo.get("detalle") or "")[:200]}
 
 
 def tope_fotos():
@@ -1039,19 +1106,31 @@ def tope_fotos():
 
 
 def fotos_hoy(hoy):
-    """Lecturas de hoy (Caracas) en el registro de v1.1 y en el de v1: el tope es uno solo."""
+    """Lecturas cobradas de hoy (Caracas): las que salieron bien o que Google cobró aunque no se pudieran leer (un 400
+    no se cobra y no cuenta). Suma todos los registros (v1, v1.1 y el actual); el diagnóstico no cuenta."""
+    def cobrada(r):
+        try:
+            return r.get("estado") == "ok" or float(r.get("costo_usd") or 0) > 0
+        except ValueError:
+            return False
     n = 0
-    for ruta in (LOG_GEMINI, LOG_GEMINI_V1):
+    for ruta in sorted(SAL.glob("gemini_*.csv")):
         try:
             with open(ruta, encoding="utf-8") as f:
-                n += sum(1 for r in csv.DictReader(f) if r.get("fecha_ccs") == hoy and r.get("estado") != "sin llave")
-        except FileNotFoundError:
+                n += sum(1 for r in csv.DictReader(f) if r.get("fecha_ccs") == hoy and cobrada(r) and r.get("entrada") != "diagnostico")
+        except (FileNotFoundError, csv.Error):
             pass
     return n
 
 
 def registrar_llamada(reg):
+    """Agrega una fila; si el registro existente tiene otras columnas (versión anterior), lo guarda aparte y empieza uno."""
     SAL.mkdir(parents=True, exist_ok=True)
+    if LOG_GEMINI.exists():
+        with open(LOG_GEMINI, encoding="utf-8") as f:
+            cab = f.readline().strip().split(",")
+        if cab != CAMPOS_LOG:
+            LOG_GEMINI.rename(SAL / f"gemini_lecturas_hasta_{ahora_utc():%Y%m%d_%H%M%S}.csv")
     nuevo = not LOG_GEMINI.exists()
     with open(LOG_GEMINI, "a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CAMPOS_LOG, extrasaction="ignore")
@@ -1087,7 +1166,17 @@ def procesar_entrada(ruta, P=None, post=None):
     if not lectura:
         que = {"application/pdf": "el PDF", "text/plain": "el texto"}.get(mime, "la foto")
         extra = " Si el PDF no se deja leer, mándame una captura de pantalla." if mime == "application/pdf" else ""
-        return f"No pude leer {que} del boleto ({reg.get('estado')}).{extra} Prueba otra vez con todas las patas a la vista."
+        motivo = reg.get("motivo") or ""
+        if reg.get("http") and reg.get("http") != 200:
+            por_que = f"Google respondió {reg['http']}: {motivo}"
+        elif reg.get("estado") == "respuesta inválida":
+            por_que = f"Google respondió, pero sin un boleto legible: «{motivo[:120]}»"
+        else:
+            por_que = f"{reg.get('estado')}{': ' + motivo if motivo else ''}"
+        n = reg.get("intentos", 1)
+        cobro = (f"Google cobró ≈USD {reg['costo_usd']:.4f}: cuenta para el tope del día.".replace(".", ",", 1)
+                 if (reg.get("costo_usd") or 0) > 0 else "Google no lo cobró: no cuenta para el tope del día.")
+        return f"No pude leer {que} del boleto ({por_que}; probé {n} forma{'s' if n != 1 else ''}).{extra} {cobro}"
     try:
         return (P or Parlays()).preparar(lectura, archivo=nombre)
     except Exception as e:  # noqa: BLE001 — la lectura ya se pagó: se guarda y se cruza con /si
@@ -1098,6 +1187,69 @@ def procesar_entrada(ruta, P=None, post=None):
 
 
 procesar_foto = procesar_entrada        # nombre de v1
+
+
+def diagnostico(ruta=None, post=None):
+    """Prueba contra Google cada forma de pedir la lectura, por separado y sin respaldo: con la última imagen guardada
+    (salidas/parlays/boletos), el último PDF guardado y un texto corto (o solo con RUTA si se da). Un 400 no se cobra;
+    cada lectura buena cuesta ~USD 0,005 (máximo ~USD 0,05 en total). No cuenta para el tope del día. Las pruebas 1-4 de
+    la imagen son, en orden, la cadena que usa el bot: la primera que diga OK es la que leerá los boletos."""
+    if not S.GEMINI_LLAVE.exists():
+        return "No encuentro la llave de Gemini (credenciales/gemini.key)."
+    llave = S.GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+
+    def ultimo(sufijos):
+        g = sorted((x for x in FOTOS.glob("*") if x.suffix.lower() in sufijos), key=lambda x: x.stat().st_mtime)
+        return g[-1] if g else None
+
+    completas = [(nombre_variante(f, p), f, "inlineData", p) for f, p in CADENA_GEMINI] + [
+        ("esquema, sin razonamiento", "esquema", "inlineData", False),
+        ("esquema, campo inline_data", "esquema", "inline_data", True)]
+    pruebas = []          # (grupo, nombre, ruta, datos, mime, formato, campo, pensar)
+    if ruta is not None:
+        rutas = [(Path(ruta), completas)]
+    else:
+        img, pdf = ultimo((".jpg", ".png", ".webp")), ultimo((".pdf",))
+        rutas = ([(img, completas)] if img else []) + ([(pdf, [completas[0], completas[2]])] if pdf else [])
+    for r_, lista in rutas:
+        datos = r_.read_bytes()
+        mime = tipo_entrada(datos)
+        if mime is None:
+            return f"No reconozco {r_.name} como imagen, PDF ni texto."
+        pruebas += [(r_.name, nom, r_, datos, mime, f, c, p) for nom, f, c, p in lista]
+    txt = b"Parlay $10: BUF -7 -110, CHI ML -175"
+    pruebas += [("texto corto", nom, None, txt, "text/plain", f, "inlineData", True)
+                for nom, f in (("esquema", "esquema"), ("sin-esquema", "sin-esquema"))]
+    out = [f"Diagnóstico de lectura · {S.GEMINI_MODELO} · {VERSION}"]
+    if not rutas:
+        out.append("(no hay boletos guardados en salidas/parlays/boletos: solo pruebo el texto)")
+    costo, ahora, grupo, ok = 0.0, ahora_utc(), None, {}
+    for i, (g, nom, r_, datos, mime, f, campo, pensar) in enumerate(pruebas, 1):
+        if g != grupo:
+            grupo = g
+            out.append(f"— {g} ({mime}, {len(datos) // 1024} KB)" if r_ else f"— {g}")
+        lectura, r = gemini_una(llave, datos, mime, f, post=post, campo=campo, pensar=pensar)
+        costo += r.get("costo_usd") or 0.0
+        ok[(g, nom)] = bool(lectura)
+        if lectura:
+            res = f"OK · {r.get('boletos')} boleto(s), {r.get('patas')} patas · {r.get('latencia_s')} s"
+        else:
+            res = f"FALLA · {r.get('http', '')} {r.get('estado')}: {(r.get('detalle') or '')[:160]} · {r.get('latencia_s', '')} s"
+        out.append(f"{i}. {nom} → {res}")
+        registrar_llamada(dict(r, hora_utc=S.iso(ahora), fecha_ccs=ahora.astimezone(CCS).date().isoformat(), version=VERSION,
+                               modelo=S.GEMINI_MODELO, entrada="diagnostico", intentos=1, foto=r_.name if r_ else "",
+                               variante=f"{nombre_variante(f, pensar)}/{campo}"))
+    out.append("Conclusión:")
+    for r_, _ in rutas:
+        cadena = [nombre_variante(f, p) for f, p in CADENA_GEMINI if ok.get((r_.name, nombre_variante(f, p)))]
+        que, lo = ("el PDF", "lo") if r_.suffix.lower() == ".pdf" else ("las imágenes", "las")
+        out.append(f"· {que}: " + (f"el bot {lo} leerá con «{cadena[0]}»" if cadena else
+                                   "ninguna forma de la cadena funcionó: no mandes boletos así hasta la próxima versión"))
+    txt_ok = [n for (g, n), v in ok.items() if g == "texto corto" and v]
+    out.append("· texto: " + ("funciona (" + ", ".join(txt_ok) + ")" if txt_ok else
+                              "tampoco funciona: el problema no es el archivo (llave, modelo o cuenta)"))
+    out.append(f"Costo del diagnóstico ≈ USD {costo:.4f} (los 400 no se cobran). No cuenta para el tope del día.".replace(".", ",", 1))
+    return "\n".join(out)
 
 
 def prueba_instalacion():
@@ -1150,6 +1302,8 @@ def main(argv):
             print(Parlays().borrar(int(resto[0])))
         elif cmd == "prueba":
             print(prueba_instalacion())
+        elif cmd == "diagnostico":
+            print(diagnostico(resto[0] if resto else None))
         else:
             print("Orden no reconocida. " + __doc__)
             return 2
