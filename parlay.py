@@ -3,8 +3,9 @@
 """
 parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/registro_42_parlays.md).
 
-  foto RUTA        lee la foto del boleto de BetOnline con Gemini, la cruza con el calendario y la deja pendiente
-  si | no          guarda o descarta el boleto pendiente
+  leer RUTA        lee el boleto de BetOnline con Gemini (foto, PDF o texto; puede traer varios boletos), lo cruza con
+                   el calendario y lo deja pendiente («foto RUTA» sigue funcionando: es lo que llamaba orden-v4)
+  si | no          guarda o descarta lo pendiente
   lista            los parlays guardados
   estado [N]       estado de un parlay (el último si no se dice): juego a juego, P(cobrar) ahora, EV contra el cierre
   jugadas EQUIPO   las últimas 10 jugadas del juego de ese equipo
@@ -30,7 +31,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1 (4-oct-2026)"
+VERSION = "parlay-v1.1 (4-oct-2026)"   # v1.1: el boleto entra como foto, PDF o texto; varios boletos por entrada
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -39,8 +40,10 @@ BOT_DIR = Path(os.environ.get("NFL_EV_DIR", str(Path.home() / "nfl_ev")))
 SAL = BASE / "salidas" / "parlays"
 REGISTRO = SAL / "parlays_2026.json"
 PENDIENTE = SAL / "pendiente.json"
-LOG_GEMINI = SAL / "gemini_fotos.csv"
-FOTOS = SAL / "fotos"
+LOG_GEMINI = SAL / "gemini_lecturas.csv"          # v1.1 (columnas nuevas); el de v1 sigue contando para el tope del día
+LOG_GEMINI_V1 = SAL / "gemini_fotos.csv"
+FOTOS = SAL / "boletos"                            # copia de cada entrada (imagen, PDF o texto)
+MAX_BOLETOS = 6
 CCS = ZoneInfo("America/Caracas")
 ESPN_TABLERO = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 ESPN_RESUMEN = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={}"
@@ -187,10 +190,17 @@ class ESPN:
         self._c = {}
 
     def traer(self, url):
+        """Dos intentos (ESPN a veces tarda); el segundo error se propaga."""
         import requests
-        r = requests.get(url, timeout=12, headers={"User-Agent": "nfl-secret-lab/1 (uso personal)"})
-        r.raise_for_status()
-        return r.json()
+        for intento in (1, 2):
+            try:
+                r = requests.get(url, timeout=(6, 20), headers={"User-Agent": "nfl-secret-lab/1 (uso personal)"})
+                r.raise_for_status()
+                return r.json()
+            except Exception:  # noqa: BLE001
+                if intento == 2:
+                    raise
+                time.sleep(2)
 
     def _get(self, url):
         if url not in self._c:
@@ -694,14 +704,12 @@ class Parlays:
             patas.append(pata)
         return patas, avisos
 
-    def preparar(self, lectura, foto=None):
-        tab = self.espn.tablero()
-        lista = juegos_del_tablero(tab)
+    def preparar_uno(self, lectura, lista, tab, archivo=None):
         patas, avisos = self.cruzar(lectura, lista)
         tipo = (lectura.get("tipo") or "").upper()
         tipo = "TEASER" if "TEASER" in tipo else "PARLAY" if ("PARLAY" in tipo or len(patas) > 1) else "SENCILLA"
         b = dict(tipo=tipo, monto=_num(lectura.get("monto")), pago=_num(lectura.get("pago")), numero=str(lectura.get("numero") or "").strip(),
-                 patas=patas, foto=foto, lectura=lectura, semana=(tab.get("week") or {}).get("number"),
+                 patas=patas, foto=archivo, lectura=lectura, semana=(tab.get("week") or {}).get("number"),
                  temporada=(tab.get("season") or {}).get("year"))
         juegos = {j["id"]: j for j in lista}
         fil = self.filas(b, juegos, modo="previa")
@@ -724,11 +732,27 @@ class Parlays:
         empezados = [f["p"]["k"] for f in fil if f["j"] and f["j"]["estado"] != "pre"]
         if empezados:
             avisos.append("patas con el juego ya empezado o terminado: " + ", ".join(map(str, empezados)))
-        _guardar_json(PENDIENTE, dict(boleto=b, avisos=avisos, creado=S.iso(self.ahora)))
-        return self.texto_pendiente(b, avisos, fil)
+        return b, avisos, fil
 
-    def texto_pendiente(self, b, avisos, fil):
-        cab = f"Leí este boleto: {b['tipo'].lower()} de {len(b['patas'])} patas, {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
+    def preparar(self, lectura, archivo=None):
+        """lectura: {"boletos": [...]} (v1.1) o un solo boleto (v1). Deja todos pendientes hasta /si."""
+        tab = self.espn.tablero()
+        lista = juegos_del_tablero(tab)
+        lecturas = lectura.get("boletos") if isinstance(lectura.get("boletos"), list) else [lectura]
+        lecturas = [x for x in lecturas if isinstance(x, dict) and x.get("patas")][:MAX_BOLETOS]
+        hechos = [self.preparar_uno(x, lista, tab, archivo) for x in lecturas]
+        if not hechos:
+            return "No encontré ningún boleto con patas. Mándamelo otra vez con todas las patas a la vista."
+        _guardar_json(PENDIENTE, dict(boletos=[h[0] for h in hechos], avisos=[h[1] for h in hechos], creado=S.iso(self.ahora)))
+        partes = [self.texto_pendiente(b, av, fil, rotulo=(f"Boleto {chr(65 + i)}" if len(hechos) > 1 else None))
+                  for i, (b, av, fil) in enumerate(hechos)]
+        pie = (f"¿Los guardo? /si guarda los {len(hechos)} · /no descarta todo" if len(hechos) > 1 else
+               "¿Lo guardo? /si para guardar · /no para descartar")
+        return "\n\n".join(partes) + "\n\n" + pie + " (si leí mal, mándalo otra vez más claro)"
+
+    def texto_pendiente(self, b, avisos, fil, rotulo=None):
+        cab = (f"{rotulo}: " if rotulo else "Leí este boleto: ") + \
+            f"{b['tipo'].lower()} de {len(b['patas'])} patas, {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
         out = [cab + (f" (n.º {b['numero']})" if b.get("numero") else "") + ":"]
         for f in fil:
             p = f["p"]
@@ -737,28 +761,33 @@ class Parlays:
                 lin += f" · P ≈ {pct(f['pg'] + f['pp'])}"
             out.append(lin)
         pr = b["previo"]
-        out += ["", f"P(cobrar) ≈ {pct(pr['p_cobrar'], 2)} {('(' + uno_de_cada(pr['p_cobrar']) + ')') if uno_de_cada(pr['p_cobrar']) else ''}".rstrip()]
+        out.append(f"P(cobrar) ≈ {pct(pr['p_cobrar'], 2)} {('(' + uno_de_cada(pr['p_cobrar']) + ')') if uno_de_cada(pr['p_cobrar']) else ''}".rstrip())
         if pr.get("ev") is not None:
             out.append(f"EV con la línea de ahora {pct(pr['ev'], 1)} · {costo_txt(pr['costo'])}")
         out.append("El EV contra el cierre aparece en /parlay cuando empiecen los juegos.")
         if pr.get("fuentes"):
             out.append("Líneas: " + ", ".join(pr["fuentes"]))
-        if avisos:
-            out += [""] + ["⚠️ " + a for a in avisos]
-        out += ["", "¿Lo guardo? /si para guardar · /no para descartar (si leí mal, manda una foto más clara)"]
+        out += ["⚠️ " + a for a in avisos]
         return "\n".join(out)
 
     def confirmar(self):
         pen = _leer_json(PENDIENTE, None)
         if not pen:
-            return "No hay ningún boleto esperando confirmación. Mándame la foto."
+            return "No hay ningún boleto esperando confirmación. Mándame el boleto (foto, PDF o texto)."
+        if pen.get("crudo"):          # leído por Gemini pero sin cruzar (ESPN no respondió): se cruza ahora y se vuelve a preguntar
+            return self.preparar(pen["crudo"], archivo=pen.get("archivo"))
+        boletos = pen.get("boletos") or ([pen["boleto"]] if pen.get("boleto") else [])
         lista = self.todos()
-        b = pen["boleto"]
-        b.update(id=1 + max([x["id"] for x in lista], default=0), cargado=S.iso(self.ahora), estado="vivo", version=VERSION)
-        lista.append(b)
+        ids = []
+        for b in boletos:
+            b.update(id=1 + max([x["id"] for x in lista], default=0), cargado=S.iso(self.ahora), estado="vivo", version=VERSION)
+            lista.append(b)
+            ids.append(b["id"])
         self._guardar(lista)
         PENDIENTE.unlink()
-        return f"Guardado como parlay {b['id']}. Pide /parlay {b['id']} cuando quieras ver cómo va."
+        if len(ids) == 1:
+            return f"Guardado como parlay {ids[0]}. Pide /parlay {ids[0]} cuando quieras ver cómo va."
+        return f"Guardados como parlays {', '.join(map(str, ids))}. Pide /parlay N para ver cada uno."
 
     def descartar(self):
         if PENDIENTE.exists():
@@ -810,7 +839,7 @@ class Parlays:
             S.log(f"parlay: no pude cerrar resultados ({type(e).__name__})")
         lista = [b for b in self.todos() if b.get("estado") != "borrado"]
         if not lista:
-            return "No hay parlays guardados. Mándame la foto del boleto de BetOnline."
+            return "No hay parlays guardados. Mándame el boleto de BetOnline (foto, PDF o texto)."
         b = lista[-1] if n is None else next((x for x in lista if x["id"] == n), None)
         if b is None:
             return f"No encuentro el parlay {n}. /parlays muestra la lista."
@@ -859,7 +888,7 @@ class Parlays:
             S.log(f"parlay: no pude cerrar resultados ({type(e).__name__})")
         lista = [b for b in self.todos() if b.get("estado") != "borrado"]
         if not lista:
-            return "No hay parlays guardados. Mándame la foto del boleto de BetOnline."
+            return "No hay parlays guardados. Mándame el boleto de BetOnline (foto, PDF o texto)."
         out = ["Tus parlays (el último primero):"]
         for b in reversed(lista[-12:]):
             pr = b.get("previo", {})
@@ -900,15 +929,17 @@ class Parlays:
 # ---------------------------------------------------------------- Gemini: lectura de la foto (mismo cliente que semana.py)
 GEMINI_NIVEL = "medium"
 PROMPT_BOLETO = (
-    "The image is a BetOnline sportsbook ticket (NFL). Transcribe only what is written; never guess. "
-    "tipo: PARLAY, TEASER or SENCILLA (straight bet). monto: amount risked in dollars. "
-    "pago: total payout if it wins (if the ticket shows both 'To Win' and 'Payout', use Payout, which includes the stake; "
-    "if it shows only 'To Win', return To Win + risk). numero: ticket number if visible. "
-    "patas: one item per selection, in ticket order: texto (the line exactly as shown), equipo (team picked; empty for totals), "
-    "partido (both teams if shown), tipo (ML, SPREAD or TOTAL), linea (signed number; 0 for ML; for totals the number), "
-    "lado (OVER or UNDER, totals only) and cuota (American odds such as -110 or +145; empty if not shown). "
-    "Leave any field empty if it cannot be read.")
-ESQUEMA_BOLETO = {
+    "The input is one or more BetOnline sportsbook tickets (NFL). It can be a photo or screenshot, a PDF (possibly several pages "
+    "and several tickets) or text pasted or typed by the bettor (it may be shorthand such as 'BUF -7 -110, CHI ML -175, $10'). "
+    "Transcribe only what is there; never guess. Return one item in 'boletos' per ticket (a typed message is one ticket unless it "
+    "clearly separates several). For each ticket: tipo PARLAY, TEASER or SENCILLA (straight bet); monto: amount risked in dollars; "
+    "pago: total payout if it wins (if the ticket shows both 'To Win' and 'Payout', use Payout, which includes the stake; if it shows "
+    "only 'To Win', return To Win + risk; empty if not shown); numero: ticket number if visible. patas: one item per selection, in "
+    "ticket order: texto (the line exactly as shown), equipo (team picked; empty for totals), partido (both teams if shown), tipo (ML, "
+    "SPREAD or TOTAL), linea (signed number; 0 for ML; for totals the number), lado (OVER or UNDER, totals only) and cuota (American "
+    "odds such as -110 or +145; empty if not shown). Ignore account balances, names and account numbers. Leave any field empty if it "
+    "cannot be read.")
+_BOLETO = {
     "type": "object",
     "properties": {
         "tipo": {"type": "string", "enum": ["PARLAY", "TEASER", "SENCILLA"]},
@@ -920,22 +951,46 @@ ESQUEMA_BOLETO = {
                            "lado": {"type": "string"}, "cuota": {"type": "string"}},
             "required": ["texto", "tipo"]}}},
     "required": ["tipo", "patas"]}
-CAMPOS_LOG = ["hora_utc", "fecha_ccs", "version", "modelo", "estado", "http", "latencia_s", "tok_entrada", "tok_salida",
-              "tok_razonamiento", "costo_usd", "foto", "patas", "detalle"]
+ESQUEMA_BOLETO = {"type": "object", "properties": {"boletos": {"type": "array", "minItems": 1, "maxItems": MAX_BOLETOS, "items": _BOLETO}},
+                  "required": ["boletos"]}
+CAMPOS_LOG = ["hora_utc", "fecha_ccs", "version", "modelo", "entrada", "estado", "http", "latencia_s", "tok_entrada", "tok_salida",
+              "tok_razonamiento", "costo_usd", "foto", "boletos", "patas", "detalle"]
+MAX_TEXTO = 8000
+MAX_ARCHIVO = 15 * 1024 * 1024
 
 
-def gemini_cuerpo(imagen, mime):
+def tipo_entrada(datos):
+    """'image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'text/plain' o None, por el contenido (no por el nombre)."""
+    if datos[:5] == b"%PDF-":
+        return "application/pdf"
+    if datos[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if datos[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if datos[:4] == b"RIFF" and datos[8:12] == b"WEBP":
+        return "image/webp"
+    try:
+        t = datos.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return "text/plain" if 3 <= len(t) <= MAX_TEXTO else None
+
+
+def gemini_cuerpo(contenido, mime):
     import base64
-    return {"contents": [{"role": "user", "parts": [{"text": PROMPT_BOLETO},
-                                                    {"inlineData": {"mimeType": mime, "data": base64.b64encode(imagen).decode("ascii")}}]}],
+    if mime == "text/plain":
+        parte = {"text": "TICKET TEXT:\n" + contenido.decode("utf-8").strip()}
+    else:
+        parte = {"inlineData": {"mimeType": mime, "data": base64.b64encode(contenido).decode("ascii")}}
+    return {"contents": [{"role": "user", "parts": [{"text": PROMPT_BOLETO}, parte]}],
             "generationConfig": {"thinkingConfig": {"thinkingLevel": GEMINI_NIVEL}, "maxOutputTokens": 8192,
                                  "responseFormat": {"text": {"mimeType": S.GEMINI_MIME, "schema": ESQUEMA_BOLETO}}}}
 
 
-def gemini_leer_boleto(imagen, mime, post=None):
-    """Una consulta. Devuelve (lectura o None, registro). Nunca imprime ni registra la llave. post: reemplazo en pruebas."""
+def gemini_leer_boleto(contenido, mime, post=None):
+    """Una consulta. Devuelve (lectura {"boletos": [...]} o None, registro). Nunca imprime ni registra la llave."""
     import requests
-    reg = dict(modelo=S.GEMINI_MODELO, version=VERSION)
+    reg = dict(modelo=S.GEMINI_MODELO, version=VERSION, entrada={"application/pdf": "pdf", "text/plain": "texto"}.get(mime, "imagen"))
     if not S.GEMINI_LLAVE.exists():
         return None, dict(reg, estado="sin llave")
     llave = S.GEMINI_LLAVE.read_text(encoding="utf-8").strip()
@@ -943,7 +998,7 @@ def gemini_leer_boleto(imagen, mime, post=None):
     try:
         r = (post or requests.post)(f"{S.GEMINI_URL}/models/{S.GEMINI_MODELO}:generateContent",
                                     headers={"x-goog-api-key": llave, "Content-Type": "application/json"},
-                                    json=gemini_cuerpo(imagen, mime), timeout=(10, 60))
+                                    json=gemini_cuerpo(contenido, mime), timeout=(10, 90))
     except Exception as e:  # noqa: BLE001 — solo el tipo
         return None, dict(reg, estado="error de red", detalle=type(e).__name__, latencia_s=round(time.time() - t0, 2))
     reg["latencia_s"], reg["http"] = round(time.time() - t0, 2), r.status_code
@@ -964,9 +1019,12 @@ def gemini_leer_boleto(imagen, mime, post=None):
     cand = (datos.get("candidates") or [{}])[0] or {}
     texto = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []) if isinstance(p, dict) and not p.get("thought"))
     obj = S._objeto_json(texto)
-    if not obj or not isinstance(obj.get("patas"), list) or not obj["patas"]:
+    if isinstance(obj, dict) and isinstance(obj.get("patas"), list):      # un solo boleto sin la envoltura
+        obj = {"boletos": [obj]}
+    boletos = [b for b in ((obj or {}).get("boletos") or []) if isinstance(b, dict) and isinstance(b.get("patas"), list) and b["patas"]]
+    if not boletos:
         return None, dict(reg, estado="respuesta inválida", detalle=(texto or "sin texto")[:200])
-    return obj, dict(reg, estado="ok", patas=len(obj["patas"]))
+    return {"boletos": boletos}, dict(reg, estado="ok", boletos=len(boletos), patas=sum(len(b["patas"]) for b in boletos))
 
 
 def tope_fotos():
@@ -981,11 +1039,15 @@ def tope_fotos():
 
 
 def fotos_hoy(hoy):
-    try:
-        with open(LOG_GEMINI, encoding="utf-8") as f:
-            return sum(1 for r in csv.DictReader(f) if r.get("fecha_ccs") == hoy and r.get("estado") != "sin llave")
-    except FileNotFoundError:
-        return 0
+    """Lecturas de hoy (Caracas) en el registro de v1.1 y en el de v1: el tope es uno solo."""
+    n = 0
+    for ruta in (LOG_GEMINI, LOG_GEMINI_V1):
+        try:
+            with open(ruta, encoding="utf-8") as f:
+                n += sum(1 for r in csv.DictReader(f) if r.get("fecha_ccs") == hoy and r.get("estado") != "sin llave")
+        except FileNotFoundError:
+            pass
+    return n
 
 
 def registrar_llamada(reg):
@@ -998,26 +1060,44 @@ def registrar_llamada(reg):
         w.writerow(reg)
 
 
-def procesar_foto(ruta, P=None, post=None):
+def procesar_entrada(ruta, P=None, post=None):
+    """Del bot: guarda una copia de la entrada (foto, PDF o texto), la lee con Gemini si queda cupo, cruza cada boleto con el
+    calendario y los deja pendientes de /si."""
     ruta = Path(ruta)
     ahora = ahora_utc()
     hoy = ahora.astimezone(CCS).date().isoformat()
+    datos = ruta.read_bytes()
+    if not datos or len(datos) > MAX_ARCHIVO:
+        return "El archivo está vacío o es demasiado grande. Mándame una foto, un PDF o el texto del boleto."
+    mime = tipo_entrada(datos)
+    if mime is None:
+        return "No reconozco ese archivo. Mándame el boleto como foto (JPG o PNG), PDF o texto."
     tope = tope_fotos()
     if fotos_hoy(hoy) >= tope:
-        return f"Ya usé las {tope} lecturas de fotos de hoy (semana.ini [parlays] tope_fotos_dia). Mañana se renueva."
-    imagen = ruta.read_bytes()
-    mime = "image/png" if imagen[:8] == b"\x89PNG\r\n\x1a\n" else "image/webp" if imagen[8:12] == b"WEBP" else "image/jpeg"
+        return f"Ya usé las {tope} lecturas de boletos de hoy (semana.ini [parlays] tope_fotos_dia). Mañana se renueva."
     FOTOS.mkdir(parents=True, exist_ok=True)
-    nombre = ahora.strftime("%Y%m%d_%H%M%S") + {"image/png": ".png", "image/webp": ".webp"}.get(mime, ".jpg")
-    (FOTOS / nombre).write_bytes(imagen)
-    lectura, reg = gemini_leer_boleto(imagen, mime, post=post)
+    nombre = ahora.strftime("%Y%m%d_%H%M%S_%f") + {"image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf",
+                                                  "text/plain": ".txt"}.get(mime, ".jpg")
+    (FOTOS / nombre).write_bytes(datos)
+    lectura, reg = gemini_leer_boleto(datos, mime, post=post)
     reg.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, foto=nombre)
     registrar_llamada(reg)
     if reg.get("estado") == "sin llave":
-        return "No encuentro la llave de Gemini (credenciales/gemini.key): no puedo leer fotos."
+        return "No encuentro la llave de Gemini (credenciales/gemini.key): no puedo leer boletos."
     if not lectura:
-        return f"No pude leer el boleto ({reg.get('estado')}). Manda una foto más clara, con todas las patas a la vista."
-    return (P or Parlays()).preparar(lectura, foto=nombre)
+        que = {"application/pdf": "el PDF", "text/plain": "el texto"}.get(mime, "la foto")
+        extra = " Si el PDF no se deja leer, mándame una captura de pantalla." if mime == "application/pdf" else ""
+        return f"No pude leer {que} del boleto ({reg.get('estado')}).{extra} Prueba otra vez con todas las patas a la vista."
+    try:
+        return (P or Parlays()).preparar(lectura, archivo=nombre)
+    except Exception as e:  # noqa: BLE001 — la lectura ya se pagó: se guarda y se cruza con /si
+        _guardar_json(PENDIENTE, dict(crudo=lectura, archivo=nombre, creado=S.iso(ahora)))
+        n = len(lectura.get("boletos") or [])
+        return (f"Leí {n} boleto{'s' if n != 1 else ''}, pero no pude cruzarlo{'s' if n != 1 else ''} con los juegos "
+                f"({type(e).__name__}). En un minuto manda /si: lo cruzo y te lo muestro antes de guardar (no vuelve a gastar Gemini).")
+
+
+procesar_foto = procesar_entrada        # nombre de v1
 
 
 def prueba_instalacion():
@@ -1042,7 +1122,7 @@ def prueba_instalacion():
     except Exception as e:  # noqa: BLE001
         out.append(f"FALLA líneas: {type(e).__name__}: {str(e)[:120]}")
     out.append(f"{'OK' if S.GEMINI_LLAVE.exists() else 'FALLA'} llave de Gemini {'presente' if S.GEMINI_LLAVE.exists() else 'ausente'}; "
-               f"tope de fotos por día: {tope_fotos()}; usadas hoy: {fotos_hoy(ahora_utc().astimezone(CCS).date().isoformat())}")
+               f"lecturas de boletos por día (foto, PDF o texto): tope {tope_fotos()}, usadas hoy {fotos_hoy(ahora_utc().astimezone(CCS).date().isoformat())}")
     SAL.mkdir(parents=True, exist_ok=True)
     out.append(f"OK carpeta {SAL.relative_to(BASE)}")
     return "\n".join(out)
@@ -1054,8 +1134,8 @@ def main(argv):
         return 0
     cmd, resto = argv[0], argv[1:]
     try:
-        if cmd == "foto" and resto:
-            print(procesar_foto(resto[0]))
+        if cmd in ("leer", "foto") and resto:
+            print(procesar_entrada(resto[0]))
         elif cmd == "si":
             print(Parlays().confirmar())
         elif cmd == "no":

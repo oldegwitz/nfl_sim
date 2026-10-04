@@ -14,7 +14,8 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /piloto [variante] → piloto del agente Gemini con los criterios P1-P4 (semana.py gemini-piloto); variante opcional:
              g1 (por omisión), g1-low, g1-texto o g1-high. Tipo 'prueba': no cuenta para el piso de 35A.
   Parlays (v4, decisión 42; parlay.py, descriptivo, no cuenta para nada):
-  foto del boleto → Gemini la lee y el bot repite lo que entendió; /si la guarda, /no la descarta
+  boleto como foto, PDF o texto (v4.1; texto pegado o escrito, solo o con /cargar) → Gemini lo lee y el bot repite lo
+             que entendió (puede traer varios boletos); /si los guarda, /no los descarta
   /parlays → la lista · /parlay [N] → estado juego a juego (el último si no se dice N)
   /jugadas EQUIPO → últimas 10 jugadas de ese juego · /borrar_parlay N → lo saca de la lista
   /ayuda   → esta lista
@@ -35,7 +36,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4 (4-oct-2026)"   # v2: /qb · v3: /piloto · v4: parlays (foto del boleto, /parlays, /parlay, /jugadas)
+VERSION = "orden-v4.1 (4-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays (foto, /parlays, /parlay, /jugadas) · v4.1: PDF y texto
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -45,7 +46,7 @@ PY = BASE / "venv" / "bin" / "python"
 CARACAS = ZoneInfo("America/Caracas")
 DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 LIMITE_S = 900                        # una corrida nunca debería pasar de ~2 min; tope de seguridad
-LIMITE_PARLAY_S = 180                 # parlay.py: lectura de la foto (≤ 70 s) o consultas a ESPN
+LIMITE_PARLAY_S = 180                 # parlay.py: lectura del boleto (≤ 100 s) o consultas a ESPN
 FOTO_MAX_BYTES = 15 * 1024 * 1024
 ORDENES = {
     "/correr": (["correr", "--tipo", "telegram"], "Proyecto los juegos de la semana que no empezaron y actualizo la hoja (≈1 min)."),
@@ -73,7 +74,7 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/estado — qué toca y cuándo\n"
          "/qb — QB de cada juego por fuente y su confiabilidad\n"
          "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
-         "Parlays: mándame la foto del boleto de BetOnline; /si lo guarda, /no lo descarta\n"
+         "Parlays: mándame el boleto de BetOnline como foto, PDF o texto (pegado, o /cargar y el texto); /si lo guarda, /no lo descarta\n"
          "/parlays — tus parlays · /parlay N — cómo va, juego a juego (sin N: el último)\n"
          "/jugadas BUF — últimas 10 jugadas de ese juego · /borrar_parlay N\n"
          "/ayuda — esta lista\n"
@@ -167,35 +168,65 @@ def correr_parlay(args):
     return p.returncode, texto
 
 
-def foto_del_mensaje(msg):
-    """file_id de la foto más grande, o de un documento de imagen (foto enviada «como archivo»)."""
+def archivo_del_mensaje(msg):
+    """(file_id, tamaño) de la foto más grande, o de un documento de imagen o PDF; None si no hay."""
     fotos = msg.get("photo") or []
     if fotos:
-        return max(fotos, key=lambda f: f.get("file_size") or (f.get("width", 0) * f.get("height", 0))).get("file_id")
+        f = max(fotos, key=lambda f: f.get("file_size") or (f.get("width", 0) * f.get("height", 0)))
+        return f.get("file_id"), f.get("file_size") or 0
     doc = msg.get("document") or {}
-    if str(doc.get("mime_type", "")).startswith("image/"):
-        return doc.get("file_id")
+    mime, nombre = str(doc.get("mime_type", "")).lower(), str(doc.get("file_name", "")).lower()
+    if mime.startswith("image/") or mime == "application/pdf" or nombre.endswith((".pdf", ".jpg", ".jpeg", ".png", ".webp")):
+        return doc.get("file_id"), doc.get("file_size") or 0
     return None
 
 
-def atender_foto(tg, chat, msg):
-    file_id = foto_del_mensaje(msg)
-    if not file_id:
-        return False
-    log("orden: foto de boleto")
-    tg.enviar(chat, "Leyendo el boleto (≈10-30 s)…")
-    destino = ENTRADA_FOTOS / f"{dt.datetime.now(dt.timezone.utc):%Y%m%d_%H%M%S}_{msg.get('message_id', 0)}.img"
-    if not tg.bajar_archivo(file_id, destino):
-        tg.enviar(chat, "No pude bajar la foto de Telegram. Mándala otra vez.")
-        return True
-    codigo, texto = correr_parlay(["foto", str(destino)])
+PARECE_BOLETO = re.compile(r"(?<![\d.])[+-]\d{3,4}(?!\d)|[+-]\d{1,2}(?:\.5|½)|\bML\b|\bmoneyline\b|\b(?:over|under)\s*\d|"
+                           r"\bparlay\b|\bteaser\b|\bpick\b", re.IGNORECASE)
+
+
+def leer_boleto(tg, chat, ruta, que):
+    """Pasa la entrada guardada a parlay.py (leer) y responde. La copia de entrada se borra: parlay.py guarda la suya."""
+    tg.enviar(chat, f"Leyendo {que} (≈10-40 s)…")
+    codigo, texto = correr_parlay(["leer", str(ruta)])
     try:
-        destino.unlink()                               # parlay.py guarda su propia copia en salidas/parlays/fotos
+        ruta.unlink()
     except OSError:
         pass
     tg.enviar(chat, texto)
-    log(f"orden foto: {'listo' if codigo == 0 else 'falló'} ({codigo})")
+    log(f"orden boleto ({que}): {'listo' if codigo == 0 else 'falló'} ({codigo})")
+
+
+def atender_archivo(tg, chat, msg):
+    hallado = archivo_del_mensaje(msg)
+    if not hallado:
+        return False
+    file_id, tam = hallado
+    es_pdf = str((msg.get("document") or {}).get("mime_type", "")).lower() == "application/pdf" or \
+        str((msg.get("document") or {}).get("file_name", "")).lower().endswith(".pdf")
+    que = "el PDF del boleto" if es_pdf else "el boleto"
+    log(f"orden: boleto ({'pdf' if es_pdf else 'imagen'})")
+    if tam and tam > FOTO_MAX_BYTES:
+        tg.enviar(chat, "El archivo pesa demasiado (más de 15 MB). Mándame una captura o el PDF de una sola página.")
+        return True
+    destino = ENTRADA_FOTOS / f"{dt.datetime.now(dt.timezone.utc):%Y%m%d_%H%M%S}_{msg.get('message_id', 0)}.entrada"
+    if not tg.bajar_archivo(file_id, destino):
+        tg.enviar(chat, "No pude bajar el archivo de Telegram. Mándalo otra vez.")
+        return True
+    leer_boleto(tg, chat, destino, que)
     return True
+
+
+def atender_texto_boleto(tg, chat, msg, texto):
+    texto = (texto or "").strip()
+    if len(texto) < 3:
+        tg.enviar(chat, "Escribe o pega el boleto después de /cargar, por ejemplo:\n/cargar Parlay $10: BUF -7 -110, CHI ML -175, Over 44.5 NYG/ARI -110")
+        return
+    destino = ENTRADA_FOTOS / f"{dt.datetime.now(dt.timezone.utc):%Y%m%d_%H%M%S}_{msg.get('message_id', 0)}.entrada"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(texto[:8000], encoding="utf-8")
+    log("orden: boleto (texto)")
+    leer_boleto(tg, chat, destino, "el texto del boleto")
 
 
 def atender_parlay(tg, chat, texto, partes):
@@ -245,18 +276,33 @@ def main():
                     log(f"mensaje ignorado de un chat no autorizado ({(msg.get('chat') or {}).get('id')})")
                 continue
             try:
-                if atender_foto(tg, chat, msg):
+                if atender_archivo(tg, chat, msg):
                     continue
-            except Exception as e:  # noqa: BLE001 — una foto rara no tumba el servicio
-                log(f"foto: error ({type(e).__name__})")
-                tg.enviar(chat, "Algo falló con la foto. Mándala otra vez.")
+            except Exception as e:  # noqa: BLE001 — un archivo raro no tumba el servicio
+                log(f"archivo: error ({type(e).__name__})")
+                tg.enviar(chat, "Algo falló con el archivo. Mándalo otra vez.")
                 continue
-            partes = (msg.get("text") or "").strip().split()
+            crudo = (msg.get("text") or "").strip()
+            partes = crudo.split()
             texto = partes[0].split("@")[0].lower() if partes else ""
             extra = [x.lower() for x in partes[1:2]]
             if not texto:
                 if msg.get("document") or msg.get("sticker") or msg.get("video"):
-                    tg.enviar(chat, "Para un boleto, mándame la foto (imagen JPG o PNG). /ayuda muestra las órdenes.")
+                    tg.enviar(chat, "Para un boleto, mándamelo como foto (JPG o PNG), PDF o texto. /ayuda muestra las órdenes.")
+                continue
+            if texto == "/cargar":
+                try:
+                    atender_texto_boleto(tg, chat, msg, crudo[len(partes[0]):])
+                except Exception as e:  # noqa: BLE001
+                    log(f"texto: error ({type(e).__name__})")
+                    tg.enviar(chat, "Algo falló con el texto. Mándalo otra vez.")
+                continue
+            if not texto.startswith("/") and PARECE_BOLETO.search(crudo):
+                try:
+                    atender_texto_boleto(tg, chat, msg, crudo)
+                except Exception as e:  # noqa: BLE001
+                    log(f"texto: error ({type(e).__name__})")
+                    tg.enviar(chat, "Algo falló con el texto. Mándalo otra vez.")
                 continue
             log(f"orden: {texto}")
             if texto in ("/ayuda", "/start", "/help"):
