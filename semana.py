@@ -43,6 +43,8 @@ Uso
   venv/bin/python semana.py retro                         (retrospectiva de los juegos jugados y sus pestañas)
   venv/bin/python semana.py hoja [--semana N]             (rehace las pestañas desde el registro, sin simular)
   venv/bin/python semana.py qb                            (QB de cada juego por fuente y confiabilidad de cada fuente)
+  venv/bin/python semana.py informe [--semana N]          (v8.1: informe de CLV y autopsia de una semana jugada; sale
+                                                           solo por Telegram cuando cierra cada semana que cuenta)
   venv/bin/python semana.py gemini-piloto [--variante g1] (piloto del agente Gemini: P1-P4; no cuenta para el piso)
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña semanal y
                                                            un boleto de prueba con el formato real)
@@ -65,7 +67,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8 (3-oct-2026)"
+VERSION_SEMANA = "semana-v8.1 (8-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -107,6 +109,14 @@ VERSION_SEMANA = "semana-v8 (3-oct-2026)"
 #     detalle técnico de v7 a la derecha, en gris, después de una columna vacía. El bloque de equipos y el Boleto van en
 #     frases (el Boleto conserva su tabla técnica a la derecha). Solo cambia la presentación: proyección, registro,
 #     selecciones, boleto y agente Gemini quedan como en v7.
+# v8.1 (decisiones 43, 45 y 46 de Ozz, 7-oct, registradas antes de la primera señal que cuenta): (43) la confiabilidad
+#     de cada fuente del QB se mide contra el QB del primer dropback de cada equipo en la jugada por jugada de nflverse
+#     (games.csv no corrige el QB después del juego: H34); sin jugada por jugada todavía, games.csv queda como verdad
+#     provisional. (45) modo 'informe' y envío automático cuando cierra una semana que cuenta: CLV de las selecciones de
+#     29A con la señal que cuenta (decide el CLV sin vig, 46; se reportan el CLV con el precio de Pinnacle y con el de
+#     BetOnline), intervalos por remuestreo de juegos y autopsia de cada juego (38, con la prueba 1 en probabilidad sin
+#     vig). No cambian el modelo, la simulación, el consenso del QB, las selecciones, el boleto ni la hoja (solo el texto
+#     de confiabilidad que ya mostraba). La proyección es idéntica a la de v8.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -2002,8 +2012,10 @@ def anexar_fuentes(filas):
 
 
 def confiabilidad_qb(g26, semana=None):
-    """Aciertos de cada fuente contra el QB que jugó (nflverse después del juego), con el voto de la corrida que cuenta
-    (la última antes del inicio entre T−85, sábado y miércoles; si no hubo, la última). {fuente: (aciertos, total)}."""
+    """Aciertos de cada fuente contra el QB que jugó, con el voto de la corrida que cuenta (la última antes del inicio entre
+    T−85, sábado y miércoles; si no hubo, la última). {fuente: (aciertos, total)}. v8.1 (43): el QB que jugó es el del
+    primer dropback de la jugada por jugada de nflverse (verdad_qb); si ese juego todavía no está en la jugada por jugada,
+    el QB de games.csv como verdad provisional (la clave '_provisional' cuenta cuántos equipo-juego la usaron)."""
     import polars as pl
     if not FUENTES_QB.exists():
         return {}
@@ -2011,12 +2023,20 @@ def confiabilidad_qb(g26, semana=None):
     if semana is not None:
         reg = reg.filter(pl.col("semana") == str(semana))
     hechos = g26.filter(pl.col("result").is_not_null())
-    real, real_nom, inicio = {}, {}, {}
+    verdad = verdad_qb()
+    ro = leer_roster()
+    nombre_ro = dict(zip(ro["gsis_id"].to_list(), ro["full_name"].to_list())) if ro is not None else {}
+    real, real_nom, inicio, provisional = {}, {}, {}, set()
     for r in hechos.iter_rows(named=True):
-        real[(r["game_id"], r["home_team"])] = _texto(r.get("home_qb_id"))
-        real[(r["game_id"], r["away_team"])] = _texto(r.get("away_qb_id"))
-        real_nom[(r["game_id"], r["home_team"])] = _norm(r.get("home_qb_name"))
-        real_nom[(r["game_id"], r["away_team"])] = _norm(r.get("away_qb_name"))
+        for eq, qid, qnom in ((r["home_team"], _texto(r.get("home_qb_id")), r.get("home_qb_name")),
+                              (r["away_team"], _texto(r.get("away_qb_id")), r.get("away_qb_name"))):
+            k = (r["game_id"], eq)
+            if k in verdad:
+                real[k] = verdad[k]
+                real_nom[k] = _norm(nombre_ro.get(verdad[k]) or (qnom if verdad[k] == qid else ""))
+            else:
+                real[k], real_nom[k] = qid, _norm(qnom)
+                provisional.add(k)
         inicio[r["game_id"]] = r["inicio"]
     elegido = {}                                       # (game, equipo, fuente) → (prioridad, (qb_id, nombre))
     for f in reg.iter_rows(named=True):
@@ -2041,16 +2061,22 @@ def confiabilidad_qb(g26, semana=None):
         acierto = (qb == real[(gid, eq)]) if qb else bool(nom and nom == real_nom.get((gid, eq)))
         a, n = out.get(fuente, (0, 0))
         out[fuente] = (a + int(acierto), n + 1)
+    usados = {(gid, eq) for (gid, eq, _f) in elegido} & provisional
+    if out and usados:
+        out["_provisional"] = len(usados)
     return out
 
 
 def confiabilidad_txt(c):
+    prov = (c or {}).get("_provisional")
+    c = {k: v for k, v in (c or {}).items() if not k.startswith("_")}
     if not c:
         return ""
     orden = ["consenso", "nflverse", "espn", "sleeper"] + sorted(f for f in c if f.startswith("gemini"))
     nombres = {"consenso": "consenso", "nflverse": "nflverse", "espn": "ESPN", "sleeper": "Sleeper"}
     nombres.update({f: f"Gemini {f.split(' ', 1)[1]} (sombra)" for f in c if f.startswith("gemini ")})
-    return "QB acertado por fuente: " + " · ".join(f"{nombres.get(f, f)} {c[f][0]}/{c[f][1]}" for f in orden if f in c)
+    return ("QB acertado por fuente (contra el primer dropback): " + " · ".join(f"{nombres.get(f, f)} {c[f][0]}/{c[f][1]}" for f in orden if f in c)
+            + (f" · verdad provisional (games.csv) en {prov} equipo-juego sin jugada por jugada todavía" if prov else ""))
 
 
 # --------------------------------------------------------------------------------------
@@ -2998,11 +3024,456 @@ def semanas_con_datos(g26):
 
 
 # --------------------------------------------------------------------------------------
+# v8.1 — Verdad del QB por primer dropback (decisión 43) e informe semanal de CLV con autopsia (45, con la fórmula de
+# CLV de la decisión 46). Registrados el 7-oct-2026 antes de la primera señal que cuenta (claude/registro_43_46.md y
+# contexto del proyecto). Todo es lectura y registro descriptivo: no toca s2-v1, la simulación, el consenso del QB, las
+# selecciones de 29A ni la hoja (el informe va por Telegram y a archivos; 38: sin pestaña nueva).
+# --------------------------------------------------------------------------------------
+INFORMES = SAL / "informes"
+N_BOOT = 10_000                    # remuestreos por juego para los intervalos del CLV
+SEMILLA_BOOT = 20261007
+UMBRAL_AUTOPSIA = 1.0              # 38: |spread del modelo − línea de la señal| ≥ 1,0 pt
+MOV_PP = 0.01                      # 45: prueba 1 = la probabilidad sin vig del lado del modelo sube ≥ 1,0 pp
+MOV_PTS = 0.5                      # 38 original (se reporta, no decide): la línea se mueve ≥ 0,5 pts hacia el modelo
+ESPERA_PBP_H = 48                  # el informe espera la jugada por jugada de todos los juegos hasta 48 h tras el último
+N_VEREDICTO = 60                   # 29A: el veredicto pide n ≥ 60 selecciones
+COLS_PBP = ["game_id", "play_id", "posteam", "qb_dropback", "passer_player_id", "rusher_player_id", "play_type", "down",
+            "epa", "interception", "fumble_lost", "touchdown", "td_team"]
+_PBP26 = {}
+_VERDAD = {}
+_MU = {}
+
+
+def pbp_temporada(max_edad_h=6.0):
+    """Jugada por jugada de la temporada en curso (la misma que baja preparar_contexto), con las columnas que usan la
+    verdad del QB y la autopsia. None si no se puede bajar ni hay copia."""
+    import polars as pl
+    if "x" in _PBP26:
+        return _PBP26["x"]
+    destino = DATOS / f"pbp_{TEMPORADA}.parquet"
+    df = None
+    if bajar(URL_PBP.format(TEMPORADA), destino, 500_000, max_edad_h):
+        try:
+            cols = [c for c in COLS_PBP if c in pl.read_parquet_schema(destino)]
+            df = pl.read_parquet(destino, columns=cols)
+        except Exception as e:  # noqa: BLE001
+            log(f"AVISO: no pude leer {destino.name} ({type(e).__name__})")
+    _PBP26["x"] = df
+    return df
+
+
+def verdad_qb(pbp=None):
+    """43: el QB que jugó = el jugador del primer dropback del equipo (qb_dropback = 1) en la jugada por jugada de
+    nflverse que figure como QB en el roster 2026 (passer_player_id; en un scramble, rusher_player_id). Si el roster no
+    está, el del primer dropback. {(game_id, equipo): gsis} solo para los juegos que ya están en la jugada por jugada."""
+    import polars as pl
+    if "v" in _VERDAD:
+        return _VERDAD["v"]
+    pbp = pbp if pbp is not None else pbp_temporada()
+    out = {}
+    if pbp is not None and pbp.height and all(c in pbp.columns for c in ("qb_dropback", "passer_player_id", "rusher_player_id")):
+        ro = leer_roster()
+        qbs = set(ro["gsis_id"].drop_nulls().to_list()) if ro is not None else set()
+        d = (pbp.filter((pl.col("qb_dropback") == 1) & pl.col("posteam").is_not_null())
+             .with_columns(pl.coalesce([pl.col("passer_player_id"), pl.col("rusher_player_id")]).alias("qb"))
+             .filter(pl.col("qb").is_not_null())
+             .sort(["game_id", "play_id"]))
+        primero = {}
+        for gid, eq, qb in d.select(["game_id", "posteam", "qb"]).iter_rows():
+            primero.setdefault((gid, eq), qb)
+            if (gid, eq) not in out and (not qbs or qb in qbs):
+                out[(gid, eq)] = qb
+        for k, qb in primero.items():                   # equipo sin un QB del roster en sus dropbacks (raro)
+            out.setdefault(k, qb)
+    _VERDAD["v"] = out
+    return out
+
+
+def _bootstrap(valores, grupos, semilla):
+    """Media de las selecciones e intervalos por remuestreo de juegos (no de selecciones: ML y spread del mismo juego
+    están ligados). (media, IC 95 % bajo, IC 95 % alto, límite inferior unilateral 95 %)."""
+    import numpy as np
+    v = np.asarray(valores, dtype=float)
+    if len(v) == 0:
+        return None
+    g = np.asarray(grupos)
+    unicos = list(dict.fromkeys(g.tolist()))
+    suma = np.array([v[g == u].sum() for u in unicos])
+    cuenta = np.array([(g == u).sum() for u in unicos])
+    rng = np.random.default_rng(semilla)
+    idx = rng.integers(0, len(unicos), size=(N_BOOT, len(unicos)))
+    medias = suma[idx].sum(axis=1) / cuenta[idx].sum(axis=1)
+    return (float(v.mean()), float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5)),
+            float(np.percentile(medias, 5)))
+
+
+def mu_de_ml(p_local):
+    """Margen esperado del local que reproduce la probabilidad sin vig del ML con la distribución del margen de la sección
+    3 (resultados 2012-2025 con spread de cierre cercano; sin anclar). Solo para reportar el movimiento del μ (45)."""
+    import numpy as np
+    if p_local is None:
+        return None
+    if "tabla" not in _MU:
+        sl, res = margenes_historicos()
+        grid = np.arange(-24.0, 24.01, 0.25)
+        pw = []
+        for mu in grid:
+            w = NUCLEO_PTS
+            while True:
+                m = np.abs(sl - mu) <= w + 1e-9
+                if m.sum() >= NUCLEO_MIN_N or w >= NUCLEO_MAX_PTS:
+                    break
+                w += 0.5
+            d = res[m] if m.sum() else np.array([mu])
+            pw.append(float((d > 0).mean() + 0.5 * (d == 0).mean()))
+        _MU["tabla"] = (grid, np.maximum.accumulate(np.array(pw)))
+    grid, pw = _MU["tabla"]
+    return float(np.interp(p_local, pw, grid))
+
+
+def _p_ml_lado(p_local, lado):
+    return None if p_local is None else (p_local if lado == "local" else 1.0 - p_local)
+
+
+def p_cubre_sin_vig(foto, h_local, lado):
+    """P(el lado cubre el hándicap h_local del local | sin push) según una foto de Pinnacle: con el mismo número, su
+    probabilidad sin vig (método de potencia); con otro número, la distribución del margen de la sección 3 anclada a esa
+    foto (clase Margen, la del Boleto)."""
+    if not foto:
+        return None
+    hc, sl, sv = foto.get("hcp_local"), foto.get("cuota_sp_local"), foto.get("cuota_sp_visit")
+    if hc is None or sl is None or sv is None or h_local is None:
+        return None
+    p_ref = sin_vig_potencia(sl, sv)
+    if p_ref is None:
+        return None
+    if abs(float(hc) - float(h_local)) < 1e-9:
+        p_loc = p_ref
+    else:
+        pw, pp = Margen(hc, p_ref).local(float(h_local))
+        p_loc = pw / max(1.0 - pp, 1e-9)
+    return p_loc if lado == "local" else 1.0 - p_loc
+
+
+def senal_que_cuenta(semana):
+    """{game_id: fila del registro}: la señal que cuenta para 29A y 31A = la última corrida automática (T−85, sábado o
+    miércoles) guardada antes del inicio del juego; las corridas manuales o por Telegram no cuentan (37)."""
+    import polars as pl
+    out = {}
+    for r in leer_registro().filter(pl.col("semana") == str(semana)).iter_rows(named=True):
+        if r.get("tipo") not in TIPOS_QUE_CUENTAN:
+            continue
+        t, ini = t_utc(r.get("corrida_utc")), t_utc(r.get("inicio_utc"))
+        if t is None or ini is None or t >= ini:
+            continue
+        if r["game_id"] not in out or t > t_utc(out[r["game_id"]]["corrida_utc"]):
+            out[r["game_id"]] = r
+    return out
+
+
+def _stats_juego(pbp, gid, eq):
+    """EPA por pase y por corrida del ataque de eq (mismo filtro que s2-v1: pases y corridas con down y EPA), pérdidas
+    de balón y TD de defensa o de equipos especiales (definición de H24)."""
+    import polars as pl
+    q = pbp.filter(pl.col("game_id") == gid)
+    sc = q.filter(pl.col("play_type").is_in(["pass", "run"]) & pl.col("down").is_not_null() & pl.col("epa").is_not_null()
+                  & (pl.col("posteam") == eq))
+    ep = sc.filter(pl.col("play_type") == "pass")["epa"]
+    er = sc.filter(pl.col("play_type") == "run")["epa"]
+    perd = q.filter((pl.col("posteam") == eq) & ((pl.col("interception") == 1) | (pl.col("fumble_lost") == 1))).height
+    tdx = q.filter((pl.col("touchdown") == 1) & (pl.col("td_team") == eq)
+                   & ((pl.col("posteam") != eq) | (pl.col("play_type") == "kickoff"))).height
+    return (float(ep.mean()) if ep.len() else None, float(er.mean()) if er.len() else None, perd, tdx)
+
+
+def _pct(x, signo=True):
+    if x is None:
+        return "—"
+    return (f"{100 * x:+.1f} %" if signo else f"{100 * x:.1f} %").replace(".", ",")
+
+
+def _num_txt(x, signo=True, dec=1):
+    if x is None:
+        return "—"
+    return (f"{x:+.{dec}f}" if signo else f"{x:.{dec}f}").replace(".", ",")
+
+
+def datos_semana(g26, semana, bot_dir):
+    """Juegos de la semana (nflverse), la señal que cuenta de cada uno y el cierre de Pinnacle del bot."""
+    import polars as pl
+    info = {r["game_id"]: r for r in g26.filter(pl.col("week") == semana).iter_rows(named=True)}
+    inicios = {gid: r["inicio"] for gid, r in info.items() if r.get("inicio") is not None}
+    return info, senal_que_cuenta(semana), cierre_pin(bot_dir, inicios)
+
+
+def clv_selecciones(g26, semana, bot_dir, datos=None):
+    """CLV de cada selección de 29A de la semana con la señal que cuenta (46: decide el CLV sin vig; se reportan el CLV
+    con el precio de Pinnacle de la señal y con el precio de BetOnline)."""
+    info, senal, cierre = datos or datos_semana(g26, semana, bot_dir)
+    cuenta_31a = semana >= SEMANA_31A
+    sels = []
+    for gid, r in senal.items():
+        g = info.get(gid) or {}
+        c = cierre.get(gid)
+        res = _num(g.get("result"))
+        for mercado in ("ml", "sp"):
+            lado = r.get("sel_ml") if mercado == "ml" else r.get("sel_sp")
+            if lado not in ("local", "visita"):
+                continue
+            eq = r["local"] if lado == "local" else r["visita"]
+            f = dict(semana=semana, game_id=gid, juego=f"{r['visita']} @ {r['local']}", corrida=f"{r['tipo']} {r['corrida_utc']}",
+                     mercado=mercado.upper(), lado=lado, equipo=eq, estado=r.get("sel_estado") or "",
+                     cuenta=int((r.get("sel_estado") == "candidata") and cuenta_31a))
+            if mercado == "ml":
+                q_sig = _p_ml_lado(_num(r.get("pin_p_ml_local")), lado)
+                q_cie = _p_ml_lado(sin_vig_potencia(c["ml_local"], c["ml_visit"]) if c and c.get("ml_local") is not None
+                                   and c.get("ml_visit") is not None else None, lado)
+                cuota_pin = _num(r.get("pin_ml_local") if lado == "local" else r.get("pin_ml_visit"))
+                cuota_bo = _num(r.get("bo_ml_local") if lado == "local" else r.get("bo_ml_visit"))
+                q_bo = q_cie
+                f["precio_senal"] = f"{eq} ML {cuota_pin:+.0f}" if cuota_pin is not None else ""
+                gano = None if res is None or res == 0 else ((res > 0) == (lado == "local"))
+            else:
+                h = _num(r.get("pin_hcp_local"))
+                q_sig = _num(r.get("pin_p_sp_local"))
+                q_sig = None if q_sig is None else (q_sig if lado == "local" else 1.0 - q_sig)
+                q_cie = p_cubre_sin_vig(c, h, lado)
+                cuota_pin = _num(r.get("pin_cuota_sp_local") if lado == "local" else r.get("pin_cuota_sp_visit"))
+                cuota_bo = _num(r.get("bo_cuota_sp_local") if lado == "local" else r.get("bo_cuota_sp_visit"))
+                q_bo = p_cubre_sin_vig(c, _num(r.get("bo_hcp_local")), lado)
+                hl = None if h is None else (h if lado == "local" else -h)
+                f["precio_senal"] = (f"{eq} {hl:+.1f} ({cuota_pin:+.0f})" if hl is not None and cuota_pin is not None else "")
+                if res is None or h is None:
+                    gano = None
+                else:
+                    x = res + h if lado == "local" else -(res + h)
+                    gano = None if abs(x) < 1e-9 else x > 0
+            f["linea_cierre"] = "" if not c else f"{c.get('hcp_local')} · ML {c.get('ml_local')}/{c.get('ml_visit')} · {c.get('min_antes')} min antes"
+            f["p_senal"] = q_sig
+            f["p_cierre"] = q_cie
+            f["clv_sin_vig"] = None if q_sig in (None, 0) or q_cie is None else q_cie / q_sig - 1.0
+            f["clv_precio_pinnacle"] = None if q_cie is None or cuota_pin is None else q_cie * decimal(cuota_pin) - 1.0
+            f["clv_precio_betonline"] = None if q_bo is None or cuota_bo is None else q_bo * decimal(cuota_bo) - 1.0
+            f["resultado"] = "" if res is None else ("push" if gano is None else ("ganó" if gano else "perdió"))
+            sels.append(f)
+    return sels
+
+
+def informe_semana(g26, semana, bot_dir, ahora):
+    """Informe semanal (45): CLV de las selecciones de 29A con la señal que cuenta y autopsia de cada juego (38, prueba 1
+    en probabilidad sin vig). Devuelve (texto para Telegram, texto completo, filas de selecciones, filas de autopsia)."""
+    datos = datos_semana(g26, semana, bot_dir)
+    info, senal, cierre = datos
+    pbp = pbp_temporada()
+    en_pbp = set(pbp["game_id"].unique().to_list()) if pbp is not None and pbp.height else set()
+    cuenta_31a = semana >= SEMANA_31A
+    sels = clv_selecciones(g26, semana, bot_dir, datos)
+
+    def bloque(filas, semilla):
+        val = [x for x in filas if x["clv_sin_vig"] is not None]
+        b = _bootstrap([x["clv_sin_vig"] for x in val], [x["game_id"] for x in val], semilla)
+        pin_ = [x["clv_precio_pinnacle"] for x in val if x["clv_precio_pinnacle"] is not None]
+        bo_ = [x["clv_precio_betonline"] for x in val if x["clv_precio_betonline"] is not None]
+        ac = [x for x in val if x["resultado"] in ("ganó", "perdió")]
+        return dict(n=len(val), juegos=len({x["game_id"] for x in val}), sin_cierre=len(filas) - len(val), boot=b,
+                    pin=(sum(pin_) / len(pin_)) if pin_ else None, bo=(sum(bo_) / len(bo_)) if bo_ else None,
+                    aciertos=sum(1 for x in ac if x["resultado"] == "ganó"), n_res=len(ac),
+                    esperado=sum(x["p_cierre"] for x in ac))
+
+    candidatas = [x for x in sels if x["estado"] == "candidata"]
+    excluidas = [x for x in sels if x["estado"] != "candidata"]
+    b_sem = bloque(candidatas, SEMILLA_BOOT + semana)
+    b_exc = bloque(excluidas, SEMILLA_BOOT + 100 + semana)
+    b_acu = None
+    if cuenta_31a:
+        acu = list(candidatas)
+        for s_ in range(SEMANA_31A, semana):
+            acu += [x for x in clv_selecciones(g26, s_, bot_dir) if x["estado"] == "candidata"]
+        b_acu = bloque(acu, SEMILLA_BOOT + 1000 + semana)
+
+    # ---- Autopsia (38, con la prueba 1 de 45) ----
+    auto = []
+    for gid, r in senal.items():
+        g = info.get(gid) or {}
+        h, sm = _num(r.get("spread_ref")), _num(r.get("spread_modelo"))
+        res = _num(g.get("result"))
+        if h is None or sm is None or abs(h - sm) < UMBRAL_AUTOPSIA:
+            continue
+        lado = "local" if h - sm > 0 else "visita"
+        eq_m = r["local"] if lado == "local" else r["visita"]
+        a = dict(semana=semana, game_id=gid, juego=f"{r['visita']} @ {r['local']}", lado_modelo=eq_m,
+                 dif_pts=round(abs(h - sm), 2), linea_senal=h, ref=r.get("ref_spread") or "",
+                 seleccion=r.get("sel_estado") or "sin selección")
+        c = cierre.get(gid)
+        # prueba 1 (45): probabilidad sin vig del lado del modelo para cubrir la línea de la señal, señal → cierre
+        q_sig = _num(r.get("pin_p_sp_local")) if r.get("ref_spread") == "pinnacle" else None
+        q_sig = None if q_sig is None else (q_sig if lado == "local" else 1.0 - q_sig)
+        q_cie = p_cubre_sin_vig(c, h, lado) if q_sig is not None else None
+        a["mov_pp"] = None if q_sig is None or q_cie is None else round(100 * (q_cie - q_sig), 2)
+        a["prueba1"] = None if a["mov_pp"] is None else a["mov_pp"] >= 100 * MOV_PP - 1e-9
+        # se reportan: movimiento en puntos (38 original) y del μ de Pinnacle
+        hc = _num(c.get("hcp_local")) if c else None
+        a["mov_pts"] = None if hc is None or r.get("ref_spread") != "pinnacle" else round((h - hc) if lado == "local" else (hc - h), 2)
+        mu_s = mu_de_ml(_num(r.get("pin_p_ml_local")))
+        mu_c = mu_de_ml(sin_vig_potencia(c["ml_local"], c["ml_visit"]) if c and c.get("ml_local") is not None
+                        and c.get("ml_visit") is not None else None)
+        a["mov_mu"] = None if mu_s is None or mu_c is None else round((mu_c - mu_s) if lado == "local" else (mu_s - mu_c), 2)
+        if res is None:
+            a["caja"] = "sin resultado"
+            auto.append(a)
+            continue
+        x = res + h
+        cubre = None if abs(x) < 1e-9 else ("local" if x > 0 else "visita")
+        a["resultado"] = resultado_txt(g)
+        # prueba 2: la pieza más grande del margen del modelo contra lo que pasó en la cancha
+        piezas = {k: _num(r.get(f"comp_{k}_pts")) for k in ("pase", "corrida", "qb")}
+        piezas = {k: v for k, v in piezas.items() if v is not None}
+        a["prueba2"] = None
+        if piezas and gid in en_pbp:
+            k = max(piezas, key=lambda z: abs(piezas[z]))
+            sl_, sv_ = _stats_juego(pbp, gid, r["local"]), _stats_juego(pbp, gid, r["visita"])
+            i = 1 if k == "corrida" else 0
+            if sl_[i] is not None and sv_[i] is not None:
+                real = sl_[i] - sv_[i]
+                a["pieza"] = f"{k} {piezas[k]:+.1f}"
+                a["epa_real"] = round(real, 3)
+                a["prueba2"] = (real > 0) == (piezas[k] > 0)
+        # prueba 3: suerte del lado que cubrió (balones por 2+ o TD de defensa o de equipos especiales; H24)
+        a["prueba3"] = None
+        if cubre and gid in en_pbp:
+            eq_c = r["local"] if cubre == "local" else r["visita"]
+            eq_o = r["visita"] if cubre == "local" else r["local"]
+            sc, so = _stats_juego(pbp, gid, eq_c), _stats_juego(pbp, gid, eq_o)
+            a["balones_lado_que_cubrio"] = so[2] - sc[2]
+            a["td_def_st_lado_que_cubrio"] = sc[3]
+            a["prueba3"] = (so[2] - sc[2] >= 2) or sc[3] > 0
+        if cubre is None:
+            a["caja"] = "push"
+        elif cubre == lado:
+            a["caja"] = ("acertó con información" if a["prueba1"] else
+                         "acertó por suerte" if a["prueba3"] else "acertó sin explicación clara")
+        else:
+            a["caja"] = "falló" + (" (el otro lado tuvo suerte)" if a["prueba3"] else "")
+        auto.append(a)
+
+    # ---- textos ----
+    falta_pbp = sorted(gid for gid in senal if info.get(gid, {}).get("result") is not None and gid not in en_pbp)
+    def linea_bloque(nombre, b):
+        if not b or not b["boot"]:
+            return f"{nombre}: sin selecciones con cierre."
+        m, lo, hi, lo1 = b["boot"]
+        return (f"{nombre}: {b['n']} selecciones en {b['juegos']} juegos · CLV sin vig {_pct(m)} "
+                f"(IC 95 % {_pct(lo)} a {_pct(hi)}; límite inferior unilateral {_pct(lo1)}) · con el precio de Pinnacle "
+                f"{_pct(b['pin'])} · con el de BetOnline {_pct(b['bo'])}"
+                + (f" · aciertos {b['aciertos']} de {b['n_res']} (el cierre esperaba {b['esperado']:.1f})".replace(".", ",") if b["n_res"] else "")
+                + (f" · {b['sin_cierre']} sin cierre del bot" if b["sin_cierre"] else ""))
+    cajas = {}
+    for a in auto:
+        cajas[a["caja"]] = cajas.get(a["caja"], 0) + 1
+    p1 = [a for a in auto if a.get("prueba1") is not None]
+    p2 = [a for a in auto if a.get("prueba2") is not None]
+    titulo = (f"INFORME SEMANAL · semana {semana} · motor s2-v1 en modo registro (sin dinero)"
+              + ("" if cuenta_31a else " · semana informativa: NO cuenta para 29A ni 31A"))
+    tel = [titulo,
+           linea_bloque("Selecciones que cuentan (29A)" if cuenta_31a else "Selecciones (no cuentan)", b_sem)]
+    if b_acu:
+        faltan = max(N_VEREDICTO - b_acu["n"], 0)
+        tel.append(linea_bloque(f"Acumulado desde la semana {SEMANA_31A}", b_acu)
+                   + (f" · faltan {faltan} para poder dar veredicto" if faltan else " · ya hay n para el veredicto (se da al final de la temporada)"))
+    tel.append(f"Autopsia ({len(auto)} juegos donde el modelo difería ≥ {UMBRAL_AUTOPSIA:.0f} pt de la línea de la señal): "
+               + " · ".join(f"{k} {v}" for k, v in sorted(cajas.items(), key=lambda kv: -kv[1]))
+               + (f" · prueba 1 (el cierre se movió ≥ 1 pp hacia el modelo): {sum(a['prueba1'] for a in p1)} de {len(p1)}" if p1 else "")
+               + (f" · pasó lo que el modelo esperaba: {sum(a['prueba2'] for a in p2)} de {len(p2)}" if p2 else ""))
+    if falta_pbp:
+        tel.append(f"Aviso: {len(falta_pbp)} juegos todavía sin jugada por jugada en nflverse (la autopsia queda parcial).")
+    tel.append("CLV sin vig = cuánto se movió la probabilidad justa de Pinnacle hacia el lado elegido, de la señal al cierre "
+               "(decide 29A, decisión 46). Descriptivo: el veredicto se da al final de la temporada con n ≥ 60 y solo si 31A pasa.")
+    completo = list(tel) + ["", "Excluidas (se registran, no cuentan): " + linea_bloque("excluidas", b_exc), "",
+                            "SELECCIONES (señal → cierre de Pinnacle, probabilidades sin vig)"]
+    for x in sels:
+        completo.append(f"  {x['juego']} · {x['mercado']} {x['equipo']} · {x['estado']} · {x['precio_senal']} · "
+                        f"P señal {_pct(x['p_senal'], False)} → cierre {_pct(x['p_cierre'], False)} · CLV sin vig {_pct(x['clv_sin_vig'])}"
+                        f" · precio Pinnacle {_pct(x['clv_precio_pinnacle'])} · BetOnline {_pct(x['clv_precio_betonline'])} · {x['resultado'] or 'sin resultado'}")
+    completo += ["", "AUTOPSIA (lado del modelo · prueba 1 en pp · se reportan: puntos y μ · prueba 2 · prueba 3 · caja)"]
+    for a in auto:
+        sino = lambda v: "—" if v is None else ("sí" if v else "no")  # noqa: E731
+        completo.append(f"  {a['juego']} · modelo con {a['lado_modelo']} (difiere {_num_txt(a['dif_pts'], False)} pts) · "
+                        f"prueba 1: {_num_txt(a.get('mov_pp'))} pp ({sino(a.get('prueba1'))}) · línea {_num_txt(a.get('mov_pts'))} pts"
+                        f" · μ {_num_txt(a.get('mov_mu'))} · prueba 2: {a.get('pieza', '—')} contra EPA real {_num_txt(a.get('epa_real'), True, 3)}"
+                        f" ({sino(a.get('prueba2'))}) · prueba 3 suerte: {sino(a.get('prueba3'))} · {a['caja']}")
+    if falta_pbp:
+        completo.append("Sin jugada por jugada todavía: " + ", ".join(falta_pbp))
+    completo.append(f"Generado {iso(ahora)} · {VERSION_SEMANA}")
+    return "\n".join(tel), "\n".join(completo), sels, auto
+
+
+def guardar_informe(semana, completo, sels, auto):
+    INFORMES.mkdir(parents=True, exist_ok=True)
+    (INFORMES / f"informe_semana_{semana}.txt").write_text(completo + "\n", encoding="utf-8")
+    for nombre, filas in (("selecciones", sels), ("autopsia", auto)):
+        ruta = INFORMES / f"informe_semana_{semana}_{nombre}.csv"
+        campos = []
+        for f in filas:
+            for k in f:
+                if k not in campos:
+                    campos.append(k)
+        with open(ruta, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=campos or ["semana"])
+            w.writeheader()
+            for f in filas:
+                w.writerow({k: ("" if f.get(k) is None else f.get(k)) for k in campos})
+    return INFORMES / f"informe_semana_{semana}.txt"
+
+
+def informes_pendientes(g26, estado, ahora):
+    """Semanas que cuentan (≥ 5) con todos sus juegos jugados y sin informe enviado. Espera la jugada por jugada de todos
+    los juegos de la semana, como máximo 48 h después del último inicio."""
+    import polars as pl
+    hechos = set(estado.get("informes", {}))
+    out = []
+    for (sem,), gr in g26.filter(pl.col("week") >= SEMANA_31A).group_by(["week"], maintain_order=True):
+        sem = int(sem)
+        if str(sem) in hechos or gr.height == 0 or gr["result"].null_count() > 0:
+            continue
+        ultimo = max(gr["inicio"].to_list())
+        pbp = pbp_temporada()
+        en_pbp = set(pbp["game_id"].unique().to_list()) if pbp is not None and pbp.height else set()
+        if set(gr["game_id"].to_list()) <= en_pbp or (ahora - ultimo).total_seconds() > ESPERA_PBP_H * 3600:
+            out.append(sem)
+    return sorted(out)
+
+
+def ultima_semana_cerrada(g26):
+    """La semana más reciente (desde la 4) con todos sus juegos jugados."""
+    import polars as pl
+    cerradas = [int(w) for (w,), gr in g26.filter(pl.col("week") >= SEMANA_AUTO).group_by(["week"])
+                if gr.height and gr["result"].null_count() == 0]
+    return max(cerradas) if cerradas else None
+
+
+def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
+    """Arma el informe de la semana, lo guarda en salidas/semana/informes/ y lo manda por Telegram. Anota en el estado
+    las semanas que cuentan y están completas (así el modo auto no lo repite). Devuelve el texto completo."""
+    import polars as pl
+    tel, completo, sels, auto = informe_semana(g26, semana, bot_dir, ahora)
+    ruta = guardar_informe(semana, completo, sels, auto)
+    log(f"informe de la semana {semana}: {len(sels)} selecciones, {len(auto)} juegos en la autopsia → {ruta.name}")
+    if not sin_telegram:
+        sys.path.insert(0, str(BASE))
+        import sprint2 as s2
+        s2.telegram(tel)
+    gr = g26.filter(pl.col("week") == semana)
+    if semana >= SEMANA_31A and gr.height and gr["result"].null_count() == 0:
+        estado.setdefault("informes", {})[str(semana)] = iso(ahora)
+    return completo
+
+
+# --------------------------------------------------------------------------------------
 # Principal
 # --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto"])
+    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
@@ -3103,6 +3574,9 @@ def main():
                   f"{estado.get('gemini_prueba', {}).get(hoy, 0)}/{GEMINI_MAX_PRUEBA_DIA} de piloto")
         else:
             print("Agente Gemini (sombra): apagado (no hay credenciales/gemini.key)")
+        inf = estado.get("informes", {})
+        print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
+                                                     if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
         b = ultimo_boleto()
         print(f"Boleto (informativo): semana {b['semana']}, armado en la corrida {NOMBRE_CORRIDA.get(b['tipo'], b['tipo'])} "
               f"({fecha_cc(t_utc(b['corrida_utc']))}) · "
@@ -3112,6 +3586,15 @@ def main():
 
     if args.modo == "qb":
         print(texto_qb(g26, ahora, args.semana))
+        return
+
+    if args.modo == "informe":                         # v8.1 (45): informe de CLV y autopsia de una semana jugada
+        sem = args.semana or ultima_semana_cerrada(g26)
+        if sem is None:
+            print("Todavía no hay una semana jugada para el informe.")
+            return
+        print(enviar_informe(g26, sem, args.bot_dir, ahora, estado, args.sin_telegram))
+        guardar_estado(estado)
         return
 
     if args.modo == "gemini-piloto":
@@ -3154,6 +3637,21 @@ def main():
                 else:
                     estado.pop("ultima_falla_hoja", None)
                 guardar_estado(estado)
+            # v8.1 (45): informe de CLV y autopsia cuando cierra una semana que cuenta (una sola vez por semana; si falla,
+            # reintenta cada 30 min y nunca frena el temporizador)
+            falla_inf = t_utc(estado.get("ultima_falla_informe"))
+            if falla_inf is None or (ahora - falla_inf).total_seconds() > 1800:
+                try:
+                    pend = informes_pendientes(g26, estado, ahora)
+                    for s_ in pend:
+                        enviar_informe(g26, s_, args.bot_dir, ahora, estado, args.sin_telegram)
+                    if pend:
+                        estado.pop("ultima_falla_informe", None)
+                        guardar_estado(estado)
+                except Exception as e:  # noqa: BLE001
+                    log(f"Informe: error ({type(e).__name__}: {str(e)[:300]})")
+                    estado["ultima_falla_informe"] = iso(ahora)
+                    guardar_estado(estado)
             return                                         # nada que hacer: sale sin escribir en el log
     else:
         import polars as pl
