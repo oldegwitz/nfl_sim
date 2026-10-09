@@ -19,9 +19,15 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   boleto como foto, PDF o texto directo (v4.1; texto pegado o escrito, solo o con /cargar) → igual, sin nombre (al guardarlo
              se llama «Parlay N»)
   Gemini lo lee y el bot repite lo que entendió (puede traer varios boletos: Nombre 1, Nombre 2…); /si guarda, /no descarta
-  /parlays → la lista · /parlay [N o NOMBRE] → estado juego a juego (el último si no se dice)
+  /parlay  → (v4.3, 42i) sin nada: empieza a cargar uno nuevo, igual que «Parlay»
+  /parlays → los de esta semana NFL (v4.3, 42j: cada semana empieza otra vez en «Parlay 1»)
+  /parlay N o NOMBRE (o S.N: semana S, número N) → estado juego a juego y por qué falló cada pata perdida
+  /historico [SEMANA] → (v4.3) semanas anteriores por fecha; con semana, cada parlay con sus razones
   /jugadas EQUIPO → últimas 10 jugadas de ese juego · /borrar_parlay N o NOMBRE → lo saca de la lista
   /ayuda   → esta lista
+  v4.3: menú de órdenes de Telegram (setMyCommands) y, cada 30 min (y 1 min después de /si o /borrar_parlay), lanza
+  «parlay.py auto» como proceso aparte (uno a la vez, máximo 15 min): resultados, por qué falló y la hoja de parlays
+  (42k). Su salida va a salidas/parlays/auto.log. No hace falta un temporizador nuevo de systemd.
 
 Las corridas pedidas por Telegram se registran (tipo "telegram") y actualizan la hoja, pero NO son la proyección
 que cuenta para 31A ni para el CLV de 29A: esa sigue siendo la automática (T−85; si no, sábado; si no, miércoles).
@@ -41,7 +47,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4.2 (4-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato
+VERSION = "orden-v4.3 (8-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -76,7 +82,8 @@ SALIDA_COMPLETA = ("/qb", "/estado", "/piloto")
 # v4: órdenes de parlay.py → (argumentos, ¿lleva número?, ¿lleva equipo?)
 ORDENES_PARLAY = {
     "/parlays": (["lista"], False, False),
-    "/parlay": (["estado"], True, False),
+    "/parlay": (["estado"], True, False),          # v4.3: sin nada empieza la carga (main); con algo, el estado
+    "/historico": (["historico"], True, False),    # v4.3
     "/jugadas": (["jugadas"], False, True),
     "/si": (["si"], False, False),
     "/no": (["no"], False, False),
@@ -89,12 +96,28 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/estado — qué toca y cuándo\n"
          "/qb — QB de cada juego por fuente y su confiabilidad\n"
          "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
-         "Parlays: escribe «Parlay» y te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
-         "   O mándame el boleto directo como foto, PDF o texto (pegado, o /cargar y el texto). /si lo guarda, /no lo descarta\n"
-         "/parlays — tus parlays · /parlay Domingo (o el número) — cómo va, juego a juego (sin nada: el último)\n"
-         "/jugadas BUF — últimas 10 jugadas de ese juego · /borrar_parlay Domingo (o el número)\n"
+         "Parlays (cada semana NFL empieza otra vez en «Parlay 1»):\n"
+         "/parlay — cargar uno nuevo: te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
+         "   También escribiendo «Parlay», o mandando el boleto directo como foto, PDF o texto. /si lo guarda, /no lo descarta\n"
+         "/parlays — los de esta semana · /parlay 2 o /parlay Domingo — cómo va, juego a juego, y por qué falló cada pata perdida\n"
+         "/historico — semanas anteriores · /historico 4 — esa semana con sus razones (y /parlay 4.2 para uno de ellos)\n"
+         "/jugadas BUF — últimas 10 jugadas de ese juego · /borrar_parlay 2 (o el nombre)\n"
          "/ayuda — esta lista\n"
+         "La hoja «NFL Secret LAB — Mis parlays 2026» se llena sola cada media hora.\n"
          "Las corridas pedidas aquí se registran pero no cuentan para 31A ni para el CLV. Los parlays son por diversión: el motor no apuesta.")
+# v4.3: menú de Telegram (botón «Menú» y lista al escribir «/»)
+COMANDOS = [("parlay", "Cargar un boleto nuevo (o /parlay 2 para ver cómo va)"), ("parlays", "Tus parlays de esta semana"),
+            ("historico", "Semanas anteriores (o /historico 4)"), ("jugadas", "Últimas jugadas de un juego: /jugadas BUF"),
+            ("si", "Guardar el boleto que leí"), ("no", "Descartar el boleto que leí"), ("cancelar", "Salir de la carga del boleto"),
+            ("borrar_parlay", "Sacar un parlay de la lista"), ("estado", "Motor: qué toca y cuándo"), ("qb", "Motor: QB de cada juego"),
+            ("correr", "Motor: proyectar ahora (no cuenta)"), ("hoja", "Motor: rehacer la hoja"), ("retro", "Motor: rehacer la retrospectiva"),
+            ("piloto", "Motor: piloto del agente Gemini"), ("ayuda", "Todas las órdenes")]
+AUTO_CADA_S = 30 * 60                 # v4.3: parlay.py auto cada 30 min
+AUTO_PRIMERA_S = 120                  # la primera, 2 min después de arrancar el servicio
+AUTO_PRONTO_S = 60                    # después de /si o /borrar_parlay
+AUTO_MAX_S = 15 * 60                  # si tarda más, se detiene
+AUTO_LOG = BASE / "salidas" / "parlays" / "auto.log"
+AUTO_LOG_MAX = 1024 * 1024
 
 
 def log(msg):
@@ -185,6 +208,52 @@ def correr_parlay(args):
     if p.returncode != 0 and not texto:
         texto = "parlay.py falló; el detalle quedó en salidas/semana/orden.log."
     return p.returncode, texto
+
+
+class Auto:
+    """v4.3: lanza «parlay.py auto» como proceso aparte cada AUTO_CADA_S (uno a la vez; si pasa de AUTO_MAX_S se detiene).
+    No bloquea el bot: tick() solo mira si terminó o si toca lanzar otro. La salida va a AUTO_LOG (se rota a 1 MB)."""
+
+    def __init__(self, ahora=time.time):
+        self.reloj = ahora
+        self.p = None
+        self.t0 = 0.0
+        self.prox = self.reloj() + AUTO_PRIMERA_S
+
+    def pronto(self, s=AUTO_PRONTO_S):
+        self.prox = min(self.prox, self.reloj() + s)
+
+    def tick(self):
+        if self.p is not None:
+            if self.p.poll() is None:
+                if self.reloj() - self.t0 > AUTO_MAX_S:
+                    self.p.kill()
+                    self.p.wait()
+                    log(f"parlay auto: pasó de {AUTO_MAX_S // 60} min y lo detuve")
+                    self.p = None
+                return
+            if self.p.returncode != 0:
+                log(f"parlay auto terminó con código {self.p.returncode} (detalle en salidas/parlays/auto.log)")
+            self.p = None
+        if self.reloj() < self.prox:
+            return
+        self.prox = self.reloj() + AUTO_CADA_S
+        try:
+            AUTO_LOG.parent.mkdir(parents=True, exist_ok=True)
+            if AUTO_LOG.exists() and AUTO_LOG.stat().st_size > AUTO_LOG_MAX:
+                AUTO_LOG.replace(AUTO_LOG.with_suffix(".log.1"))
+            with open(AUTO_LOG, "a", encoding="utf-8") as fh:
+                self.p = subprocess.Popen([str(PY), "-u", str(BASE / "parlay.py"), "auto"], cwd=BASE, stdout=fh,
+                                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            self.t0 = self.reloj()
+        except Exception as e:  # noqa: BLE001 — nunca tumba el bot
+            log(f"parlay auto: no pude lanzarlo ({type(e).__name__})")
+            self.p = None
+
+
+def poner_menu(tg):
+    r = tg.llamar("setMyCommands", commands=json.dumps([{"command": c, "description": d} for c, d in COMANDOS], ensure_ascii=False))
+    log("menú de órdenes de Telegram: " + ("listo" if r.get("ok") else "no se pudo (sigue sin menú)"))
 
 
 def archivo_del_mensaje(msg):
@@ -350,15 +419,16 @@ def atender_parlay(tg, chat, texto, partes):
             args = args + [cual]
         elif texto == "/borrar_parlay":
             tg.enviar(chat, "Dime cuál: /borrar_parlay Domingo (o el número)")
-            return
+            return None
     if con_equipo:
         if not resto or not re.fullmatch(r"[A-Za-z]{2,3}", resto[0]):
             tg.enviar(chat, "Dime el equipo con su abreviatura: /jugadas BUF")
-            return
+            return None
         args = args + [resto[0].upper()]
     codigo, salida = correr_parlay(args)
     tg.enviar(chat, salida)
     log(f"orden {texto}: {'listo' if codigo == 0 else 'falló'} ({codigo})")
+    return codigo
 
 
 def main():
@@ -370,11 +440,14 @@ def main():
         time.sleep(60)
         raise SystemExit(1)
     log(f"{VERSION}: escuchando como @{yo['result'].get('username')} (solo el chat autorizado)")
+    poner_menu(tg)
+    auto = Auto()
     try:
         offset = int(OFFSET.read_text().strip())
     except Exception:  # noqa: BLE001
         offset = 0
     while True:
+        auto.tick()
         r = tg.llamar("getUpdates", espera=70, offset=offset, timeout=50)
         if not r.get("ok"):
             time.sleep(10)
@@ -439,8 +512,13 @@ def main():
             log(f"orden: {texto}")
             if texto in ("/ayuda", "/start", "/help"):
                 tg.enviar(chat, AYUDA)
+            elif texto == "/parlay" and len(partes) == 1:     # v4.3 (42i): /parlay solo empieza la carga
+                log("orden: paso «Parlay» (/parlay)")
+                empezar_flujo(tg, chat)
             elif texto in ORDENES_PARLAY:
-                atender_parlay(tg, chat, texto, partes)
+                codigo = atender_parlay(tg, chat, texto, partes)
+                if codigo == 0 and texto in ("/si", "/borrar_parlay"):
+                    auto.pronto()                              # la hoja de parlays se actualiza en ~1 min
             elif texto == "/piloto" and extra and extra[0] not in VARIANTES:
                 tg.enviar(chat, f"Variante desconocida: {extra[0]}. Usa una de: {', '.join(VARIANTES)}.")
             elif texto in ORDENES:

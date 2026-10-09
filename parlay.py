@@ -9,23 +9,31 @@ parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/regi
                    sin nombre, al guardarlo se llama «Parlay N». --formato: el que eligió Ozz; si el archivo es de otro
                    tipo, se rechaza sin gastar Gemini (código 3). «foto RUTA» sigue funcionando (orden-v4)
   si | no          guarda o descarta lo pendiente
-  lista            los parlays guardados
-  estado [N|NOMBRE]  estado de un parlay (el último si no se dice): juego a juego, P(cobrar) ahora, EV contra el cierre
+  lista            los parlays de esta semana NFL (v1.3.1, 42j: cada semana empieza otra vez en «Parlay 1»)
+  estado [N|NOMBRE|S.N]  estado de un parlay (el último si no se dice): juego a juego, P(cobrar) ahora, EV contra el
+                   cierre y, en las patas perdidas, por qué fallaron. N = número de esta semana; S.N = semana S, número N
+  historico [SEMANA]  semanas anteriores (sin semana: la lista por fecha; con semana: cada parlay con sus razones)
   jugadas EQUIPO   las últimas 10 jugadas del juego de ese equipo
   borrar N|NOMBRE  saca un parlay de la lista (queda en el registro marcado como borrado)
+  auto             (v1.3.1, lo lanza orden.py cada 30 min) resultados de cada pata, «por qué falló» con nflverse y la hoja
+                   «NFL Secret LAB — Mis parlays 2026» (una pestaña por semana; solo escribe si algo cambió)
+  hoja             rehace ahora las pestañas de esa hoja
   prueba           comprobación de la instalación (no gasta Gemini)
   diagnostico [RUTA]  prueba contra Google cada forma de la cadena del bot con la última imagen, el último PDF y un texto,
                    y muestra lo que leyó; los 400 no se cobran; ≈USD 0,05 como máximo; no cuenta para el tope
 
 Lo llama orden.py (bot del motor) como proceso aparte, igual que a semana.py. Es descriptivo: no cuenta para 31A ni para
-el CLV de 29A, no toca s2-v1 (no importa sprint2.py) y no escribe en la hoja.
+el CLV de 29A y no toca s2-v1 (no importa sprint2.py). No escribe en la hoja del motor: solo en su hoja propia de
+parlays (42k), con la misma cuenta de servicio.
 
 Fuentes: ESPN (API pública, sin llave) para el juego en vivo; nflverse (calendario y consenso) y las fotos de Pinnacle del
 bot (~/nfl_ev, solo lectura) para las probabilidades, con las funciones de semana.py: sin vig por potencia y la
 distribución del margen de la sección 3 anclada a la línea. En vivo, la aproximación registrada (registro 42).
 """
+import contextlib
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -36,7 +44,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.3 (4-oct-2026)"   # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido
+VERSION = "parlay-v1.3.1 (8-oct-2026)"   # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -56,6 +64,29 @@ ESPN_A_NFLVERSE = {"LAR": "LA", "WSH": "WAS"}
 TOPE_FOTOS_DIA = 10            # semana.ini [parlays] tope_fotos_dia; aparte del tope de las corridas T−85
 SD_TOTAL_PREVIA = 13.07        # DE del total menos el total de cierre, 2021-2025 (sección 6b, HECHO)
 PIN_MAX_H = 24.0               # foto de Pinnacle más vieja que se acepta como línea vigente antes del juego
+
+# v1.3.1 (42j, 42k)
+CANDADO = SAL / "registro.lock"                    # una escritura del registro a la vez (el bot y el modo auto)
+CANDADO_AUTO = SAL / "auto.lock"                   # un modo auto a la vez
+DATOS_P = SAL / "datos"                            # copias propias de nflverse (no comparte archivos con semana.py)
+URL_SNAPS = "https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_{}.csv"
+EDAD_PBP_H = 2.0               # jugada por jugada y snaps: se vuelven a bajar como mucho cada 2 h, y solo si falta una razón
+ESPERA_PBP_DIAS = 7            # si nflverse no publica el partido en 7 días, la razón queda «sin datos»
+UMBRAL_SORPRESA = 13           # «sorpresa grande»: 13 puntos o más peor que la línea de cierre (42k)
+RAZONES_VERSION = "r1"         # si cambia la regla, se recalculan las razones guardadas
+HOJA_PARLAYS_ID = "1gsq3QBOfkGOxIlzhSsVP8wBMeksUShxkppiEYfTOeqc"   # «NFL Secret LAB — Mis parlays 2026»; semana.ini [parlays] hoja_id
+ESTADO_HOJA = SAL / "hoja_estado.json"             # huella de cada pestaña escrita (solo se escribe lo que cambió)
+COMO_LEER = "Cómo leer"                            # pestaña fija que mantiene Claude con el conector: la EC2 no la toca
+PLAYOFFS_ESPN = {1: ("Comodines", 19), 2: ("Divisional", 20), 3: ("Conferencia", 21), 5: ("Super Bowl", 22)}
+APODO_EQ = {"ARI": "Cardinals", "ATL": "Falcons", "BAL": "Ravens", "BUF": "Bills", "CAR": "Panthers", "CHI": "Bears",
+            "CIN": "Bengals", "CLE": "Browns", "DAL": "Cowboys", "DEN": "Broncos", "DET": "Lions", "GB": "Packers",
+            "HOU": "Texans", "IND": "Colts", "JAX": "Jaguars", "KC": "Chiefs", "LA": "Rams", "LAC": "Chargers",
+            "LV": "Raiders", "MIA": "Dolphins", "MIN": "Vikings", "NE": "Patriots", "NO": "Saints", "NYG": "Giants",
+            "NYJ": "Jets", "PHI": "Eagles", "PIT": "Steelers", "SEA": "Seahawks", "SF": "49ers", "TB": "Buccaneers",
+            "TEN": "Titans", "WAS": "Commanders"}
+CAUSAS = {"balones": "Perdió más balones", "td_def": "TD de defensa o de equipos especiales", "qb": "El QB titular no terminó",
+          "lesion": "Lesiones durante el partido", "rival_mejor": "El rival movió mejor el balón", "clima": "Viento o lluvia",
+          "sin_causa": "Sin causa clara", "sorpresa": "Sorpresa grande (13+ pts contra el cierre)", "sin_datos": "Sin datos de nflverse"}
 
 # Aproximación en vivo (registro 42; ajustada con nflverse 2016-2019 y comprobada con 2020-2022).
 # La serie en curso termina en TD (+7), gol de campo (+3), TD del rival (−7) o nada, con las tasas de nflverse por down,
@@ -187,6 +218,92 @@ def _linea(x):
         return None
 
 
+# ---------------------------------------------------------------- v1.3.1: semanas NFL y candado del registro
+def clave_semana(b):
+    """(temporada, fase, semana) de ESPN: fase 1 pretemporada, 2 temporada regular, 3 playoffs (semana 1 = comodines)."""
+    return (int(b.get("temporada") or S.TEMPORADA), int(b.get("fase") or 2), int(b.get("semana") or 0))
+
+
+def nombre_semana(clave, corto=False):
+    t, f, s = clave
+    if f == 3:
+        txt = PLAYOFFS_ESPN.get(s, (f"Playoffs {s}", None))[0]
+    elif f == 1:
+        txt = f"Pretemporada {s}"
+    else:
+        txt = f"Semana {s}" if s else "Sin semana"
+    if corto and f == 2:
+        txt = str(s)
+    return txt if t == S.TEMPORADA else f"{txt} de {t}"
+
+
+def semana_nflverse(fase, semana):
+    """Semana de ESPN → semana de nflverse (en playoffs nflverse sigue con 19-22)."""
+    return PLAYOFFS_ESPN.get(semana, (None, None))[1] if int(fase or 2) == 3 else semana
+
+
+def leer_semana(txt, actual=None):
+    """«4», «semana 4», «comodines»… → clave (temporada, fase, semana) o None."""
+    t = _clave_nombre(txt).replace("semana", "").strip()
+    if t.isdigit():
+        return (S.TEMPORADA, 2, int(t))
+    for s, (nom, _) in PLAYOFFS_ESPN.items():
+        if t and _clave_nombre(nom).startswith(t):
+            return (S.TEMPORADA, 3, s)
+    return None
+
+
+def fechas_txt(isos):
+    """«8-12 oct» o «30 sep-4 oct» (Caracas) a partir de las horas de inicio."""
+    ts = sorted(t for t in (S.t_utc(x) for x in isos if x) if t)
+    if not ts:
+        return ""
+    a, b = ts[0].astimezone(CCS), ts[-1].astimezone(CCS)
+    if a.date() == b.date():
+        return f"{a.day} {S.MESES[a.month - 1]}"
+    if a.month == b.month:
+        return f"{a.day}-{b.day} {S.MESES[a.month - 1]}"
+    return f"{a.day} {S.MESES[a.month - 1]}-{b.day} {S.MESES[b.month - 1]}"
+
+
+@contextlib.contextmanager
+def candado(ruta=CANDADO, espera_s=90.0):
+    """Candado de archivo (flock). El bot y el modo auto escriben el registro solo adentro de él, por poco tiempo."""
+    import fcntl
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    with open(ruta, "a+") as fh:
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() - t0 > espera_s:
+                    raise TimeoutError("el registro de parlays está ocupado")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def media_txt(x):
+    """−2½, +4, 44½ (líneas de apuestas)."""
+    if x is None:
+        return ""
+    x = float(x)
+    s = "−" if x < 0 else ""
+    a = abs(x)
+    ent = int(math.floor(a + 1e-9))
+    return s + (f"{ent}½" if abs(a - ent - 0.5) < 1e-9 else num_txt(a))
+
+
+def linea_eq_txt(x):
+    if x is None:
+        return ""
+    return "PK" if abs(float(x)) < 1e-9 else (("+" if x > 0 else "") + media_txt(x))
+
+
 # ---------------------------------------------------------------- ESPN
 class ESPN:
     """API pública de ESPN (sin llave). `traer` se reemplaza en las pruebas."""
@@ -212,8 +329,8 @@ class ESPN:
             self._c[url] = self.traer(url)
         return self._c[url]
 
-    def tablero(self, semana=None, temporada=None):
-        url = ESPN_TABLERO + (f"?seasontype=2&week={semana}&dates={temporada}" if semana else "")
+    def tablero(self, semana=None, temporada=None, fase=2):
+        url = ESPN_TABLERO + (f"?seasontype={int(fase or 2)}&week={semana}&dates={temporada}" if semana else "")
         return self._get(url)
 
     def resumen(self, evento):
@@ -236,6 +353,7 @@ def juegos_del_tablero(tab):
     out = []
     semana = (tab.get("week") or {}).get("number")
     temporada = (tab.get("season") or {}).get("year")
+    fase = (tab.get("season") or {}).get("type") or 2
     for e in tab.get("events", []):
         c = e["competitions"][0]
         st = c.get("status", {})
@@ -251,6 +369,7 @@ def juegos_del_tablero(tab):
                         reloj=st.get("displayClock", "0:00"), local=eq.get("home", {}), visita=eq.get("away", {}),
                         situacion=c.get("situation") or {}, semana=(e.get("week") or {}).get("number", semana),
                         temporada=(e.get("season") or {}).get("year", temporada),
+                        fase=int((e.get("season") or {}).get("type") or fase),
                         cancelado=ty.get("name") in ("STATUS_CANCELED", "STATUS_POSTPONED")))
     return out
 
@@ -484,6 +603,17 @@ def nombre_pata(p):
     return f"{lado} {fi(p['linea'])} ({p.get('partido', '')}) {c}".strip()
 
 
+def pata_corta(p):
+    """v1.3.1, para la hoja y el histórico: «Bills ML», «Texans −2½», «Over 44½ (NE @ BUF)», sin la cuota."""
+    if p.get("tipo") in ("ML", "SPREAD"):
+        eq = APODO_EQ.get(p.get("equipo") or "", p.get("equipo") or "?")
+        return f"{eq} ML" if p["tipo"] == "ML" else f"{eq} {linea_eq_txt(p.get('linea'))}"
+    if p.get("tipo") == "TOTAL":
+        lado = "Over" if p.get("lado_total", "OVER") == "OVER" else "Under"
+        return f"{lado} {media_txt(p.get('linea'))}" + (f" ({p['partido']})" if p.get("partido") else "")
+    return str(p.get("texto") or "?")[:40]
+
+
 def marcador_txt(j):
     v, l = j["visita"], j["local"]
     if j["estado"] == "pre":
@@ -624,6 +754,73 @@ def _clave_nombre(x):
     return re.sub(r"\s+", " ", normal(x)).strip()
 
 
+def normalizar(lista):
+    """v1.3.1 (42j). Cada boleto lleva su semana (temporada, fase, semana de ESPN) y su número dentro de la semana (n).
+    Los de v1-v1.3 se numeran por semana en el orden en que se cargaron (1, 2, 3…); los borrados quedan con n = 0. Su
+    nombre automático con el número global («Parlay 7») pasa al de la semana («Parlay 2»); los nombres que puso Ozz no
+    cambian. Idempotente: lo ya numerado no se toca."""
+    porsem = {}
+    for b in sorted(lista, key=lambda x: x.get("id", 0)):
+        b.setdefault("fase", 2)
+        porsem.setdefault(clave_semana(b), []).append(b)
+    for bs in porsem.values():
+        tope = max([b.get("n") or 0 for b in bs if b.get("estado") != "borrado"], default=0)
+        for b in bs:
+            if b.get("n") is not None:
+                continue
+            if b.get("estado") == "borrado":
+                b["n"] = 0
+            else:
+                tope += 1
+                b["n"] = tope
+            if "nombre_auto" not in b:
+                auto = not b.get("nombre") or _clave_nombre(b["nombre"]) == _clave_nombre(f"{b.get('tipo') or 'parlay'} {b.get('id', '')}")
+                b["nombre_auto"] = bool(auto)
+                if auto and b["n"]:
+                    b["nombre"] = f"{(b.get('tipo') or 'parlay').capitalize()} {b['n']}"
+    return lista
+
+
+def resumen_semana(bs):
+    """Aciertos contra lo esperado (probabilidad de ganar al cierre de cada pata ya jugada) y causas de las perdidas."""
+    out = dict(aciertos=0, decididas=0, esperados=0.0, perdidas=0, causas={}, sin_razon=0)
+    for b in bs:
+        for p in b.get("patas", []):
+            if p.get("res") not in ("G", "P", "E"):
+                continue
+            out["decididas"] += 1
+            out["aciertos"] += p["res"] == "G"
+            out["esperados"] += p.get("p_cierre") or 0.0
+            if p["res"] == "P":
+                out["perdidas"] += 1
+                pq = p.get("por_que")
+                if not pq:
+                    out["sin_razon"] += 1
+                for c in (pq or {}).get("causas", []):
+                    out["causas"][c] = out["causas"].get(c, 0) + 1
+    return out
+
+
+def causas_txt(causas):
+    orden = sorted(causas.items(), key=lambda kv: (-kv[1], list(CAUSAS).index(kv[0]) if kv[0] in CAUSAS else 99))
+    return " · ".join(f"{CAUSAS.get(c, c)} {n}" for c, n in orden)
+
+
+def texto_por_que(p):
+    pq = p.get("por_que")
+    if pq and pq.get("texto"):
+        return pq["texto"]
+    return "sale cuando nflverse publique la jugada por jugada (suele ser al día siguiente del partido)."
+
+
+def hoja_parlays_id():
+    import configparser
+    c = configparser.ConfigParser()
+    if S.CONFIG.exists():
+        c.read(S.CONFIG)
+    return (c.get("parlays", "hoja_id", fallback="") or HOJA_PARLAYS_ID).strip()
+
+
 class Parlays:
     def __init__(self, espn=None, bot_dir=BOT_DIR, ahora=None):
         self.espn = espn or ESPN()
@@ -640,7 +837,33 @@ class Parlays:
         return self._cal
 
     def fila_nfl(self, j):
-        return self.cal().get((j.get("temporada"), j.get("semana"), frozenset((j["local"].get("abbr"), j["visita"].get("abbr")))))
+        sem = semana_nflverse(j.get("fase", 2), j.get("semana"))
+        return self.cal().get((j.get("temporada"), sem, frozenset((j["local"].get("abbr"), j["visita"].get("abbr")))))
+
+    def fila_de_pata(self, b, p):
+        """Fila de nflverse del juego de una pata guardada (por la semana del boleto y los equipos de «VIS @ LOC»)."""
+        eqs = [x.strip() for x in str(p.get("partido") or "").split("@")]
+        if len(eqs) != 2 or not all(eqs):
+            return None
+        t, f, s = clave_semana(b)
+        return self.cal().get((t, semana_nflverse(f, s), frozenset(eqs)))
+
+    def semana_actual(self):
+        """(temporada, fase, semana) de ESPN ahora (la que muestra su tablero); si ESPN no responde, la de nflverse."""
+        if getattr(self, "_actual", None) is None:
+            try:
+                tab = self.espn.tablero()
+                self._actual = (int((tab.get("season") or {}).get("year") or S.TEMPORADA), int((tab.get("season") or {}).get("type") or 2),
+                                int((tab.get("week") or {}).get("number") or 0))
+            except Exception:  # noqa: BLE001
+                try:
+                    _, g26 = S.calendario(6.0)
+                    s = S.semana_actual(g26, self.ahora)
+                    self._actual = (S.TEMPORADA, 3 if s and s > 18 else 2,
+                                    next((k for k, v in PLAYOFFS_ESPN.items() if v[1] == s), s) if s and s > 18 else (s or 0))
+                except BaseException:  # noqa: BLE001
+                    self._actual = (S.TEMPORADA, 2, 0)
+        return self._actual
 
     def ref(self, j, cierre=False):
         clave = (j["id"], cierre)
@@ -651,17 +874,34 @@ class Parlays:
 
     # -- registro
     def todos(self):
-        return _leer_json(REGISTRO, [])
+        """El registro, con la numeración por semana de v1.3.1 (normalizar; se guarda en la próxima escritura).
+        Si el archivo existe pero no se puede leer, falla (nunca se reescribe un registro dañado con una lista vacía)."""
+        if REGISTRO.exists():
+            try:
+                lista = json.loads(REGISTRO.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                raise RuntimeError(f"no puedo leer {REGISTRO.name} ({type(e).__name__}); no escribo nada") from e
+            if not isinstance(lista, list):
+                raise RuntimeError(f"{REGISTRO.name} no tiene la forma esperada; no escribo nada")
+            return normalizar(lista)
+        return []
 
     def _guardar(self, lista):
         _guardar_json(REGISTRO, lista)
 
-    def _juegos(self, semana=None, temporada=None, ids=()):
-        out = {j["id"]: j for j in juegos_del_tablero(self.espn.tablero(semana, temporada))}
+    def de_semana(self, clave, lista=None, con_borrados=False):
+        return sorted([b for b in (lista if lista is not None else self.todos())
+                       if clave_semana(b) == clave and (con_borrados or b.get("estado") != "borrado")], key=lambda b: (b.get("n") or 0, b["id"]))
+
+    def _juegos(self, semana=None, temporada=None, ids=(), fase=2):
+        out = {j["id"]: j for j in juegos_del_tablero(self.espn.tablero(semana, temporada, fase))}
         if set(ids) - set(out):
             for j in juegos_del_tablero(self.espn.tablero()):
                 out.setdefault(j["id"], j)
         return out
+
+    def juegos_de(self, b):
+        return self._juegos(b.get("semana"), b.get("temporada"), [p.get("evento") for p in b["patas"]], b.get("fase") or 2)
 
     # -- probabilidades de un boleto: 'ahora' (en vivo), 'previa' (línea vigente) o 'cierre'
     def filas(self, b, juegos, modo="ahora", con_resumen=False):
@@ -730,10 +970,12 @@ class Parlays:
         tipo = "TEASER" if "TEASER" in tipo else "PARLAY" if ("PARLAY" in tipo or len(patas) > 1) else "SENCILLA"
         b = dict(tipo=tipo, monto=_num(lectura.get("monto")), pago=_num(lectura.get("pago")), numero=str(lectura.get("numero") or "").strip(),
                  patas=patas, foto=archivo, lectura=lectura, semana=(tab.get("week") or {}).get("number"),
-                 temporada=(tab.get("season") or {}).get("year"))
+                 temporada=(tab.get("season") or {}).get("year"), fase=int((tab.get("season") or {}).get("type") or 2))
         juegos = {j["id"]: j for j in lista}
         fil = self.filas(b, juegos, modo="previa")
         probs = [(f["pg"], f["pp"]) for f in fil]
+        for f in fil:                     # v1.3.1: probabilidad de cada pata al cargarla (para la hoja)
+            f["p"]["p_carga"] = None if f["pg"] is None else round(f["pg"], 4)
         pc, ev = p_cobrar(probs), ev_boleto(b, probs)
         b["previo"] = dict(p_cobrar=pc, ev=ev, costo=None if ev is None or not b["monto"] else -ev * b["monto"],
                            hora=S.iso(self.ahora), fuentes=sorted({f.get("fuente", "") for f in fil if f.get("fuente")}))
@@ -803,31 +1045,38 @@ class Parlays:
         if pen.get("crudo"):          # leído por Gemini pero sin cruzar (ESPN no respondió): se cruza ahora y se vuelve a preguntar
             return self.preparar(pen["crudo"], archivo=pen.get("archivo"), nombre=pen.get("nombre"))
         boletos = pen.get("boletos") or ([pen["boleto"]] if pen.get("boleto") else [])
-        lista = self.todos()
-        usados = {_clave_nombre(nombre_de(x)) for x in lista if x.get("estado") != "borrado"}
         hechos = []
-        for b in boletos:
-            b.update(id=1 + max([x["id"] for x in lista], default=0), cargado=S.iso(self.ahora), estado="vivo", version=VERSION)
-            base = limpiar_nombre(b.get("nombre")) or f"{b['tipo'].capitalize()} {b['id']}"
-            nom, k = base, 2
-            while _clave_nombre(nom) in usados or nom.isdigit():
-                nom, k = f"{base} ({k})", k + 1
-            b["nombre"] = nom
-            usados.add(_clave_nombre(nom))
-            lista.append(b)
-            hechos.append(b)
-        self._guardar(lista)
-        PENDIENTE.unlink()
-        def automatico(b):
-            return b["nombre"].lower() == f"{b['tipo']} {b['id']}".lower()
+        with candado():
+            lista = self.todos()
+            for b in boletos:
+                b.setdefault("fase", 2)
+                if not b.get("semana"):           # sin semana de ESPN (raro): la de ahora
+                    b["temporada"], b["fase"], b["semana"] = self.semana_actual()
+                clave = clave_semana(b)
+                dela = self.de_semana(clave, lista)
+                b.update(id=1 + max([x["id"] for x in lista], default=0), n=1 + max([x.get("n") or 0 for x in dela], default=0),
+                         cargado=S.iso(self.ahora), estado="vivo", version=VERSION)
+                propio = limpiar_nombre(b.get("nombre"))
+                base = propio or f"{b['tipo'].capitalize()} {b['n']}"
+                b["nombre_auto"] = not propio
+                usados = {_clave_nombre(nombre_de(x)) for x in dela}
+                nom, k = base, 2
+                while _clave_nombre(nom) in usados or nom.isdigit():
+                    nom, k = f"{base} ({k})", k + 1
+                b["nombre"] = nom
+                lista.append(b)
+                hechos.append(b)
+            self._guardar(lista)
+            PENDIENTE.unlink()
+        sem = nombre_semana(clave_semana(hechos[0])).lower()
         if len(hechos) == 1:
             b = hechos[0]
-            pide = f"/parlay {b['id']}" if automatico(b) else f"/parlay {b['nombre']} o /parlay {b['id']}"
-            return f"Guardado como «{b['nombre']}» (n.º {b['id']}). Pide {pide} cuando quieras ver cómo va."
+            pide = f"/parlay {b['n']}" if b["nombre_auto"] else f"/parlay {b['nombre']} o /parlay {b['n']}"
+            return f"Guardado como «{b['nombre']}» ({sem}, n.º {b['n']}). Pide {pide} cuando quieras ver cómo va."
         b = hechos[0]
-        pide = (f"Pide /parlay y el número para ver cada uno (por ejemplo, /parlay {b['id']})." if automatico(b) else
+        pide = (f"Pide /parlay y el número para ver cada uno (por ejemplo, /parlay {b['n']})." if b["nombre_auto"] else
                 f"Pide /parlay {b['nombre']} (o su número) para ver cada uno.")
-        return "Guardados: " + " · ".join(f"«{x['nombre']}» (n.º {x['id']})" for x in hechos) + ". " + pide
+        return f"Guardados ({sem}): " + " · ".join(f"«{x['nombre']}» (n.º {x['n']})" for x in hechos) + ". " + pide
 
     def descartar(self):
         if PENDIENTE.exists():
@@ -836,78 +1085,155 @@ class Parlays:
         return "No había nada por confirmar."
 
     def buscar(self, ref, lista=None):
-        """ref: número o nombre (sin importar mayúsculas ni acentos). Devuelve (boleto, None) o (None, mensaje).
+        """ref (v1.3.1): número de esta semana («2»), semana y número («4.2»), o nombre (sin importar mayúsculas ni
+        acentos; primero en esta semana, después en las anteriores). Devuelve (boleto, None) o (None, mensaje).
         Un nombre incompleto sirve si apunta a uno solo («domingo» → «Domingo 1» si no hay otro)."""
         lista = [b for b in (lista if lista is not None else self.todos()) if b.get("estado") != "borrado"]
         ref = str(ref or "").strip()
-        if ref.isdigit():
-            b = next((x for x in lista if x["id"] == int(ref)), None)
-            return (b, None) if b else (None, f"No encuentro el parlay {ref}. /parlays muestra la lista.")
+        actual = self.semana_actual()
+        m = re.fullmatch(r"(\d{1,2})\s*[.\-/]\s*(\d{1,3})", ref)
+        if ref.isdigit() or m:
+            clave = (S.TEMPORADA, 2, int(m.group(1))) if m else actual
+            n = int(m.group(2)) if m else int(ref)
+            b = next((x for x in self.de_semana(clave, lista) if x.get("n") == n), None)
+            if b:
+                return b, None
+            otras = sorted({clave_semana(x) for x in lista if x.get("n") == n and clave_semana(x) != clave}, reverse=True)
+            pista = (f" ¿Era de la {nombre_semana(otras[0]).lower()}? /parlay {otras[0][2]}.{n}" if otras and otras[0][1] == 2 else "")
+            return None, f"En la {nombre_semana(clave).lower()} no tienes el parlay {n}.{pista} /parlays muestra los de esta semana y /historico los anteriores."
         k = _clave_nombre(ref)
         if not k:
             return None, "Dime cuál: el número o el nombre."
-        exactos = [x for x in lista if _clave_nombre(nombre_de(x)) == k]
-        if exactos:
-            return exactos[-1], None
-        cand = [x for x in lista if _clave_nombre(nombre_de(x)).startswith(k)]
-        if len(cand) == 1:
-            return cand[0], None
-        if cand:
-            return None, "Hay varios: " + " · ".join(f"/parlay {nombre_de(x)}" for x in cand[-6:])
-        return None, f"No encuentro «{ref}». /parlays muestra la lista."
+        for grupo in (self.de_semana(actual, lista), sorted(lista, key=lambda x: (clave_semana(x), x["id"]))):
+            exactos = [x for x in grupo if _clave_nombre(nombre_de(x)) == k]
+            if exactos:
+                return exactos[-1], None
+            cand = [x for x in grupo if _clave_nombre(nombre_de(x)).startswith(k)]
+            if len(cand) == 1:
+                return cand[0], None
+            if cand:
+                return None, "Hay varios: " + " · ".join(f"/parlay {self.ref_corta(x, actual)}" for x in cand[-6:])
+        return None, f"No encuentro «{ref}». /parlays muestra los de esta semana y /historico los anteriores."
+
+    def ref_corta(self, b, actual=None):
+        """Cómo pedir este boleto: el nombre si es de esta semana; si no, «semana.número»."""
+        actual = actual or self.semana_actual()
+        if clave_semana(b) == actual:
+            return str(b.get("n")) if b.get("nombre_auto") else nombre_de(b)
+        t, f, s = clave_semana(b)
+        return f"{s}.{b.get('n')}" if f == 2 and t == S.TEMPORADA else nombre_de(b)
 
     def borrar(self, ref):
-        lista = self.todos()
-        b, msg = self.buscar(ref, lista)
-        if b is None:
-            return msg.replace("/parlay ", "/borrar_parlay ")
-        b.update(estado="borrado", borrado=S.iso(self.ahora))
-        self._guardar(lista)
-        return f"«{nombre_de(b)}» (n.º {b['id']}) borrado de la lista (queda en el registro marcado como borrado)."
-
-    # -- cierre: anota el resultado cuando se decide
-    def cerrar_resultados(self):
-        lista = self.todos()
-        cambio = False
-        for b in lista:
-            if b.get("estado") != "vivo":
-                continue
-            juegos = self._juegos(b.get("semana"), b.get("temporada"), [p.get("evento") for p in b["patas"]])
-            fa = self.filas(b, juegos, modo="ahora")
-            if any(f["j"] is None for f in fa):
-                continue
-            perdida = any(f["j"]["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 for f in fa)
-            if not perdida and not all(f["j"]["estado"] == "post" for f in fa):
-                continue
-            fc = self.filas(b, juegos, modo="cierre")
-            probs_c = [(f["pg"], f["pp"]) for f in fc]
-            ev_c = ev_boleto(b, probs_c)
-            decididas = [f for f in fa if f["j"]["estado"] == "post"]
-            b.update(estado="perdido" if perdida else "cobrado", cerrado=S.iso(self.ahora),
-                     resultado=("perdido" if perdida else "cobró") + f" · acertó {sum(1 for f in decididas if f['pg'] == 1.0)} de {len(decididas)} patas ya jugadas",
-                     cierre=dict(p_cobrar=p_cobrar(probs_c), ev=ev_c, costo=None if ev_c is None or not b.get("monto") else -ev_c * b["monto"],
-                                 aciertos=sum(1 for f in decididas if f["pg"] == 1.0), decididas=len(decididas),
-                                 esperados=round(sum(fc[i]["pg"] or 0 for i, f in enumerate(fa) if f["j"]["estado"] == "post"), 2)))
-            cambio = True
-        if cambio:
+        with candado():
+            lista = self.todos()
+            b, msg = self.buscar(ref, lista)
+            if b is None:
+                return msg.replace("/parlay ", "/borrar_parlay ")
+            b.update(estado="borrado", borrado=S.iso(self.ahora))
             self._guardar(lista)
+        return (f"«{nombre_de(b)}» ({nombre_semana(clave_semana(b)).lower()}, n.º {b.get('n')}) borrado de la lista "
+                "(queda en el registro marcado como borrado).")
+
+    # -- resultados (v1.3.1): cada pata ya jugada guarda su resultado; el boleto se cierra cuando se decide
+    def resultado_pata(self, f, fc_f):
+        """Campos que guarda una pata cuyo juego terminó: resultado (G, P o E), marcador, línea de cierre (Pinnacle sin vig
+        si el bot la tiene; si no, el consenso de nflverse), puntos contra el cierre y probabilidad de ganar al cierre."""
+        p, j = f["p"], f["j"]
+        loc, vis = j["local"], j["visita"]
+        pl_, pv = int(loc.get("puntos") or 0), int(vis.get("puntos") or 0)
+        out = dict(res="E" if f["pp"] == 1.0 else "G" if f["pg"] == 1.0 else "P",
+                   marcador=f"{vis.get('apodo') or vis.get('abbr')} {pv} - {pl_} {loc.get('apodo') or loc.get('abbr')}",
+                   p_cierre=None if fc_f is None or fc_f.get("pg") is None else round(fc_f["pg"], 4), final=S.iso(self.ahora))
+        if j.get("cancelado"):
+            out["res"] = "E"
+        fila = self.fila_nfl(j)
+        if fila:
+            out["gid"] = fila["game_id"]
+        r = self.ref(j, cierre=True)
+        if p["tipo"] in ("ML", "SPREAD"):
+            es_loc = p["equipo"] == loc.get("abbr")
+            out.update(puntos_eq=pl_ if es_loc else pv, puntos_ri=pv if es_loc else pl_)
+            out["margen"] = out["puntos_eq"] - out["puntos_ri"]
+            if r is not None and r.ok():
+                h = float(r.r["hcp_local"])
+                out["cierre_linea"] = round(h if es_loc else -h, 2)
+                out["cierre_fuente"] = r.fuente
+                out["contra_cierre"] = round(out["margen"] + out["cierre_linea"], 2)
+        else:
+            out["total"] = pl_ + pv
+            if r is not None and r.total is not None:
+                out["cierre_linea"] = float(r.total)
+                out["cierre_fuente"] = "consenso nflverse"
+                d = out["total"] - r.total
+                out["contra_cierre"] = round(d if p.get("lado_total", "OVER") == "OVER" else -d, 2)
+        return out
+
+    def actualizar(self):
+        """Lee ESPN fuera del candado y escribe adentro: (1) cada pata cuyo juego terminó guarda resultado_pata; (2) el boleto
+        vivo se cierra (perdido o cobrado) cuando se decide, como en v1.3. Devuelve cuántos boletos cambiaron."""
+        cambios = {}
+        for b in self.todos():
+            if b.get("estado") == "borrado":
+                continue
+            falta = [p for p in b["patas"] if p.get("res") is None]
+            if b.get("estado") != "vivo" and not falta:
+                continue
+            juegos = self.juegos_de(b)
+            fa = self.filas(b, juegos, modo="ahora")
+            fc = None
+            cb, cp = {}, {}
+            for i, f in enumerate(fa):
+                if f["p"].get("res") is None and f["j"] is not None and f["j"]["estado"] == "post":
+                    fc = fc or self.filas(b, juegos, modo="cierre")
+                    cp[f["p"]["k"]] = self.resultado_pata(f, fc[i])
+            if b.get("estado") == "vivo" and not any(f["j"] is None for f in fa):
+                perdida = any(f["j"]["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 for f in fa)
+                if perdida or all(f["j"]["estado"] == "post" for f in fa):
+                    fc = fc or self.filas(b, juegos, modo="cierre")
+                    probs_c = [(f["pg"], f["pp"]) for f in fc]
+                    ev_c = ev_boleto(b, probs_c)
+                    decididas = [f for f in fa if f["j"]["estado"] == "post"]
+                    cb = dict(estado="perdido" if perdida else "cobrado", cerrado=S.iso(self.ahora),
+                              resultado=("perdido" if perdida else "cobró") + f" · acertó {sum(1 for f in decididas if f['pg'] == 1.0)} de {len(decididas)} patas ya jugadas",
+                              cierre=dict(p_cobrar=p_cobrar(probs_c), ev=ev_c, costo=None if ev_c is None or not b.get("monto") else -ev_c * b["monto"],
+                                          aciertos=sum(1 for f in decididas if f["pg"] == 1.0), decididas=len(decididas),
+                                          esperados=round(sum(fc[i]["pg"] or 0 for i, f in enumerate(fa) if f["j"]["estado"] == "post"), 2)))
+            if cb or cp:
+                cambios[b["id"]] = (cb, cp)
+        if cambios:
+            with candado():
+                lista = self.todos()
+                for b in lista:
+                    cb, cp = cambios.get(b["id"], ({}, {}))
+                    if cb and b.get("estado") == "vivo":
+                        b.update(cb)
+                    for p in b["patas"]:
+                        if p.get("k") in cp and p.get("res") is None:
+                            p.update(cp[p["k"]])
+                self._guardar(lista)
+        return len(cambios)
+
+    cerrar_resultados = actualizar        # nombre de v1-v1.3
 
     # -- textos para Telegram
-    def texto_estado(self, ref=None):
+    def _actualizar_callado(self):
         try:
-            self.cerrar_resultados()
-        except Exception as e:  # noqa: BLE001
-            S.log(f"parlay: no pude cerrar resultados ({type(e).__name__})")
+            self.actualizar()
+        except Exception as e:  # noqa: BLE001 — al log del servicio (stderr), no al mensaje
+            print(f"parlay: no pude actualizar resultados ({type(e).__name__}: {str(e)[:120]})", file=sys.stderr)
+
+    def texto_estado(self, ref=None):
+        self._actualizar_callado()
         lista = [b for b in self.todos() if b.get("estado") != "borrado"]
         if not lista:
             return "No hay parlays guardados. Mándame el boleto de BetOnline (foto, PDF o texto)."
         if ref is None or not str(ref).strip():
-            b = lista[-1]
+            b = max(lista, key=lambda x: x["id"])
         else:
             b, msg = self.buscar(ref, lista)
             if b is None:
                 return msg
-        juegos = self._juegos(b.get("semana"), b.get("temporada"), [p.get("evento") for p in b["patas"]])
+        juegos = self.juegos_de(b)
         fa = self.filas(b, juegos, modo="ahora", con_resumen=True)
         fc = self.filas(b, juegos, modo="cierre")
         pc = p_cobrar([(f["pg"], f["pp"]) for f in fa])
@@ -919,7 +1245,8 @@ class Parlays:
         per = len(post) - gan - push
         vivas = len(fa) - len(post)
         estado = "PERDIDO" if per else ("COBRADO" if vivas == 0 else "vivo")
-        out = [f"🎟 {nombre_de(b)} (n.º {b['id']}) · {b.get('tipo', 'parlay').lower()} de {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
+        out = [f"🎟 {nombre_de(b)} ({nombre_semana(clave_semana(b)).lower()}, n.º {b.get('n')}) · {b.get('tipo', 'parlay').lower()} de "
+               f"{len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
                + (f" · boleto {b['numero']}" if b.get("numero") else ""),
                f"{estado}: {gan} ganadas · {per} perdidas · {push} push · {vivas} por decidir"]
         if estado == "vivo":
@@ -937,36 +1264,92 @@ class Parlays:
             if j["estado"] != "post" and f["pg"] is not None:
                 lin += f" · P ≈ {pct(f['pg'] + (f['pp'] or 0))}"
             out.append(lin)
+            if j["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 and not j.get("cancelado"):
+                out.append("   por qué: " + texto_por_que(p))
             if j["estado"] == "in" and j["id"] not in visto:
                 visto.add(j["id"])
                 ev = estado_vivo(j, f["res"])
                 s, u = situacion_txt(j, ev), (ev.get("ultima") or "").strip()
                 if s or u:
                     out.append("   " + " · ".join(x for x in (s, ("última: " + u[:100]) if u else "") if x))
-        out += ["", "P en juego: aproximación (registro 42), no validada. Antes del juego: Pinnacle sin vig o consenso. Por diversión: el motor no apuesta (31A)."]
+        out += ["", "P en juego: aproximación (registro 42), no validada. Antes del juego: Pinnacle sin vig o consenso. "
+                "Por qué falló: jugada por jugada de nflverse, sin IA. Por diversión: el motor no apuesta (31A)."]
         return "\n".join(out)
 
     def texto_lista(self):
-        try:
-            self.cerrar_resultados()
-        except Exception as e:  # noqa: BLE001
-            S.log(f"parlay: no pude cerrar resultados ({type(e).__name__})")
-        lista = [b for b in self.todos() if b.get("estado") != "borrado"]
+        """v1.3.1 (42j): solo la semana NFL de ahora; las anteriores, en /historico."""
+        self._actualizar_callado()
+        todos = [b for b in self.todos() if b.get("estado") != "borrado"]
+        actual = self.semana_actual()
+        lista = self.de_semana(actual, todos)
+        anteriores = sorted({clave_semana(b) for b in todos if clave_semana(b) != actual}, reverse=True)
+        pie = (f"Semanas anteriores: /historico (por ejemplo, /historico {nombre_semana(anteriores[0], corto=True).lower()})"
+               if anteriores else "")
         if not lista:
-            return "No hay parlays guardados. Mándame el boleto de BetOnline (foto, PDF o texto)."
-        out = ["Tus parlays (el último primero):"]
-        for b in reversed(lista[-12:]):
+            return "\n".join([f"{nombre_semana(actual)}: todavía no cargaste parlays. Escribe /parlay para cargar uno."] + ([pie] if pie else []))
+        out = [f"Tus parlays de la {nombre_semana(actual).lower()} ({fechas_txt(p.get('inicio') for b in lista for p in b['patas'])}):"]
+        for b in lista:
             pr = b.get("previo", {})
-            fin = b.get("resultado") or f"en juego · /parlay {b['id']}"
-            out.append(f"{b['id']} · «{nombre_de(b)}» · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → "
+            fin = b.get("resultado") or f"en juego · /parlay {self.ref_corta(b, actual)}"
+            out.append(f"{b.get('n')} · «{nombre_de(b)}» · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → "
                        f"{dinero(b.get('pago'))} · P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
-        cer = [b for b in lista if b.get("cierre")]
-        if cer:
-            ac = sum(b["cierre"]["aciertos"] for b in cer)
-            es = sum(b["cierre"]["esperados"] for b in cer)
-            n = sum(b["cierre"].get("decididas", 0) for b in cer)
-            out += ["", f"Tus patas ya decididas: acertaste {ac} de {n}; según el cierre se esperaban {fi(round(es, 1))}."]
+        r = resumen_semana(lista)
+        if r["decididas"]:
+            out += ["", f"Patas ya jugadas: acertaste {r['aciertos']} de {r['decididas']}; según el cierre se esperaban {fi(round(r['esperados'], 1))}."]
+        if pie:
+            out += ["", pie]
         return "\n".join(out)
+
+    def texto_historico(self, arg=None):
+        """v1.3.1 (42j): sin semana, la lista de semanas por fecha (la más nueva primero); con semana, cada parlay con el
+        resultado de cada pata y, en las perdidas, por qué falló."""
+        self._actualizar_callado()
+        todos = [b for b in self.todos() if b.get("estado") != "borrado"]
+        if not todos:
+            return "No hay parlays guardados todavía."
+        actual = self.semana_actual()
+        semanas = sorted({clave_semana(b) for b in todos}, reverse=True)
+        enlace = f"La hoja con todas las semanas: https://docs.google.com/spreadsheets/d/{hoja_parlays_id()}"
+        if not arg or not str(arg).strip():
+            out = ["Tus semanas (la más nueva primero):"]
+            for c in semanas:
+                bs = self.de_semana(c, todos)
+                r = resumen_semana(bs)
+                cob = sum(1 for b in bs if b.get("estado") == "cobrado")
+                per = sum(1 for b in bs if b.get("estado") == "perdido")
+                viv = len(bs) - cob - per
+                partes = [f"{len(bs)} parlay{'s' if len(bs) != 1 else ''}: {cob} cobrado{'s' if cob != 1 else ''}, {per} perdido{'s' if per != 1 else ''}"
+                          + (f", {viv} en juego" if viv else "")]
+                if r["decididas"]:
+                    partes.append(f"patas {r['aciertos']} de {r['decididas']} (se esperaban {fi(round(r['esperados'], 1))})")
+                out.append(f"• {nombre_semana(c)} ({fechas_txt(p.get('inicio') for b in bs for p in b['patas'])})"
+                           + (" · esta semana" if c == actual else "") + " · " + " · ".join(partes)
+                           + f" → /historico {nombre_semana(c, corto=True).lower()}")
+            return "\n".join(out + ["", enlace])
+        clave = leer_semana(arg)
+        if clave is None or clave not in semanas:
+            return (f"No tengo parlays de «{str(arg).strip()[:20]}». Semanas con parlays: "
+                    + ", ".join(nombre_semana(c, corto=True) for c in semanas) + ". Por ejemplo: /historico " + nombre_semana(semanas[0], corto=True).lower())
+        bs = self.de_semana(clave, todos)
+        r = resumen_semana(bs)
+        out = [f"{nombre_semana(clave)} ({fechas_txt(p.get('inicio') for b in bs for p in b['patas'])})"
+               + (f" · patas: acertaste {r['aciertos']} de {r['decididas']} (se esperaban {fi(round(r['esperados'], 1))})" if r["decididas"] else "")]
+        if r["causas"]:
+            out.append("Por qué fallaron: " + causas_txt(r["causas"]))
+        for b in bs:
+            ci = b.get("cierre") or {}
+            est = {"cobrado": "✅ COBRADO", "perdido": "❌ PERDIDO"}.get(b.get("estado"), "⏳ en juego")
+            out += ["", f"{b.get('n')} · «{nombre_de(b)}» · {b.get('tipo', 'parlay').lower()} de {len(b['patas'])} patas · "
+                        f"{dinero(b.get('monto'))} → {dinero(b.get('pago'))} · {est}"]
+            if ci:
+                out.append(f"   P(cobrar) al cierre {pct(ci.get('p_cobrar'), 2)} · EV contra el cierre {pct(ci.get('ev'), 1)} · {costo_txt(ci.get('costo'))}")
+            for p in b["patas"]:
+                ic = {"G": "✅", "P": "❌", "E": "🟡"}.get(p.get("res"), "⏳")
+                lin = f"   {ic} {pata_corta(p)}" + (f" · {p['marcador']}" if p.get("marcador") else (f" · {p.get('partido')}" if p.get("partido") else ""))
+                out.append(lin)
+                if p.get("res") == "P":
+                    out.append("      por qué: " + texto_por_que(p))
+        return "\n".join(out + ["", enlace])
 
     def texto_jugadas(self, equipo, n=10):
         eq = _abbr((equipo or "").upper().strip())
@@ -989,6 +1372,449 @@ class Parlays:
             out.append(f"{cu} {p['reloj']} · {p['ataque']} · {dd}{'🏈 ' if p['anota'] else ''}{p['texto'][:120]} "
                        f"({j['visita']['abbr']} {p['visita']}-{p['local']} {j['local']['abbr']})")
         return "\n".join(out)
+
+
+# ---------------------------------------------------------------- v1.3.1 (42k): por qué falló cada pata, sin IA
+COLS_RAZONES = ["game_id", "play_id", "posteam", "defteam", "play_type", "yards_gained", "interception", "fumble_lost",
+                "touchdown", "td_team", "return_touchdown", "qb_dropback", "passer_player_name", "rusher_player_name", "desc",
+                "wind", "weather", "roof"]
+
+
+def _norm_jug(x):
+    return re.sub(r"[^a-z]", "", re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", (x or "").lower()))
+
+
+def _qb_txt(x):
+    return str(x or "?").replace(".", ". ").replace("  ", " ")
+
+
+def _edad_dias(iso, ahora):
+    t = S.t_utc(iso)
+    return 0.0 if t is None else (ahora - t).total_seconds() / 86400
+
+
+class Razones:
+    """Hechos de un partido en la jugada por jugada de nflverse y los snaps (PFR vía nflverse). Las mismas reglas con las
+    que Claude llenó la hoja de la semana 4 (registro 42, 42k), con una corrección: los balones perdidos en jugadas de
+    patada de despeje no se le cuentan al equipo que pateó (nflverse lo pone como posteam)."""
+
+    def __init__(self, pbp=None, snaps=None):
+        self.pbp, self.snaps, self._p = pbp, snaps, {}
+
+    def cargar(self, max_edad_h=EDAD_PBP_H):
+        import polars as pl
+        DATOS_P.mkdir(parents=True, exist_ok=True)
+        rp, rs = DATOS_P / f"pbp_{S.TEMPORADA}.parquet", DATOS_P / f"snap_counts_{S.TEMPORADA}.csv"
+        if S.bajar(S.URL_PBP.format(S.TEMPORADA), rp, 100_000, max_edad_h):
+            cols = [c for c in COLS_RAZONES if c in pl.read_parquet_schema(rp)]
+            self.pbp = pl.read_parquet(rp, columns=cols)
+        if S.bajar(URL_SNAPS.format(S.TEMPORADA), rs, 10_000, max_edad_h):
+            self.snaps = pl.read_csv(rs, infer_schema_length=0)
+        self._p = {}
+        return self
+
+    def juego(self, gid):
+        import polars as pl
+        if gid not in self._p:
+            self._p[gid] = None if self.pbp is None else self.pbp.filter(pl.col("game_id") == gid)
+        p = self._p[gid]
+        return p if p is not None and p.height >= 50 else None      # menos de 50 jugadas: todavía incompleto
+
+    def con_snaps(self, gid):
+        import polars as pl
+        return self.snaps is not None and self.snaps.filter(pl.col("game_id") == gid).height > 0
+
+    def hechos(self, gid, eq, rival):
+        """Balones perdidos, TD de defensa o especiales, yardas por jugada, QB que no terminó y titulares lesionados."""
+        import polars as pl
+        p = self.juego(gid)
+        tov = p.filter(pl.col("play_type").fill_null("") != "punt")
+        to = {t: int(tov.filter(pl.col("posteam") == t).select((pl.col("interception").fill_null(0) + pl.col("fumble_lost").fill_null(0)).sum()).item() or 0)
+              for t in (eq, rival)}
+        td = p.filter((pl.col("touchdown") == 1) & pl.col("td_team").is_not_null() &
+                      ((pl.col("td_team") != pl.col("posteam")) | (pl.col("return_touchdown") == 1)))
+        tdd = {t: td.filter(pl.col("td_team") == t).height for t in (eq, rival)}
+        jug = p.filter(pl.col("play_type").is_in(["pass", "run"]) & pl.col("yards_gained").is_not_null())
+        ypp = {t: (jug.filter(pl.col("posteam") == t)["yards_gained"].mean() or 0.0) for t in (eq, rival)}
+        db = p.filter((pl.col("qb_dropback") == 1) & (pl.col("posteam") == eq)).sort("play_id")
+        qbs = db.with_columns(pl.coalesce(["passer_player_name", "rusher_player_name"]).alias("qb"))["qb"].drop_nulls().to_list()
+        qb_salio = None
+        if qbs:
+            cnt = {q: qbs.count(q) for q in set(qbs)}
+            otros = {q: c for q, c in cnt.items() if q != qbs[0] and c >= 5}
+            if otros:
+                qb_salio = (qbs[0], max(otros, key=otros.get))
+        lesionados = []
+        if self.con_snaps(gid):
+            abrevs = set()
+            for d in p["desc"].drop_nulls().to_list():
+                for t, ab in re.findall(r"\b([A-Z]{2,3})-\d+-([A-Za-z][A-Za-z'.\- ]*?) was injured", d):
+                    if t == eq:
+                        abrevs.add(ab.strip())
+            s = self.snaps.filter(pl.col("team") == eq)
+            for nom in s["player"].unique().to_list():
+                part = {r["game_id"]: max(float(r["offense_pct"] or 0), float(r["defense_pct"] or 0))
+                        for r in s.filter(pl.col("player") == nom).to_dicts()}
+                antes = [v for k, v in part.items() if k < gid]
+                if gid not in part or part[gid] >= 0.5 or not antes or sum(antes) / len(antes) < 0.5:
+                    continue
+                pr = str(nom).split()
+                if len(pr) < 2:
+                    continue
+                for ab in abrevs:
+                    if "." in ab:
+                        pre, ape = ab.split(".", 1)
+                        if _norm_jug(ape) == _norm_jug(" ".join(pr[1:])) and _norm_jug(pr[0]).startswith(_norm_jug(pre)):
+                            lesionados.append(nom)
+                            break
+        return dict(to=to, tdd=tdd, ypp=ypp, qb=qb_salio, les=sorted(lesionados))
+
+    def clima(self, gid):
+        p = self.juego(gid)
+        fila = p.head(1).to_dicts()[0] if p is not None and p.height else {}
+        techo = str(fila.get("roof") or "").lower()
+        if techo in ("dome", "closed"):
+            return None, False
+        w = fila.get("wind")
+        txt = str(fila.get("weather") or "").lower()
+        return (int(w) if w is not None else None), any(x in txt for x in ("rain", "snow", "shower", "sleet"))
+
+    def explicar(self, gid, p, local, visita, ahora=None):
+        """Texto y causas de una pata perdida; None si nflverse todavía no publicó el partido."""
+        if self.juego(gid) is None:
+            return None
+        ahora = ahora or ahora_utc()
+        partes, causas = [], []
+        contra = p.get("contra_cierre")
+        if p["tipo"] in ("ML", "SPREAD"):
+            eq = p["equipo"]
+            rival = visita if eq == local else local
+            h = self.hechos(gid, eq, rival)
+            pe, pr = int(p.get("puntos_eq") or 0), int(p.get("puntos_ri") or 0)
+            m = pe - pr
+            if p["tipo"] == "ML":
+                partes.append(f"{'Perdió' if m < 0 else 'Empató'} {pe}-{pr}.")
+            else:
+                partes.append(f"{'Perdió' if m < 0 else 'Ganó' if m > 0 else 'Empató'} {pe}-{pr} y no cubrió el {linea_eq_txt(p.get('linea'))}.")
+            if h["to"][eq] - h["to"][rival] >= 2:
+                partes.append(f"Perdió más balones ({h['to'][eq]} contra {h['to'][rival]}).")
+                causas.append("balones")
+            if h["tdd"][rival]:
+                partes.append(f"Los {APODO_EQ.get(rival, rival)} anotaron {h['tdd'][rival]} TD de defensa o de equipos especiales.")
+                causas.append("td_def")
+            if h["qb"]:
+                partes.append(f"Su QB titular ({_qb_txt(h['qb'][0])}) no terminó el partido; entró {_qb_txt(h['qb'][1])}.")
+                causas.append("qb")
+            if h["les"]:
+                partes.append("Se lesionaron titulares durante el partido: " + ", ".join(h["les"][:3]) + ".")
+                causas.append("lesion")
+            if h["ypp"][rival] - h["ypp"][eq] >= 1.0:
+                partes.append(f"Los {APODO_EQ.get(rival, rival)} movieron mejor el balón: {fi(round(h['ypp'][rival], 1))} yardas por jugada "
+                              f"contra {fi(round(h['ypp'][eq], 1))}.")
+                causas.append("rival_mejor")
+            if not causas:
+                if m < 0:
+                    partes.append("Sin una causa clara en los datos: " + (f"partido parejo, se decidió por {-m}." if -m <= 8 else f"perdió por {-m}."))
+                else:
+                    nec = media_txt(abs(float(p.get("linea") or 0)))
+                    partes.append(f"Sin una causa clara en los datos: {'ganó por ' + str(m) if m > 0 else 'empató'} y necesitaba ganar por más de {nec}.")
+                causas.append("sin_causa")
+            if contra is not None and contra <= -UMBRAL_SORPRESA:
+                partes.append(f"Sorpresa grande: {num_txt(abs(contra))} puntos peor que la línea de cierre.")
+                causas.append("sorpresa")
+        else:
+            over = p.get("lado_total", "OVER") == "OVER"
+            tot, linea = int(p.get("total") or 0), float(p.get("linea") or 0)
+            d = tot - linea
+            partes.append(f"Se anotaron {tot} puntos; la línea era {media_txt(linea)} ({media_txt(abs(d))} {'menos' if d < 0 else 'más'}).")
+            h1, h2 = self.hechos(gid, local, visita), self.hechos(gid, visita, local)
+            to = h1["to"][local] + h1["to"][visita]
+            if over:
+                viento, lluvia = self.clima(gid)
+                if viento is not None and viento >= 15:
+                    partes.append(f"Hubo viento fuerte ({viento} mph).")
+                    causas.append("clima")
+                elif lluvia:
+                    partes.append("Jugaron con lluvia o nieve.")
+                    causas.append("clima")
+                for eq, h in ((local, h1), (visita, h2)):
+                    if h["qb"]:
+                        partes.append(f"El QB titular de los {APODO_EQ.get(eq, eq)} ({_qb_txt(h['qb'][0])}) no terminó el partido; entró {_qb_txt(h['qb'][1])}.")
+                        if "qb" not in causas:
+                            causas.append("qb")
+                if to >= 4:
+                    partes.append(f"Hubo {to} balones perdidos entre los dos.")
+                    causas.append("balones")
+            else:
+                n_td = h1["tdd"][local] + h1["tdd"][visita]
+                if n_td:
+                    partes.append(f"Hubo {n_td} TD de defensa o de equipos especiales.")
+                    causas.append("td_def")
+                if to >= 4:
+                    partes.append(f"Hubo {to} balones perdidos entre los dos (campos cortos).")
+                    causas.append("balones")
+            if not causas:
+                partes.append("Sin una causa clara en los datos.")
+                causas.append("sin_causa")
+            if contra is not None and contra <= -UMBRAL_SORPRESA:
+                partes.append(f"Sorpresa grande: {num_txt(abs(contra))} puntos {'menos' if over else 'más'} que el total de cierre.")
+                causas.append("sorpresa")
+        return dict(texto=" ".join(partes), causas=causas, parcial=not self.con_snaps(gid), version=RAZONES_VERSION, hora=S.iso(ahora))
+
+
+def explicar_pendientes(P, R=None):
+    """Razón de cada pata perdida que todavía no la tiene (o la tiene incompleta, sin snaps). Baja nflverse solo si hace
+    falta. Escribe adentro del candado. Devuelve cuántas razones nuevas guardó."""
+    pend = []
+    for b in P.todos():
+        if b.get("estado") == "borrado":
+            continue
+        for p in b["patas"]:
+            if p.get("res") != "P":
+                continue
+            pq = p.get("por_que") or {}
+            if pq and pq.get("version") == RAZONES_VERSION and (not pq.get("parcial") or _edad_dias(p.get("final"), P.ahora) > ESPERA_PBP_DIAS):
+                continue
+            pend.append((b, p))
+    if not pend:
+        return 0
+    R = R or Razones().cargar()
+    nuevos = {}
+    for b, p in pend:
+        eqs = [x.strip() for x in str(p.get("partido") or "").split("@")]
+        gid = p.get("gid") or (P.fila_de_pata(b, p) or {}).get("game_id")
+        if not gid or len(eqs) != 2:
+            continue
+        x = R.explicar(gid, p, eqs[1], eqs[0], P.ahora)
+        if x is None:
+            if _edad_dias(p.get("final"), P.ahora) <= ESPERA_PBP_DIAS:
+                continue
+            x = dict(texto=f"nflverse no publicó la jugada por jugada de este partido en {ESPERA_PBP_DIAS} días.", causas=["sin_datos"],
+                     parcial=False, version=RAZONES_VERSION, hora=S.iso(P.ahora))
+        viejo = p.get("por_que") or {}
+        if (viejo.get("texto"), viejo.get("causas"), viejo.get("parcial"), viejo.get("version")) == (x["texto"], x["causas"], x["parcial"], x["version"]):
+            continue
+        nuevos[(b["id"], p["k"])] = x
+    if nuevos:
+        with candado():
+            lista = P.todos()
+            for b in lista:
+                for p in b["patas"]:
+                    if (b["id"], p.get("k")) in nuevos:
+                        p["por_que"] = nuevos[(b["id"], p["k"])]
+            P._guardar(lista)
+    return len(nuevos)
+
+
+# ---------------------------------------------------------------- v1.3.1 (42k): hoja «NFL Secret LAB — Mis parlays 2026»
+NCOL_H = 11                                                   # A-E en palabras · F separador · G-K detalle técnico en gris
+ANCHOS_H = (120, 230, 230, 90, 440, 16, 60, 105, 105, 130, 100)
+ENCAB_H = ["Parlay", "Apuesta", "Partido", "Resultado", "Por qué falló", "", "Cuota", "Prob. de ganar al cargarlo",
+           "Prob. de ganar al cierre", "Línea de cierre", "Contra el cierre"]
+FILA_ENCAB_H = 7
+
+
+def _rgb_h(h):
+    h = h.lstrip("#")
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
+
+
+_GRIS = {"foregroundColor": _rgb_h("#808080")}
+FORMATO_H = {
+    "titulo": {"textFormat": {"bold": True, "fontSize": 14}},
+    "nota": {"textFormat": {"italic": True, "fontSize": 9, "foregroundColor": _rgb_h("#666666")}},
+    "rotulo": {"textFormat": {"bold": True}},
+    "texto": {},
+    "encab": {"textFormat": {"bold": True}, "backgroundColor": _rgb_h("#EFEFEF"), "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"},
+    "encab_tec": {"textFormat": dict(_GRIS, bold=True), "backgroundColor": _rgb_h("#EFEFEF"), "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"},
+    "parlay": {"textFormat": {"bold": True}, "backgroundColor": _rgb_h("#F3F3F3"), "verticalAlignment": "TOP"},
+    "parlay_texto": {"backgroundColor": _rgb_h("#F3F3F3"), "wrapStrategy": "WRAP", "verticalAlignment": "TOP"},
+    "parlay_tec": {"textFormat": _GRIS, "backgroundColor": _rgb_h("#F3F3F3"), "verticalAlignment": "TOP"},
+    "G": {"backgroundColor": _rgb_h("#D9EAD3"), "verticalAlignment": "TOP"},
+    "P": {"backgroundColor": _rgb_h("#F4CCCC"), "verticalAlignment": "TOP"},
+    "E": {"backgroundColor": _rgb_h("#FFF2CC"), "verticalAlignment": "TOP"},
+    "pata": {"verticalAlignment": "TOP"},
+    "razon": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"},
+    "tec": {"textFormat": _GRIS, "verticalAlignment": "TOP"},
+}
+
+
+def _pts_txt(x):
+    return "" if x is None else (("+" if x > 0 else "") + num_txt(x).replace("-", "−") + " pts")
+
+
+def filas_hoja(P, clave, todos=None):
+    """Filas de la pestaña de una semana: [(texto, estilo), …] por fila. Solo usa el registro y la hora (ni ESPN ni
+    nflverse): la hoja cambia cuando cambia el registro o cuando empieza un juego."""
+    bs = P.de_semana(clave, todos)
+    fechas = fechas_txt(p.get("inicio") for b in P.de_semana(clave, todos, con_borrados=True) for p in b["patas"])
+    r = resumen_semana(bs)
+    cob = sum(1 for b in bs if b.get("estado") == "cobrado")
+    per = sum(1 for b in bs if b.get("estado") == "perdido")
+    viv = len(bs) - cob - per
+    filas = [[(f"Mis parlays · {nombre_semana(clave)}" + (f" ({fechas})" if fechas else ""), "titulo")],
+             [("La llena el servidor cada media hora. «Por qué falló» sale de la jugada por jugada de nflverse (sin IA), normalmente "
+               "un día después del partido. Por diversión: el motor no apuesta.", "nota")],
+             []]
+    res_txt = (f"{len(bs)} parlay{'s' if len(bs) != 1 else ''}: {cob} cobrado{'s' if cob != 1 else ''}, {per} perdido{'s' if per != 1 else ''}"
+               + (f", {viv} en juego" if viv else "") + ". "
+               + (f"Patas ya jugadas: acertaste {r['aciertos']} de {r['decididas']}; según el cierre se esperaban {fi(round(r['esperados'], 1))}."
+                  if r["decididas"] else "Todavía no se jugó ninguna pata."))
+    if not r["perdidas"]:
+        cau = "Ninguna pata perdida todavía."
+    else:
+        cau = causas_txt(r["causas"]) if r["causas"] else ""
+        if r["sin_razon"]:
+            cau += (" · " if cau else "") + f"esperando a nflverse: {r['sin_razon']} pata{'s' if r['sin_razon'] != 1 else ''}"
+    filas += [[("Resumen", "rotulo"), (res_txt, "texto")], [("Por qué fallaron", "rotulo"), (cau, "texto")], []]
+    filas.append([(x, "encab" if i < 5 else "encab_tec") for i, x in enumerate(ENCAB_H)])
+    if not bs:
+        filas.append([("No quedan parlays en esta semana (los borraste).", "texto")])
+    for b in bs:
+        ci, pr = b.get("cierre") or {}, b.get("previo") or {}
+        est = b.get("estado")
+        uno = uno_de_cada(ci.get("p_cobrar") if ci else pr.get("p_cobrar"))
+        if ci:
+            e_txt = (f"Acertó {ci.get('aciertos', 0)} de {ci.get('decididas', 0)} patas (se esperaban {fi(round(ci.get('esperados') or 0, 1))}). "
+                     f"Al cierre: prob. de cobrar {pct(ci.get('p_cobrar'), 2)}" + (f" ({uno})" if uno else "")
+                     + f", EV {pct(ci.get('ev'), 1)}, {costo_txt(ci.get('costo'))}.")
+        else:
+            e_txt = (f"Al cargarlo: prob. de cobrar {pct(pr.get('p_cobrar'), 2)}" + (f" ({uno})" if uno else "")
+                     + f", EV {pct(pr.get('ev'), 1)} con la línea de ese momento, {costo_txt(pr.get('costo'))}. "
+                     "El EV contra el cierre sale cuando se decida.")
+        t_carga = S.t_utc(b.get("cargado"))
+        filas.append([(nombre_de(b), "parlay"),
+                      (f"{(b.get('tipo') or 'parlay').capitalize()} de {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}", "parlay"),
+                      (("cargado " + S.fecha_cc(t_carga)) if t_carga else "", "parlay_texto"),
+                      ({"cobrado": "Cobrado", "perdido": "Perdido"}.get(est, "En juego"), {"cobrado": "G", "perdido": "P"}.get(est, "parlay")),
+                      (e_txt, "parlay_texto"), ("", "parlay_tec"), ("", "parlay_tec"),
+                      (pct(pr.get("p_cobrar"), 2), "parlay_tec"), (pct(ci.get("p_cobrar"), 2) if ci else "—", "parlay_tec"),
+                      ("", "parlay_tec"), (("EV " + pct(ci.get("ev"), 1)) if ci and ci.get("ev") is not None else "", "parlay_tec")])
+        for p in b["patas"]:
+            res = p.get("res")
+            ini = S.t_utc(p.get("inicio"))
+            if res:
+                partido = p.get("marcador") or p.get("partido") or ""
+                d_txt = {"G": "Ganó", "P": "Perdió", "E": "Empate"}[res]
+            elif not p.get("evento"):
+                partido, d_txt = "juego no encontrado al cargarlo", "—"
+            elif ini and P.ahora >= ini:
+                partido, d_txt = f"{p.get('partido') or '?'} · en juego", "En juego"
+            else:
+                partido, d_txt = f"{p.get('partido') or '?'}" + (f" · {S.fecha_cc(ini)}" if ini else ""), "Por jugar"
+            razon = texto_por_que(p) if res == "P" else ("Empate: esa pata se devuelve." if res == "E" else "")
+            razon = razon[:1].upper() + razon[1:]
+            if p.get("tipo") == "TOTAL":
+                lc = f"Total {media_txt(p['cierre_linea'])}" if p.get("cierre_linea") is not None else ""
+            else:
+                lc = (f"{APODO_EQ.get(p.get('equipo') or '', p.get('equipo') or '')} {linea_eq_txt(p['cierre_linea'])}"
+                      if p.get("cierre_linea") is not None else "")
+            filas.append([("", "pata"), (pata_corta(p), "pata"), (partido, "pata"), (d_txt, res if res else "pata"), (razon, "razon"),
+                          ("", ""), (americana_txt(p.get("cuota")), "tec"),
+                          (pct(p.get("p_carga")) if p.get("p_carga") is not None else "—", "tec"),
+                          (pct(p.get("p_cierre")) if p.get("p_cierre") is not None else ("—" if res else ""), "tec"),
+                          (lc, "tec"), (_pts_txt(p.get("contra_cierre")), "tec")])
+    return filas
+
+
+def _celda_h(v, est):
+    c = {}
+    if v not in (None, ""):
+        c["userEnteredValue"] = {"stringValue": str(v)}
+    if FORMATO_H.get(est):
+        c["userEnteredFormat"] = FORMATO_H[est]
+    return c
+
+
+def pedidos_pestana(sid, filas):
+    """Un batchUpdate que reemplaza toda la pestaña: valores y formatos (las celdas fuera de las filas quedan vacías)."""
+    R = max(40, len(filas) + 5)
+    rows = [{"values": [_celda_h(v, e) for v, e in fila]} for fila in filas]
+    pedidos = [{"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {
+                    "rowCount": R, "columnCount": NCOL_H, "frozenRowCount": FILA_ENCAB_H, "hideGridlines": True}},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount,gridProperties.hideGridlines"}},
+               {"updateCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": R, "startColumnIndex": 0, "endColumnIndex": NCOL_H},
+                                "rows": rows, "fields": "userEnteredValue,userEnteredFormat"}}]
+    pedidos += [{"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                                               "properties": {"pixelSize": w}, "fields": "pixelSize"}} for i, w in enumerate(ANCHOS_H)]
+    return pedidos
+
+
+def abrir_hoja_parlays():
+    """(Hoja de semana.py o None, motivo). La cuenta de servicio de semana.ini [google]; la hoja de [parlays] hoja_id.
+    semana.ini [parlays] hoja = no la apaga."""
+    import configparser
+    if not S.CONFIG.exists():
+        return None, "no encuentro semana.ini"
+    c = configparser.ConfigParser()
+    c.read(S.CONFIG)
+    if c.get("parlays", "hoja", fallback="si").strip().lower() in ("no", "0", "false", "apagada"):
+        return None, "apagada en semana.ini"
+    try:
+        cred = (S.BASE / c["google"]["credenciales"]).resolve()
+    except KeyError:
+        return None, "semana.ini no tiene [google] credenciales"
+    if not cred.exists():
+        return None, "no encuentro las credenciales de Google"
+    return S.Hoja(cred, hoja_parlays_id()), ""
+
+
+def escribir_hoja(P, hoja=None, forzar=False):
+    """Una pestaña por semana con parlays («Semana 5»…), la más nueva primero, junto a «Cómo leer» (que la EC2 no toca).
+    Solo escribe las pestañas cuyo contenido cambió (huella en hoja_estado.json) o que no existen."""
+    if hoja is None:
+        hoja, motivo = abrir_hoja_parlays()
+        if hoja is None:
+            return f"sin hoja ({motivo})"
+    todos = P.todos()
+    semanas = sorted({clave_semana(b) for b in todos})
+    if not semanas:
+        return "sin parlays"
+    hid = getattr(hoja, "url", "").rsplit("/", 1)[-1]
+    est = _leer_json(ESTADO_HOJA, {})
+    if est.get("hoja") != hid:
+        est = dict(hoja=hid, pestanas={})
+    tabs = hoja.pestanas()
+    escritas = []
+    for c in semanas:                         # de la más vieja a la más nueva: la nueva queda primero (índice 1)
+        titulo = nombre_semana(c)
+        if titulo == COMO_LEER:
+            continue
+        filas = filas_hoja(P, c, todos)
+        huella = hashlib.md5(json.dumps(filas, ensure_ascii=False).encode()).hexdigest()
+        if not forzar and titulo in tabs and est["pestanas"].get(titulo) == huella:
+            continue
+        if titulo not in tabs:
+            r = hoja.lote([{"addSheet": {"properties": {"title": titulo, "index": 1 if COMO_LEER in tabs else 0,
+                                                        "gridProperties": {"rowCount": max(40, len(filas) + 5), "columnCount": NCOL_H}}}}])
+            tabs[titulo] = r["replies"][0]["addSheet"]["properties"]["sheetId"]
+        hoja.lote(pedidos_pestana(tabs[titulo], filas))
+        est["pestanas"][titulo] = huella
+        _guardar_json(ESTADO_HOJA, est)
+        escritas.append(titulo)
+    return ("escribí " + ", ".join(escritas)) if escritas else "sin cambios"
+
+
+def modo_auto(P=None, hoja=None, R=None):
+    """Lo lanza orden.py cada 30 min (y poco después de /si o /borrar_parlay): resultados, razones y hoja. Uno a la vez."""
+    try:
+        with candado(CANDADO_AUTO, espera_s=0):
+            P = P or Parlays()
+            try:
+                if not P.todos():
+                    return "auto: sin parlays"
+            except RuntimeError as e:
+                return f"auto: FALLA registro: {e}"
+            partes = []
+            for nombre, fn in (("resultados", P.actualizar), ("razones", lambda: explicar_pendientes(P, R)),
+                               ("hoja", lambda: escribir_hoja(P, hoja))):
+                try:
+                    partes.append(f"{nombre}: {fn()}")
+                except Exception as e:  # noqa: BLE001 — un paso que falla no frena los otros
+                    partes.append(f"{nombre}: FALLA {type(e).__name__}: {str(e)[:160]}")
+            return f"auto {VERSION}: " + " · ".join(partes)
+    except TimeoutError:
+        return "auto: ya hay otro corriendo"
 
 
 # ---------------------------------------------------------------- Gemini: lectura de la foto (mismo cliente que semana.py)
@@ -1037,7 +1863,8 @@ ESQUEMA_SIMPLE = {"type": "object", "properties": {"tipo": {"type": "string"}, "
 PROMPT_JSON = ('\nAnswer ONLY with a JSON object and nothing else, of this form: {"boletos": [{"tipo": "PARLAY", "monto": "10", '
                '"pago": "315.12", "numero": "", "patas": [{"texto": "...", "equipo": "...", "partido": "...", "tipo": "SPREAD", '
                '"linea": "-7", "lado": "", "cuota": "-110"}]}]}')
-CADENA_GEMINI = (("esquema-varios", True), ("sin-esquema", True), ("sin-esquema", False))
+# v1.3.1: diagnóstico del 4-oct (registro 42): esquema-varios falló en 2 de 3 entradas; sin-esquema leyó las 3 → sale el esquema.
+CADENA_GEMINI = (("sin-esquema", True), ("sin-esquema", False))
 ESQUEMA_VARIOS = {"type": "object", "properties": {"boletos": {"type": "array", "items": ESQUEMA_SIMPLE}}}
 FORMATOS = {"pdf": ("application/pdf",), "imagen": ("image/png", "image/jpeg", "image/webp"), "texto": ("text/plain",)}
 NOMBRE_MAX = 30
@@ -1064,7 +1891,7 @@ def tipo_entrada(datos):
     return "text/plain" if 3 <= len(t) <= MAX_TEXTO else None
 
 
-def gemini_cuerpo(contenido, mime, variante="esquema-varios", campo="inlineData", pensar=True):
+def gemini_cuerpo(contenido, mime, variante="sin-esquema", campo="inlineData", pensar=True):
     """Cuerpo de generateContent. campo: 'inlineData' (camelCase, como semana.py) o 'inline_data' (solo para el diagnóstico)."""
     import base64
     if mime == "text/plain":
@@ -1383,6 +2210,28 @@ def prueba_instalacion():
                f"lecturas de boletos por día (foto, PDF o texto): tope {tope_fotos()}, usadas hoy {fotos_hoy(ahora_utc().astimezone(CCS).date().isoformat())}")
     SAL.mkdir(parents=True, exist_ok=True)
     out.append(f"OK carpeta {SAL.relative_to(BASE)}")
+    try:                                     # v1.3.1: registro con la numeración por semana (solo lectura)
+        lista = Parlays().todos()
+        sem = sorted({clave_semana(b) for b in lista if b.get("estado") != "borrado"})
+        out.append(f"OK registro: {len(lista)} boletos, semanas {', '.join(nombre_semana(c, corto=True) for c in sem) or 'ninguna'}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"FALLA registro: {type(e).__name__}: {str(e)[:120]}")
+    try:                                     # v1.3.1: datos de «por qué falló» (baja nflverse a salidas/parlays/datos)
+        R = Razones().cargar(max_edad_h=24.0)
+        n = R.pbp["game_id"].n_unique() if R.pbp is not None else 0
+        ns = R.snaps["game_id"].n_unique() if R.snaps is not None else 0
+        out.append(f"{'OK' if n and ns else 'FALLA'} datos de razones: jugada por jugada {n} partidos, snaps {ns} partidos")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"FALLA datos de razones: {type(e).__name__}: {str(e)[:120]}")
+    try:                                     # v1.3.1: hoja de parlays (solo lee la lista de pestañas)
+        hoja, motivo = abrir_hoja_parlays()
+        if hoja is None:
+            out.append(f"FALLA hoja de parlays: {motivo}")
+        else:
+            tabs = hoja.pestanas()
+            out.append(f"OK hoja de parlays: la cuenta de servicio la abre ({len(tabs)} pestañas: {', '.join(list(tabs)[:6])})")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"FALLA hoja de parlays: {type(e).__name__}: {str(e)[:160]}")
     return "\n".join(out)
 
 
@@ -1408,6 +2257,14 @@ def main(argv):
             print(Parlays().texto_jugadas(resto[0] if resto else ""))
         elif cmd == "borrar" and resto:
             print(Parlays().borrar(" ".join(resto)))
+        elif cmd == "historico":
+            print(Parlays().texto_historico(" ".join(resto) if resto else None))
+        elif cmd == "auto":
+            print(f"[{ahora_utc():%Y-%m-%d %H:%M:%S} UTC] " + modo_auto(), flush=True)
+        elif cmd == "hoja":
+            P = Parlays()
+            P._actualizar_callado()
+            print(escribir_hoja(P, forzar=True))
         elif cmd == "prueba":
             print(prueba_instalacion())
         elif cmd == "diagnostico":
