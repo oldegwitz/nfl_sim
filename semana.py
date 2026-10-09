@@ -46,6 +46,8 @@ Uso
   venv/bin/python semana.py informe [--semana N]          (v8.1: informe de CLV y autopsia de una semana jugada; sale
                                                            solo por Telegram cuando cierra cada semana que cuenta)
   venv/bin/python semana.py gemini-piloto [--variante g1] (piloto del agente Gemini: P1-P4; no cuenta para el piso)
+  (v8.2) En las corridas automáticas T−85, después de g1, el registro en vivo e2 (decisión 49) consulta aparte
+         enfermedad, vestuario y descanso anunciado; el modo estado muestra solo sus conteos.
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña semanal y
                                                            un boleto de prueba con el formato real)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
@@ -67,7 +69,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8.1 (8-oct-2026)"
+VERSION_SEMANA = "semana-v8.2 (8-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -117,6 +119,10 @@ VERSION_SEMANA = "semana-v8.1 (8-oct-2026)"
 #     BetOnline), intervalos por remuestreo de juegos y autopsia de cada juego (38, con la prueba 1 en probabilidad sin
 #     vig). No cambian el modelo, la simulación, el consenso del QB, las selecciones, el boleto ni la hoja (solo el texto
 #     de confiabilidad que ya mostraba). La proyección es idéntica a la de v8.
+# v8.2 (decisión 49, ruta A, aprobada por Ozz el 8-oct): registro en vivo «e2» en las corridas automáticas T−85,
+#     después de g1 y en una consulta aparte (enfermedad, vestuario, descanso de titulares anunciado y una línea libre
+#     por equipo; salidas/semana/e2_vivo.csv; tope propio de 20 consultas por día). El modo estado muestra solo conteos.
+#     No cambian la proyección, g1 (ni su huella), el consenso del QB, las selecciones, el boleto, el informe ni la hoja.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -2552,6 +2558,260 @@ def gemini_piloto(g26, ahora, estado, variante=None):
 
 
 # --------------------------------------------------------------------------------------
+# v8.2 (decisión 49, ruta A, aprobada por Ozz el 8-oct): registro en vivo «e2» a T−85 (claude/registro_49_vivo.md)
+#   · Consulta APARTE de g1 (no toca su configuración, su huella ni el reloj de su piso): por equipo, V1 enfermedad,
+#     V2 vestuario (suspensión, conflicto, despido o cambio de quien llama las jugadas), V3 descanso de titulares
+#     anunciado y V4 una línea libre. Solo en las corridas automáticas T−85 (modo auto), después de g1.
+#   · El pedido lleva la hora real: el resultado todavía no existe. Una fila consultada en o después del inicio queda
+#     con valida = 0 y no entra al análisis.
+#   · Tope propio (E2_MAX_DIA consultas por día de Caracas, estado["e2"]); sin reintentos; plazo propio de 120 s.
+#   · Registro: salidas/semana/e2_vivo.csv (2 filas por juego). Se mide una sola vez al cerrar la semana 18; hasta
+#     entonces el modo estado solo muestra conteos, nunca resultados contra la línea.
+#   · semana.ini [e2] activo = no lo apaga sin tocar código.
+# --------------------------------------------------------------------------------------
+E2_MAX_DIA = 20
+E2_PLAZO_S = 120
+E2_HILOS = 8
+E2_REGISTRO = SAL / "e2_vivo.csv"
+_T0_PROCESO = time.time()
+CAMPOS_E2 = ["corrida_utc", "game_id", "semana", "game_type", "inicio_utc", "minutos_antes", "valida", "equipo", "rival",
+             "es_local", "huella", "modelo", "model_version", "estado", "http", "latencia_s", "costo_usd",
+             "evidencia_busqueda", "v1_enfermedad", "v1_url", "v1_fecha", "v1_conf", "v2_vestuario", "v2_url", "v2_fecha",
+             "v2_conf", "v3_descanso", "v3_url", "v3_fecha", "v3_conf", "v4_nota", "detalle"]
+E2_SISTEMA = """You are a careful NFL news researcher using Google Search. Rules:
+1. Always search before answering, using at most 5 Google searches in total.
+2. Use only news published in the last 7 days. Report only what a source you found states; never guess.
+3. Fill every field for both teams, using the team codes given. If you find nothing for a field, answer false and
+   leave its url and date as empty strings.
+4. Each *_url must be a page that appeared in your search results; never build or guess a URL. Each *_date is that
+   page's publication date (YYYY-MM-DD).
+5. *_conf: "high" if official or several reliable sources agree; "medium" if one reliable source; "low" if unclear."""
+E2_USUARIO = """Now: {ahora_utc} UTC ({ahora_et} ET), {minutos} minutes before kickoff. NFL {temporada} {fase}.
+Game: {visita_nombre} ({visita}) at {local_nombre} ({local}), kickoff {inicio_utc} UTC.
+For EACH team, as reported this week:
+- illness: was an illness or virus affecting several players reported?
+- turmoil: was there a suspension, a public conflict, a firing, or a change of offensive or defensive play-caller?
+- resting_starters: did the team announce it will rest starters in this game?
+- other_news: one short line with any other relevant pre-game news that is not a routine injury update, or "" if none."""
+E2_PARTES = (("illness", "v1", "v1_enfermedad"), ("turmoil", "v2", "v2_vestuario"), ("resting", "v3", "v3_descanso"))
+
+
+def e2_esquema(visita, local):
+    def equipo(eq):
+        s, b = {"type": "string"}, {"type": "boolean"}
+        conf = {"type": "string", "enum": list(CONFIANZAS)}
+        props = {"team": {"type": "string", "enum": [eq]},
+                 "illness": b, "illness_url": s, "illness_date": s, "illness_conf": conf,
+                 "turmoil": b, "turmoil_url": s, "turmoil_date": s, "turmoil_conf": conf,
+                 "resting_starters": b, "resting_url": s, "resting_date": s, "resting_conf": conf,
+                 "other_news": s}
+        return {"type": "object", "properties": props, "required": list(props)}
+    return {"type": "object", "properties": {"away": equipo(visita), "home": equipo(local)}, "required": ["away", "home"]}
+
+
+def e2_huella():
+    """Huella de la configuración e2 completa. Cambia → configuración nueva (se anota en cada fila)."""
+    cfg = dict(modelo=GEMINI_MODELO, via="generateContent", nivel="medium", mime=GEMINI_MIME, sistema=E2_SISTEMA,
+               usuario=E2_USUARIO, forma_esquema=json.dumps(e2_esquema("AAA", "BBB"), sort_keys=True),
+               herramientas=["google_search"], plazo=E2_PLAZO_S, hilos=E2_HILOS, max_tokens=GEMINI_MAX_TOKENS)
+    return hashlib.md5(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+
+
+def e2_activo():
+    cfg = configparser.ConfigParser()
+    if CONFIG.exists():
+        cfg.read(CONFIG)
+    val = str(cfg["e2"].get("activo", "si")).strip().lower() if cfg.has_section("e2") else "si"
+    return val not in ("no", "0", "false", "apagado")
+
+
+def e2_momento(ahora):
+    """Hora de la consulta: la de la corrida más lo que lleva el proceso (igual en producción y con --ahora)."""
+    return ahora + dt.timedelta(seconds=round(time.time() - _T0_PROCESO))
+
+
+def e2_cuerpo(j, momento):
+    fase = (f"regular season, week {j['semana']}" if j.get("game_type", "REG") == "REG"
+            else f"postseason, {RONDAS.get(j['game_type'], j['game_type'])}")
+    txt = E2_USUARIO.format(ahora_utc=momento.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            ahora_et=_fmt_et(momento), minutos=max(int((j["inicio"] - momento).total_seconds() // 60), 0),
+                            temporada=TEMPORADA, fase=fase,
+                            visita_nombre=EQUIPOS.get(j["visita"], j["visita"]), visita=j["visita"],
+                            local_nombre=EQUIPOS.get(j["local"], j["local"]), local=j["local"],
+                            inicio_utc=j["inicio"].astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"))
+    return {"systemInstruction": {"parts": [{"text": E2_SISTEMA}]},
+            "contents": [{"role": "user", "parts": [{"text": txt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "medium"}, "maxOutputTokens": GEMINI_MAX_TOKENS,
+                                 "responseFormat": {"text": {"mimeType": GEMINI_MIME, "schema": e2_esquema(j["visita"], j["local"])}}}}
+
+
+def _e2_bool(x):
+    if isinstance(x, bool):
+        return x
+    t = _texto(x).lower()
+    return True if t in ("true", "yes") else False if t in ("false", "no") else None
+
+
+def e2_leer(datos, j):
+    u = datos.get("usageMetadata") or {}
+    ent = int(u.get("promptTokenCount") or 0) + int(u.get("toolUsePromptTokenCount") or 0)
+    sal = int(u.get("candidatesTokenCount") or 0) + int(u.get("thoughtsTokenCount") or 0)
+    out = dict(model_version=_texto(datos.get("modelVersion")), costo_usd=round(ent * PRECIO_ENTRADA + sal * PRECIO_SALIDA, 6))
+    cand = (datos.get("candidates") or [{}])[0] or {}
+    gm = cand.get("groundingMetadata") or {}
+    partes = ((cand.get("content") or {}).get("parts")) or []
+    texto = "".join(p.get("text", "") for p in partes if isinstance(p, dict) and not p.get("thought"))
+    obj = _objeto_json(texto)
+    equipos, urls = {}, []
+    for lado, eq in (("away", j["visita"]), ("home", j["local"])):
+        x = (obj or {}).get(lado)
+        if not isinstance(x, dict) or DE_OTRAS.get(_texto(x.get("team")).upper(), _texto(x.get("team")).upper()) != eq:
+            continue
+        f = {}
+        for pre, cod, col in E2_PARTES:
+            clave = "resting_starters" if pre == "resting" else pre
+            val = _e2_bool(x.get(clave))
+            f[col] = "" if val is None else int(val)
+            f[f"{cod}_url"] = _texto(x.get(f"{pre}_url"))[:300]
+            f[f"{cod}_fecha"] = _texto(x.get(f"{pre}_date"))[:10]
+            conf = _texto(x.get(f"{pre}_conf")).lower()
+            f[f"{cod}_conf"] = conf if conf in CONFIANZAS else ""
+            if f[f"{cod}_url"]:
+                urls.append(f[f"{cod}_url"])
+        f["v4_nota"] = _texto(x.get("other_news"))[:200]
+        if all(f[col] != "" for _, _, col in E2_PARTES):
+            equipos[eq] = f
+    out["equipos"] = equipos
+    meta = bool((gm.get("webSearchQueries") or []) or (gm.get("groundingChunks") or []) or gm.get("searchEntryPoint"))
+    out["evidencia_busqueda"] = "metadatos" if meta else "enlace" if any(u_.startswith(PREFIJO_BUSQUEDA) for u_ in urls) else "ninguna"
+    if obj is None:
+        out["estado"], out["detalle"] = "respuesta inválida", ("sin texto" if not texto else "no es JSON: " + texto[:150])
+    elif len(equipos) == 2:
+        out["estado"], out["detalle"] = "ok", ""
+    elif equipos:
+        out["estado"], out["detalle"] = "parcial", "respondió un solo equipo válido"
+    else:
+        out["estado"], out["detalle"] = "respuesta inválida", "JSON sin equipos válidos"
+    return out
+
+
+def e2_llamar(llave, j, momento, limite):
+    """Una consulta e2 (un juego). Nunca lanza excepciones ni registra la llave."""
+    import requests
+    base = dict(equipos={})
+    t0 = time.time()
+    resta = limite - t0
+    if resta < 5:
+        return {**base, "estado": "tiempo agotado", "detalle": "sin tiempo para empezar", "latencia_s": 0.0}
+    try:
+        r = requests.post(f"{GEMINI_URL}/models/{GEMINI_MODELO}:generateContent",
+                          headers={"x-goog-api-key": llave, "Content-Type": "application/json"},
+                          json=e2_cuerpo(j, momento), timeout=(min(10.0, resta), resta))
+    except requests.exceptions.Timeout:
+        return {**base, "estado": "tiempo agotado", "latencia_s": round(time.time() - t0, 2)}
+    except Exception as e:  # noqa: BLE001
+        return {**base, "estado": "error de red", "detalle": type(e).__name__, "latencia_s": round(time.time() - t0, 2)}
+    lat = round(time.time() - t0, 2)
+    if r.status_code != 200:
+        try:
+            msg = _texto(((r.json() or {}).get("error") or {}).get("message"))
+        except Exception:  # noqa: BLE001
+            msg = ""
+        return {**base, "estado": "error HTTP", "http": r.status_code, "detalle": msg[:300], "latencia_s": lat}
+    try:
+        datos = r.json()
+    except ValueError:
+        return {**base, "estado": "respuesta inválida", "http": 200, "detalle": "la respuesta no es JSON", "latencia_s": lat}
+    return {**base, **e2_leer(datos, j), "http": 200, "latencia_s": lat}
+
+
+def e2_vivo(pendientes, ahora, estado):
+    """Registro en vivo e2 de los juegos de una corrida automática T−85 (después de g1). Nunca detiene la corrida."""
+    try:
+        if not pendientes or not GEMINI_LLAVE.exists() or not e2_activo():
+            return
+        from concurrent.futures import ThreadPoolExecutor, wait
+        juegos = [j for j, _ in pendientes]
+        momento = e2_momento(ahora)
+        hoy = momento.astimezone(CARACAS).date().isoformat()
+        usado = estado.setdefault("e2", {})
+        for k in [k for k in usado if k != hoy]:
+            usado.pop(k)
+        disponibles = max(E2_MAX_DIA - usado.get(hoy, 0), 0)
+        a_consultar, sin_cupo = juegos[:disponibles], juegos[disponibles:]
+        usado[hoy] = usado.get(hoy, 0) + len(a_consultar)
+        llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+        t0 = time.time()
+        limite = t0 + E2_PLAZO_S
+        res = {}
+        if a_consultar:
+            ex = ThreadPoolExecutor(max_workers=E2_HILOS)
+            futs = {ex.submit(e2_llamar, llave, j, momento, limite): j for j in a_consultar}
+            hechos, _ = wait(futs, timeout=max(limite - time.time(), 0) + 1.0)
+            for f, j in futs.items():
+                res[j["game_id"]] = (f.result() if f in hechos and f.exception() is None else
+                                     dict(equipos={}, estado="tiempo agotado", latencia_s=float(E2_PLAZO_S)))
+            ex.shutdown(wait=False, cancel_futures=True)
+        del llave
+        for j in sin_cupo:
+            res[j["game_id"]] = dict(equipos={}, estado="tope", detalle=f"tope de {E2_MAX_DIA} consultas del día", latencia_s=0.0)
+        huella = e2_huella()
+        filas = []
+        for j in juegos:
+            x = res[j["game_id"]]
+            minutos = round((j["inicio"] - momento).total_seconds() / 60, 1)
+            for eq, rival, es_local in ((j["visita"], j["local"], 0), (j["local"], j["visita"], 1)):
+                f = dict(corrida_utc=iso(momento), game_id=j["game_id"], semana=j["semana"], game_type=j.get("game_type", "REG"),
+                         inicio_utc=iso(j["inicio"]), minutos_antes=minutos, valida=int(minutos > 0), equipo=eq, rival=rival,
+                         es_local=es_local, huella=huella, modelo=GEMINI_MODELO, model_version=x.get("model_version", ""),
+                         estado=x["estado"], http=x.get("http", ""), latencia_s=x.get("latencia_s", ""),
+                         costo_usd=x.get("costo_usd", "") if es_local == 0 else "",      # el costo, una vez por juego
+                         evidencia_busqueda=x.get("evidencia_busqueda", ""), detalle=x.get("detalle", ""))
+                f.update(x["equipos"].get(eq) or {})
+                filas.append(f)
+        SAL.mkdir(parents=True, exist_ok=True)
+        if E2_REGISTRO.exists():
+            with open(E2_REGISTRO, encoding="utf-8") as fh:
+                if fh.readline().strip().split(",") != CAMPOS_E2:
+                    viejo = E2_REGISTRO.with_name(f"e2_vivo_previo_{int(time.time())}.csv")
+                    E2_REGISTRO.rename(viejo)
+                    log(f"e2: el registro tenía otras columnas; lo guardé como {viejo.name}")
+        nuevo = not E2_REGISTRO.exists()
+        with open(E2_REGISTRO, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=CAMPOS_E2)
+            if nuevo:
+                w.writeheader()
+            for f in filas:
+                w.writerow({k: ("" if f.get(k) is None else f.get(k)) for k in CAMPOS_E2})
+        cuenta = {}
+        for gid in {j["game_id"] for j in juegos}:
+            cuenta[res[gid]["estado"]] = cuenta.get(res[gid]["estado"], 0) + 1
+        costo = sum(float(r.get("costo_usd") or 0) for r in res.values())
+        log(f"e2 ({huella}): {len(juegos)} juegos en {time.time() - t0:.1f} s · {cuenta} · USD {costo:.4f}")
+    except Exception as e:  # noqa: BLE001
+        log(f"e2: error ({type(e).__name__}); la proyección y g1 no se afectan")
+
+
+def texto_e2_estado(ahora, estado):
+    """Solo conteos (registro 49: nada de resultados contra la línea antes de cerrar la semana 18)."""
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    cab = (f"Registro en vivo e2 (49): {'activo' if e2_activo() else 'APAGADO en semana.ini'} · huella {e2_huella()} · "
+           f"hoy {estado.get('e2', {}).get(hoy, 0)}/{E2_MAX_DIA} consultas")
+    if not E2_REGISTRO.exists():
+        return cab + " · todavía sin consultas (empieza en la próxima T−85 automática)"
+    with open(E2_REGISTRO, encoding="utf-8") as fh:
+        filas = list(csv.DictReader(fh))
+    validas = [f for f in filas if f.get("valida") == "1"]
+    juegos = {f["game_id"] for f in validas}
+    ok = [f for f in validas if f.get("estado") in ("ok", "parcial") and f.get("v1_enfermedad") != ""]
+    band = {col: sum(1 for f in ok if f.get(col) == "1") for _, _, col in E2_PARTES}
+    costo = sum(float(f.get("costo_usd") or 0) for f in filas)
+    return (cab + f" · {len(juegos)} juegos registrados ({len(ok)} equipos con respuesta) · banderas: enfermedad "
+            f"{band['v1_enfermedad']}, vestuario {band['v2_vestuario']}, descanso {band['v3_descanso']} · USD {costo:.2f}")
+
+
+# --------------------------------------------------------------------------------------
 # Corrida (hacia adelante y retrospectiva)
 # --------------------------------------------------------------------------------------
 def preparar_contexto(g_all, g26):
@@ -3574,6 +3834,8 @@ def main():
                   f"{estado.get('gemini_prueba', {}).get(hoy, 0)}/{GEMINI_MAX_PRUEBA_DIA} de piloto")
         else:
             print("Agente Gemini (sombra): apagado (no hay credenciales/gemini.key)")
+        if GEMINI_LLAVE.exists():
+            print(texto_e2_estado(ahora, estado))
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -3693,6 +3955,9 @@ def main():
         s2.telegram(txt)
     if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
         gemini_sombra(sombra, ahora, estado)
+        guardar_estado(estado)
+    if sombra and args.modo == "auto":                # v8.2 (49): registro en vivo e2, aparte de g1 y después de él
+        e2_vivo(sombra, ahora, estado)
         guardar_estado(estado)
     log("== LISTO")
 
