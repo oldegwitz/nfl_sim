@@ -75,7 +75,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8.3 (11-oct-2026)"
+VERSION_SEMANA = "semana-v8.3.1 (11-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -140,6 +140,10 @@ VERSION_SEMANA = "semana-v8.3 (11-oct-2026)"
 #     titulares con los snaps y avisa «la máquina no sabe esto» (Telegram aparte y columna E de la hoja); verificación con
 #     los snaps en el informe y piloto Flash-Lite contra 3.8 Flash con la regla escrita antes.
 #     No cambian la proyección, s2-v1, g1 ni e2 (ni sus huellas), el consenso del QB, las selecciones ni el boleto.
+# v8.3.1 (Ozz, 11-oct, opción b, después de que 3.8 Flash agotara los 180 s en la primera T−85 real): el vigía tiene
+#     300 s en vez de 180 y 16 consultas a la vez en vez de 8 (todas las de 3.8 Flash de un grupo empiezan juntas).
+#     Huellas nuevas: el piloto cuenta solo consultas con las huellas actuales y desde la semana 6 (VIGIA_PILOTO_DESDE);
+#     lo consultado con v8.3 queda en el registro y en la verificación, pero no en el piloto. Nada más cambia.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -2844,8 +2848,8 @@ def texto_e2_estado(ahora, estado):
 VIGIA_MODELOS = {"A": "gemini-3.5-flash-lite", "B": "gemini-3.8-flash"}
 VIGIA_NOMBRE = {"A": "Flash-Lite", "B": "3.8 Flash"}
 VIGIA_MAX_DIA = 40
-VIGIA_PLAZO_S = 180
-VIGIA_HILOS = 8
+VIGIA_PLAZO_S = 300                                # v8.3.1 (Ozz, 11-oct, opción b): antes 180
+VIGIA_HILOS = 16                                   # v8.3.1: antes 8
 VIGIA_MAX_JUG = 15
 VIGIA_CONSULTAS = SAL / "vigia_consultas.csv"
 VIGIA_HECHOS = SAL / "vigia_hechos.csv"
@@ -2856,6 +2860,7 @@ VIGIA_FUENTES = ("official_inactive_list", "official_injury_report", "team_trans
                  "league_announcement")
 VIGIA_SIN_TITULAR = {"K", "P", "LS"}
 VIGIA_PILOTO_SEMANAS, VIGIA_PILOTO_MAX = 2, 4
+VIGIA_PILOTO_DESDE = 6                             # v8.3.1: el piloto empieza en la semana 6 (huellas nuevas)
 VIGIA_MIN_HECHOS, VIGIA_MIN_PRECISION, VIGIA_MAX_FALLAS, VIGIA_DIF_COBERTURA = 10, 0.90, 0.20, 0.05
 VIGIA_HOLGURA_MIN = 5                              # minutos de tolerancia de reloj para «fuente posterior a la consulta»
 ESTADO_ES = {"inactive": "inactivo", "out": "out", "doubtful": "doubtful", "injured_reserve": "lista de lesionados",
@@ -3440,9 +3445,13 @@ def vigia_frase(av):
     return " · 🔎 el vigía: " + "; ".join(partes)
 
 
-def vigia_verificar(g26):
-    """Verificación con los snaps (código, sin IA). Devuelve (métricas por (modelo, semana), filas de hechos con 'jugo')."""
+def vigia_verificar(g26, solo_actual=False):
+    """Verificación con los snaps (código, sin IA). Devuelve (métricas por (modelo, semana), filas de hechos con 'jugo').
+    solo_actual: solo las consultas con la huella actual de cada modelo (v8.3.1: la que usa el piloto)."""
     consultas = [f for f in _leer_csv(VIGIA_CONSULTAS) if f.get("valida") == "1"]
+    if solo_actual:
+        actual = {c: vigia_huella(c) for c in VIGIA_MODELOS}
+        consultas = [f for f in consultas if f.get("huella") == actual.get(f.get("modelo_clave"))]
     hechos = [f for f in _leer_csv(VIGIA_HECHOS) if f.get("minutos_antes") and _f(f.get("minutos_antes")) > 0]
     if not consultas:
         return {}, []
@@ -3510,7 +3519,7 @@ def vigia_piloto(met):
     semanas = sorted({s for (c, s) in met if c == "A"} & {s for (c, s) in met if c == "B"})
     if len(semanas) < VIGIA_PILOTO_SEMANAS:
         return dict(estado="en curso", semanas=semanas, por_modelo={}, ganador=None,
-                    motivo=f"{len(semanas)} de {VIGIA_PILOTO_SEMANAS} semanas con los dos modelos")
+                    motivo=f"{len(semanas)} de {VIGIA_PILOTO_SEMANAS} semanas con los dos modelos; el piloto cuenta desde la semana {VIGIA_PILOTO_DESDE}")
 
     def junta(c, ss):
         t = dict(consultas=0, fallas=0, hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0, sin_snaps=0)
@@ -3550,10 +3559,16 @@ def vigia_piloto(met):
     return dict(estado="decidido", semanas=ss, por_modelo=pm, ganador=g, motivo=f"los dos elegibles: gana la mayor cobertura ({VIGIA_NOMBRE[g]})")
 
 
+def vigia_met_piloto(g26):
+    """v8.3.1: métricas que entran al piloto = huellas actuales y semanas desde VIGIA_PILOTO_DESDE."""
+    met, _ = vigia_verificar(g26, solo_actual=True)
+    return {k: m for k, m in met.items() if k[1] >= VIGIA_PILOTO_DESDE}
+
+
 def vigia_piloto_aplicar(g26, estado, ahora):
     """Si la regla ya da resultado y todavía no se aplicó, lo anota en el estado (una sola vez). Devuelve (piloto, métricas)."""
     v = estado.setdefault("vigia", {})
-    met, _ = vigia_verificar(g26)
+    met = vigia_met_piloto(g26)
     p = vigia_piloto(met)
     if not v.get("elegido") and not v.get("sin_ganador") and p["estado"] in ("decidido", "sin ganador"):
         resumen_pm = {c: {k: (round(x, 4) if isinstance(x, float) else x) for k, x in d.items()} for c, d in p["por_modelo"].items()}
@@ -4761,7 +4776,7 @@ def seccion_vigia(g26):
     if not met:
         return "", [], []
     est = leer_estado()
-    p = vigia_piloto(met)
+    p = vigia_piloto(vigia_met_piloto(g26))
     lin = ["VIGÍA (55): verificación con los snaps de nflverse (código, sin IA)"]
     tot = {}
     for (c, s), m in sorted(met.items(), key=lambda kv: (kv[0][1], kv[0][0])):
