@@ -44,7 +44,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.3.1 (8-oct-2026)"   # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja
+VERSION = "parlay-v1.3.2 (11-oct-2026)"  # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -636,7 +636,7 @@ def avance_txt(p, j):
         if j["estado"] == "post":
             return "ganada" if v > 0 else "push" if v == 0 else "perdida"
         if p["tipo"] == "ML":
-            return f"gana por {dif}" if dif > 0 else "empatado" if dif == 0 else f"pierde por {-dif}"
+            return f"va ganando por {dif}" if dif > 0 else "empatado" if dif == 0 else f"va perdiendo por {-dif}"
         return f"cubre por {num_txt(abs(v))}" if v > 0 else "justo en el número" if v == 0 else f"le faltan {num_txt(abs(v))}"
     tot, linea = loc + vis, float(p["linea"])
     over = p.get("lado_total", "OVER") == "OVER"
@@ -648,16 +648,49 @@ def avance_txt(p, j):
     return f"van {tot}; se pierde con {necesita} puntos más" if necesita > 0 else f"van {tot}; ya se pasó"
 
 
-def icono(j, pg, pp):
+def estado_marcador(p, j):
+    """v1.3.2 (42m): cómo va la pata según el marcador: 'gana', 'pierde' o 'igual'. ML y spread: el marcador (con la línea
+    en el spread). Totales: el ritmo (los puntos que van, llevados al partido completo, contra la línea); con menos del 10 %
+    del partido jugado, 'igual'."""
+    loc, vis = j["local"].get("puntos", 0) or 0, j["visita"].get("puntos", 0) or 0
+    if p["tipo"] in ("ML", "SPREAD"):
+        dif = (loc - vis) if p["equipo"] == j["local"].get("abbr") else (vis - loc)
+        v = dif + (0 if p["tipo"] == "ML" else float(p["linea"]))
+    else:
+        jugado = 1.0 - fraccion_restante(j)
+        if jugado < 0.1:
+            return "igual"
+        v = (loc + vis) / jugado - float(p["linea"])
+        if p.get("lado_total", "OVER") != "OVER":
+            v = -v
+    return "gana" if v > 1e-9 else "pierde" if v < -1e-9 else "igual"
+
+
+def icono(j, pg, pp, p=None):
+    """⏳ antes del juego · ✅ ❌ 🟡 terminado · en vivo (v1.3.2, 42m) el color sigue al marcador: 🟢 va ganando (o
+    cubriendo; en totales, a ese ritmo), 🔴 va perdiendo, ⚪ empatado o justo en el número. La probabilidad va aparte,
+    en palabras (prob_txt)."""
     if j.get("cancelado"):
         return "⚪"
     if j["estado"] == "pre":
         return "⏳"
     if j["estado"] == "post":
         return "✅" if pg == 1.0 else "🟡" if pp == 1.0 else "❌"
-    if pg is None:
+    if p is None:
         return "⚪"
-    return "🟢" if pg + (pp or 0) >= 0.5 else "🔴"
+    return {"gana": "🟢", "pierde": "🔴"}.get(estado_marcador(p, j), "⚪")
+
+
+def prob_txt(p, prob, est):
+    """v1.3.2 (42m): la probabilidad en palabras: «todavía la gana 53 de cada 100»."""
+    k = int(round(100 * prob))
+    if p["tipo"] == "ML":
+        verbo = "la gana"
+    elif p["tipo"] == "SPREAD":
+        verbo = "la cubre"
+    else:
+        verbo = "la pasa" if p.get("lado_total", "OVER") == "OVER" else "termina debajo"
+    return ("todavía " if est == "pierde" else "") + f"{verbo} {k} de cada 100"
 
 
 def situacion_txt(j, ev):
@@ -779,6 +812,21 @@ def normalizar(lista):
                 if auto and b["n"]:
                     b["nombre"] = f"{(b.get('tipo') or 'parlay').capitalize()} {b['n']}"
     return lista
+
+
+def aciertos_boleto(b):
+    """v1.3.2: aciertos de un parlay contados desde sus patas (no desde el momento en que el boleto se cerró)."""
+    ps = b.get("patas", [])
+    dec = [p for p in ps if p.get("res") in ("G", "P", "E")]
+    return dict(aciertos=sum(1 for p in dec if p["res"] == "G"), decididas=len(dec), total=len(ps), faltan=len(ps) - len(dec),
+                esperados=round(sum(p.get("p_cierre") or 0.0 for p in dec), 2))
+
+
+def aciertos_txt(b, mayuscula=False):
+    a = aciertos_boleto(b)
+    txt = (f"acertó {a['aciertos']} de {a['decididas']} patas" + (f" (faltan {a['faltan']} por jugar)" if a["faltan"] else "")
+           if a["decididas"] else "todavía no se jugó ninguna pata")
+    return txt[:1].upper() + txt[1:] if mayuscula else txt
 
 
 def resumen_semana(bs):
@@ -1260,8 +1308,10 @@ class Parlays:
             if j is None:
                 out.append(f"{p['k']} ⚠️ {nombre_pata(p)} · juego no encontrado")
                 continue
-            lin = f"{p['k']} {icono(j, f['pg'], f['pp'])} {nombre_pata(p)} · {marcador_txt(j)} · {avance_txt(p, j)}"
-            if j["estado"] != "post" and f["pg"] is not None:
+            lin = f"{p['k']} {icono(j, f['pg'], f['pp'], p)} {nombre_pata(p)} · {marcador_txt(j)} · {avance_txt(p, j)}"
+            if j["estado"] == "in" and not j.get("cancelado") and f["pg"] is not None:
+                lin += " · " + prob_txt(p, f["pg"] + (f["pp"] or 0), estado_marcador(p, j))
+            elif j["estado"] == "pre" and f["pg"] is not None:
                 lin += f" · P ≈ {pct(f['pg'] + (f['pp'] or 0))}"
             out.append(lin)
             if j["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 and not j.get("cancelado"):
@@ -1272,8 +1322,9 @@ class Parlays:
                 s, u = situacion_txt(j, ev), (ev.get("ultima") or "").strip()
                 if s or u:
                     out.append("   " + " · ".join(x for x in (s, ("última: " + u[:100]) if u else "") if x))
-        out += ["", "P en juego: aproximación (registro 42), no validada. Antes del juego: Pinnacle sin vig o consenso. "
-                "Por qué falló: jugada por jugada de nflverse, sin IA. Por diversión: el motor no apuesta (31A)."]
+        out += ["", "En vivo, el color sigue al marcador: 🟢 va ganando (o cubriendo; en totales, a ese ritmo) · 🔴 va perdiendo · "
+                "⚪ empatado. «N de cada 100»: aproximación en juego (registro 42), no validada. Antes del juego: Pinnacle sin vig "
+                "o consenso. Por qué falló: jugada por jugada de nflverse, sin IA. Por diversión: el motor no apuesta (31A)."]
         return "\n".join(out)
 
     def texto_lista(self):
@@ -1290,7 +1341,10 @@ class Parlays:
         out = [f"Tus parlays de la {nombre_semana(actual).lower()} ({fechas_txt(p.get('inicio') for b in lista for p in b['patas'])}):"]
         for b in lista:
             pr = b.get("previo", {})
-            fin = b.get("resultado") or f"en juego · /parlay {self.ref_corta(b, actual)}"
+            if b.get("estado") in ("cobrado", "perdido"):           # v1.3.2: aciertos desde las patas
+                fin = ("cobró" if b["estado"] == "cobrado" else "perdido") + " · " + aciertos_txt(b)
+            else:
+                fin = b.get("resultado") or f"en juego · /parlay {self.ref_corta(b, actual)}"
             out.append(f"{b.get('n')} · «{nombre_de(b)}» · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → "
                        f"{dinero(b.get('pago'))} · P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
         r = resumen_semana(lista)
@@ -1675,7 +1729,9 @@ def filas_hoja(P, clave, todos=None):
         est = b.get("estado")
         uno = uno_de_cada(ci.get("p_cobrar") if ci else pr.get("p_cobrar"))
         if ci:
-            e_txt = (f"Acertó {ci.get('aciertos', 0)} de {ci.get('decididas', 0)} patas (se esperaban {fi(round(ci.get('esperados') or 0, 1))}). "
+            ab = aciertos_boleto(b)                                    # v1.3.2: desde las patas, no del momento del cierre
+            e_txt = (f"Acertó {ab['aciertos']} de {ab['decididas']} patas (se esperaban {fi(round(ab['esperados'], 1))})"
+                     + (f"; faltan {ab['faltan']} por jugar" if ab["faltan"] else "") + ". "
                      f"Al cierre: prob. de cobrar {pct(ci.get('p_cobrar'), 2)}" + (f" ({uno})" if uno else "")
                      + f", EV {pct(ci.get('ev'), 1)}, {costo_txt(ci.get('costo'))}.")
         else:
