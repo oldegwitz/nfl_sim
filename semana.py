@@ -48,6 +48,12 @@ Uso
   venv/bin/python semana.py gemini-piloto [--variante g1] (piloto del agente Gemini: P1-P4; no cuenta para el piso)
   (v8.2) En las corridas automáticas T−85, después de g1, el registro en vivo e2 (decisión 49) consulta aparte
          enfermedad, vestuario y descanso anunciado; el modo estado muestra solo sus conteos.
+  (v8.3) En las corridas automáticas T−85, después de g1 y antes de e2, el VIGÍA (decisión 55) busca bajas con fuente
+         oficial y avisa cuando falta un titular que la máquina no conoce (Telegram aparte y columna E de la hoja).
+  venv/bin/python semana.py vigia-prueba                  (v8.3: prueba del vigía sin consultar: pedido, esquema, lectura,
+                                                           titulares con los snaps y la regla del piloto)
+  venv/bin/python semana.py vigia-prueba --real           (v8.3: 1 consulta real por modelo sobre el próximo juego; no
+                                                           cuenta para nada, no escribe en el registro; tope 4 por día)
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña semanal y
                                                            un boleto de prueba con el formato real)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
@@ -69,7 +75,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8.2 (8-oct-2026)"
+VERSION_SEMANA = "semana-v8.3 (11-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -123,6 +129,17 @@ VERSION_SEMANA = "semana-v8.2 (8-oct-2026)"
 #     después de g1 y en una consulta aparte (enfermedad, vestuario, descanso de titulares anunciado y una línea libre
 #     por equipo; salidas/semana/e2_vivo.csv; tope propio de 20 consultas por día). El modo estado muestra solo conteos.
 #     No cambian la proyección, g1 (ni su huella), el consenso del QB, las selecciones, el boleto, el informe ni la hoja.
+# v8.3 (decisiones 50, 52 y 55 de Ozz, 9-11 oct; registradas antes de construir):
+#     (50) sección «Fuera» del informe semanal: los juegos cuya proyección que cuenta quedó Fuera (spread, total o QB
+#     dudoso), error del modelo contra el del cierre, si cubrió el lado del modelo, con y sin cambio de QB, acumulado con
+#     IC; solo registro, no decide nada.
+#     (52) 29A decide sobre el EXCESO: CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo
+#     (no favorito o favorito), mercado y semana; el CLV sin restar se reporta y no decide (H37).
+#     (55) el VIGÍA (claude/registro_55_vigia.md): en las corridas automáticas T−85, después de g1 y antes de e2, Gemini
+#     reporta solo hechos de fuente oficial sobre jugadores que no juegan; el código cruza nombres con el roster, decide los
+#     titulares con los snaps y avisa «la máquina no sabe esto» (Telegram aparte y columna E de la hoja); verificación con
+#     los snaps en el informe y piloto Flash-Lite contra 3.8 Flash con la regla escrita antes.
+#     No cambian la proyección, s2-v1, g1 ni e2 (ni sus huellas), el consenso del QB, las selecciones ni el boleto.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -456,6 +473,7 @@ COLORES = {"verde": "#D9EAD3", "azul": "#9FC5E8", "rojo": "#F4CCCC", "cierre": "
 COMO_LEER = ("El favorito es el equipo que las apuestas creen que gana; «por 7 puntos» es por cuánto creen que gana. "
              "«7 de cada 10» quiere decir que, si el partido se jugara 10 veces, ganaría unas 7. La máquina es nuestro "
              "programa: está a prueba y no se apuesta por ella. Azul: ese equipo sirve para el teaser (6 puntos extra). "
+             "🔎: el vigía encontró, con fuente oficial, titulares que no juegan y que la máquina no conoce. "
              "Más a la derecha, en gris, está el detalle técnico: no hace falta leerlo.")
 LEYENDA_TEC = ("Detalle técnico (no hace falta leerlo). Verde: señal del modelo que cuenta para el registro 29A (sin validar; "
                "H29: el cierre le gana por 0,4 pts; ningún dinero por el motor, 31A). Azul: pata Wong (H28). Rojo (Fuera): el "
@@ -2812,6 +2830,875 @@ def texto_e2_estado(ahora, estado):
 
 
 # --------------------------------------------------------------------------------------
+# v8.3 (decisión 55, aprobada por Ozz el 10-oct): el VIGÍA del motor (claude/registro_55_vigia.md, escrito antes)
+#   · Gemini solo reporta HECHOS de fuente oficial: lista de inactivos, reporte final de lesiones (Out/Doubtful),
+#     movimientos oficiales, declaraciones con nombre y anuncios de la NFL, con URL y hora. Nada anónimo ni especulativo.
+#   · El código (sin IA) valida cada hecho, cruza el nombre con el roster 2026, decide los titulares habituales con los
+#     snaps (definición de F0) y arma el aviso «la máquina no sabe esto» (s2-v1 solo usa el QB).
+#   · Solo en las corridas automáticas T−85, después de g1 y antes de e2 (sus huellas no cambian). Piloto: Flash-Lite (A)
+#     y 3.8 Flash (B) consultan cada juego hasta que la regla del registro elige uno (lo aplica el código).
+#   · Si Google rechaza el esquema con 400 (pasó en los parlays, 42), el mismo pedido va sin esquema con el formato JSON
+#     en el texto (columna 'forma'); un 400 no se cobra.
+#   · No cambia la proyección, s2-v1, las selecciones de 29A, 31A, el boleto ni el consenso del QB.
+# --------------------------------------------------------------------------------------
+VIGIA_MODELOS = {"A": "gemini-3.5-flash-lite", "B": "gemini-3.8-flash"}
+VIGIA_NOMBRE = {"A": "Flash-Lite", "B": "3.8 Flash"}
+VIGIA_MAX_DIA = 40
+VIGIA_PLAZO_S = 180
+VIGIA_HILOS = 8
+VIGIA_MAX_JUG = 15
+VIGIA_CONSULTAS = SAL / "vigia_consultas.csv"
+VIGIA_HECHOS = SAL / "vigia_hechos.csv"
+URL_SNAPS = "https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_{}.csv"
+VIGIA_ESTADOS = ("inactive", "out", "doubtful", "injured_reserve", "suspended", "released_or_traded", "other_official")
+VIGIA_NO_JUEGA = {"inactive", "out", "doubtful", "injured_reserve", "suspended", "released_or_traded"}
+VIGIA_FUENTES = ("official_inactive_list", "official_injury_report", "team_transaction", "team_or_coach_statement",
+                 "league_announcement")
+VIGIA_SIN_TITULAR = {"K", "P", "LS"}
+VIGIA_PILOTO_SEMANAS, VIGIA_PILOTO_MAX = 2, 4
+VIGIA_MIN_HECHOS, VIGIA_MIN_PRECISION, VIGIA_MAX_FALLAS, VIGIA_DIF_COBERTURA = 10, 0.90, 0.20, 0.05
+VIGIA_HOLGURA_MIN = 5                              # minutos de tolerancia de reloj para «fuente posterior a la consulta»
+ESTADO_ES = {"inactive": "inactivo", "out": "out", "doubtful": "doubtful", "injured_reserve": "lista de lesionados",
+             "suspended": "suspendido", "released_or_traded": "cortado o cambiado", "other_official": "otro"}
+FUENTE_ES = {"official_inactive_list": "lista oficial de inactivos", "official_injury_report": "reporte de lesiones",
+             "team_transaction": "movimiento oficial", "team_or_coach_statement": "declaración oficial",
+             "league_announcement": "anuncio de la NFL"}
+CAMPOS_VC = ["corrida_utc", "game_id", "semana", "game_type", "inicio_utc", "minutos_antes", "valida", "modelo_clave",
+             "modelo", "huella", "forma", "model_version", "estado", "http", "latencia_s", "costo_usd", "busquedas",
+             "evidencia_busqueda", "inactivos_visita", "inactivos_local", "titulares_visita", "titulares_local",
+             "n_hechos", "n_avisos", "detalle"]
+CAMPOS_VH = ["corrida_utc", "game_id", "semana", "modelo_clave", "huella", "equipo", "nombre", "posicion",
+             "estado_jugador", "tipo_fuente", "url", "publicada", "evidencia", "valido", "motivo_invalido", "gsis_id",
+             "cruce", "titular", "part_media", "es_qb_usado", "aviso", "minutos_antes", "nombre_roster"]
+VIGIA_SISTEMA = """You are a strict NFL player-availability fact checker using Google Search. Report ONLY official facts.
+Rules:
+1. Always search before answering. Your training data is out of date.
+2. Report a player only if an official source says he will NOT play this game: the team's official inactive list for
+   this game, the final injury report (Out or Doubtful), an official roster move (injured reserve, PUP, NFI, suspension,
+   release, trade), an on-record statement by the team or its head coach, or an NFL announcement.
+3. Never report rumors, anonymous sources ("sources say"), "expected to", "questionable", "game-time decision" or
+   predictions.
+4. source_url must be a page that appeared in your search results; never build or guess a URL. source_published is
+   that page's publication time in UTC (YYYY-MM-DDTHH:MM), or its date (YYYY-MM-DD) if no time is shown.
+5. evidence: what the source says, in 20 words or fewer.
+6. inactives_published: true only if you found the official inactive list for THIS game.
+7. Use the team codes given and return both teams. An empty players list is a valid answer."""
+VIGIA_USUARIO = """Now: {ahora_utc} UTC ({ahora_et} ET), {minutos} minutes before kickoff. NFL {temporada} {fase}.
+Game: {visita_nombre} ({visita}) at {local_nombre} ({local}), kickoff {inicio_utc} UTC.
+For EACH team, list the players who will not play this game according to official sources (at most 15 per team)."""
+VIGIA_TEXTO_JSON = ('\nAnswer ONLY with a JSON object of this form and nothing else: {"away": {"team": "@V@", '
+                    '"inactives_published": true, "players": [{"name": "Full Name", "position": "C", "status": '
+                    '"inactive|out|doubtful|injured_reserve|suspended|released_or_traded|other_official", "source_type": '
+                    '"official_inactive_list|official_injury_report|team_transaction|team_or_coach_statement|'
+                    'league_announcement", "source_url": "https://...", "source_published": "YYYY-MM-DDTHH:MM", '
+                    '"evidence": "..."}]}, "home": {"team": "@L@", "inactives_published": false, "players": []}}')
+_VIG = {}
+
+
+def vigia_esquema(visita, local):
+    def equipo(eq):
+        s = {"type": "string"}
+        jug = {"type": "object",
+               "properties": {"name": s, "position": s, "status": {"type": "string", "enum": list(VIGIA_ESTADOS)},
+                              "source_type": {"type": "string", "enum": list(VIGIA_FUENTES)}, "source_url": s,
+                              "source_published": s, "evidence": s},
+               "required": ["name", "position", "status", "source_type", "source_url", "source_published", "evidence"]}
+        return {"type": "object",
+                "properties": {"team": {"type": "string", "enum": [eq]}, "inactives_published": {"type": "boolean"},
+                               "players": {"type": "array", "maxItems": VIGIA_MAX_JUG, "items": jug}},
+                "required": ["team", "inactives_published", "players"]}
+    return {"type": "object", "properties": {"away": equipo(visita), "home": equipo(local)}, "required": ["away", "home"]}
+
+
+def vigia_huella(clave):
+    """Huella de la configuración completa del vigía para un modelo. Cambia → configuración nueva (se anota en cada fila)."""
+    cfg = dict(modelo=VIGIA_MODELOS[clave], via="generateContent", nivel="medium", mime=GEMINI_MIME, sistema=VIGIA_SISTEMA,
+               usuario=VIGIA_USUARIO, texto_json=VIGIA_TEXTO_JSON, respaldo_400="texto",
+               forma_esquema=json.dumps(vigia_esquema("AAA", "BBB"), sort_keys=True), herramientas=["google_search"],
+               plazo=VIGIA_PLAZO_S, hilos=VIGIA_HILOS, max_tokens=GEMINI_MAX_TOKENS)
+    return hashlib.md5(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+
+
+def vigia_cfg():
+    """(activo, tope diario) desde semana.ini [vigia]."""
+    cfg = configparser.ConfigParser()
+    if CONFIG.exists():
+        cfg.read(CONFIG)
+    sec = cfg["vigia"] if cfg.has_section("vigia") else {}
+    activo = str(sec.get("activo", "si")).strip().lower() not in ("no", "0", "false", "apagado")
+    try:
+        tope = int(str(sec.get("max_llamadas_dia", VIGIA_MAX_DIA)).strip() or VIGIA_MAX_DIA)
+    except ValueError:
+        tope = VIGIA_MAX_DIA
+    return activo, tope
+
+
+def vigia_precio(clave, cuando):
+    """USD por token (entrada, salida) del modelo en esa fecha (el razonamiento se cobra como salida)."""
+    if clave == "A":
+        return PRECIO_ENTRADA, PRECIO_SALIDA
+    return (0.75e-6, 3.75e-6) if cuando.astimezone(dt.timezone.utc).date() <= dt.date(2026, 12, 31) else (1.50e-6, 7.50e-6)
+
+
+def vigia_cuerpo(j, momento, con_esquema=True):
+    fase = (f"regular season, week {j['semana']}" if j.get("game_type", "REG") == "REG"
+            else f"postseason, {RONDAS.get(j['game_type'], j['game_type'])}")
+    txt = VIGIA_USUARIO.format(ahora_utc=momento.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                               ahora_et=_fmt_et(momento), minutos=max(int((j["inicio"] - momento).total_seconds() // 60), 0),
+                               temporada=TEMPORADA, fase=fase,
+                               visita_nombre=EQUIPOS.get(j["visita"], j["visita"]), visita=j["visita"],
+                               local_nombre=EQUIPOS.get(j["local"], j["local"]), local=j["local"],
+                               inicio_utc=j["inicio"].astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"))
+    gc = {"thinkingConfig": {"thinkingLevel": "medium"}, "maxOutputTokens": GEMINI_MAX_TOKENS}
+    if con_esquema:
+        gc["responseFormat"] = {"text": {"mimeType": GEMINI_MIME, "schema": vigia_esquema(j["visita"], j["local"])}}
+    else:
+        txt += VIGIA_TEXTO_JSON.replace("@V@", j["visita"]).replace("@L@", j["local"])
+    return {"systemInstruction": {"parts": [{"text": VIGIA_SISTEMA}]},
+            "contents": [{"role": "user", "parts": [{"text": txt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": gc}
+
+
+def vigia_leer(datos, j, clave, momento):
+    """Respuesta de generateContent → costo, búsquedas y, por equipo, si encontró la lista de inactivos y los hechos."""
+    u = datos.get("usageMetadata") or {}
+    ent = int(u.get("promptTokenCount") or 0) + int(u.get("toolUsePromptTokenCount") or 0)
+    sal = int(u.get("candidatesTokenCount") or 0) + int(u.get("thoughtsTokenCount") or 0)
+    pe, ps = vigia_precio(clave, momento)
+    out = dict(model_version=_texto(datos.get("modelVersion")), costo_usd=round(ent * pe + sal * ps, 6))
+    cand = (datos.get("candidates") or [{}])[0] or {}
+    gm = cand.get("groundingMetadata") or {}
+    out["busquedas"] = len({_texto(q) for q in (gm.get("webSearchQueries") or []) if _texto(q)})
+    partes = ((cand.get("content") or {}).get("parts")) or []
+    texto = "".join(p.get("text", "") for p in partes if isinstance(p, dict) and not p.get("thought"))
+    obj = _objeto_json(texto)
+    equipos, urls = {}, []
+    for lado, eq in (("away", j["visita"]), ("home", j["local"])):
+        x = (obj or {}).get(lado)
+        if not isinstance(x, dict) or DE_OTRAS.get(_texto(x.get("team")).upper(), _texto(x.get("team")).upper()) != eq:
+            continue
+        jugs = []
+        for p in (x.get("players") if isinstance(x.get("players"), list) else [])[:VIGIA_MAX_JUG]:
+            if not isinstance(p, dict):
+                continue
+            h = dict(nombre=_texto(p.get("name"))[:80], posicion=_texto(p.get("position")).upper()[:6],
+                     estado_jugador=_texto(p.get("status")).lower(), tipo_fuente=_texto(p.get("source_type")).lower(),
+                     url=_texto(p.get("source_url"))[:300], publicada=_texto(p.get("source_published"))[:25],
+                     evidencia=_texto(p.get("evidence"))[:200])
+            jugs.append(h)
+            if h["url"]:
+                urls.append(h["url"])
+        ib = _e2_bool(x.get("inactives_published"))
+        equipos[eq] = dict(inactivos="" if ib is None else int(ib), jugadores=jugs)
+    out["equipos"] = equipos
+    meta = bool((gm.get("webSearchQueries") or []) or (gm.get("groundingChunks") or []) or gm.get("searchEntryPoint"))
+    out["evidencia_busqueda"] = "metadatos" if meta else "enlace" if any(x.startswith(PREFIJO_BUSQUEDA) for x in urls) else "ninguna"
+    if obj is None:
+        out["estado"], out["detalle"] = "respuesta inválida", ("sin texto" if not texto else "no es JSON: " + texto[:150])
+    elif len(equipos) == 2:
+        out["estado"], out["detalle"] = "ok", ""
+    elif equipos:
+        out["estado"], out["detalle"] = "parcial", "respondió un solo equipo válido"
+    else:
+        out["estado"], out["detalle"] = "respuesta inválida", "JSON sin equipos válidos"
+    return out
+
+
+def vigia_llamar(llave, j, clave, momento, limite):
+    """Una consulta del vigía (un juego, un modelo). Un 400 con esquema pasa una vez al pedido sin esquema (no se cobra).
+    Nunca lanza excepciones ni registra la llave."""
+    import requests
+    base = dict(equipos={}, forma="esquema")
+    for forma in ("esquema", "texto"):
+        t0 = time.time()
+        resta = limite - t0
+        if resta < 5:
+            return {**base, "forma": forma, "estado": "tiempo agotado", "detalle": "sin tiempo para empezar", "latencia_s": 0.0}
+        try:
+            r = requests.post(f"{GEMINI_URL}/models/{VIGIA_MODELOS[clave]}:generateContent",
+                              headers={"x-goog-api-key": llave, "Content-Type": "application/json"},
+                              json=vigia_cuerpo(j, momento, forma == "esquema"), timeout=(min(10.0, resta), resta))
+        except requests.exceptions.Timeout:
+            return {**base, "forma": forma, "estado": "tiempo agotado", "latencia_s": round(time.time() - t0, 2)}
+        except Exception as e:  # noqa: BLE001 — solo el tipo: el texto podría traer datos de la conexión
+            return {**base, "forma": forma, "estado": "error de red", "detalle": type(e).__name__, "latencia_s": round(time.time() - t0, 2)}
+        lat = round(time.time() - t0, 2)
+        if r.status_code == 400 and forma == "esquema":
+            continue                                     # 400 = pedido rechazado (no se cobra): se prueba sin esquema
+        if r.status_code != 200:
+            try:
+                msg = _texto(((r.json() or {}).get("error") or {}).get("message"))
+            except Exception:  # noqa: BLE001
+                msg = ""
+            return {**base, "forma": forma, "estado": "error HTTP", "http": r.status_code, "detalle": msg[:300], "latencia_s": lat}
+        try:
+            datos = r.json()
+        except ValueError:
+            return {**base, "forma": forma, "estado": "respuesta inválida", "http": 200, "detalle": "la respuesta no es JSON", "latencia_s": lat}
+        return {**base, **vigia_leer(datos, j, clave, momento), "forma": forma, "http": 200, "latencia_s": lat}
+    return {**base, "forma": "texto", "estado": "error HTTP", "http": 400, "detalle": "400 con y sin esquema", "latencia_s": 0.0}
+
+
+def _fecha_fuente(txt):
+    """'YYYY-MM-DDTHH:MM[:SS][Z]' → datetime UTC; 'YYYY-MM-DD' → date; otra cosa → None."""
+    t = _texto(txt)
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$", t)
+    if not m:
+        return None
+    try:
+        if m.group(4) is None:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        x = dt.datetime.fromisoformat(t.replace("Z", "+00:00").replace(" ", "T"))
+        return (x if x.tzinfo else x.replace(tzinfo=dt.timezone.utc)).astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def vigia_validar(h, momento):
+    """'' si el hecho cumple el registro 55; si no, el motivo."""
+    if not h["nombre"]:
+        return "sin nombre"
+    if h["estado_jugador"] not in VIGIA_ESTADOS:
+        return "estado desconocido"
+    if h["tipo_fuente"] not in VIGIA_FUENTES:
+        return "fuente no oficial"
+    if not re.match(r"^https?://\S+$", h["url"]):
+        return "sin URL"
+    f = _fecha_fuente(h["publicada"])
+    if f is None:
+        return "sin fecha"
+    if isinstance(f, dt.datetime):
+        if f > momento + dt.timedelta(minutes=VIGIA_HOLGURA_MIN):
+            return "fuente posterior a la consulta"
+    elif f > momento.astimezone(dt.timezone.utc).date():
+        return "fuente posterior a la consulta"
+    return ""
+
+
+def vigia_datos(max_edad_h=12.0):
+    """(snaps 2026, roster 2026) de nflverse; None si no se pueden bajar ni hay copia."""
+    import polars as pl
+    if "d" in _VIG:
+        return _VIG["d"]
+    snaps = roster = None
+    if bajar(URL_SNAPS.format(TEMPORADA), DATOS / f"snap_counts_{TEMPORADA}.csv", 10_000, max_edad_h):
+        try:
+            snaps = pl.read_csv(DATOS / f"snap_counts_{TEMPORADA}.csv", infer_schema_length=0)
+        except Exception as e:  # noqa: BLE001
+            log(f"Vigía: no pude leer los snaps ({type(e).__name__})")
+    if bajar(URL_ROSTER.format(TEMPORADA), DATOS / f"roster_{TEMPORADA}.csv", 100_000, max_edad_h):
+        try:
+            roster = pl.read_csv(DATOS / f"roster_{TEMPORADA}.csv", infer_schema_length=0)
+        except Exception as e:  # noqa: BLE001
+            log(f"Vigía: no pude leer el roster ({type(e).__name__})")
+    _VIG["d"] = (snaps, roster)
+    return _VIG["d"]
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+GRUPO_POS = {"T": "OL", "G": "OL", "C": "OL", "OT": "OL", "OG": "OL", "OL": "OL", "LT": "OL", "RT": "OL", "LG": "OL",
+             "RG": "OL", "DE": "DL", "DT": "DL", "NT": "DL", "DL": "DL", "EDGE": "DL", "LB": "LB", "ILB": "LB", "OLB": "LB",
+             "MLB": "LB", "CB": "DB", "S": "DB", "SS": "DB", "FS": "DB", "DB": "DB", "NB": "DB", "RB": "RB", "HB": "RB",
+             "FB": "RB", "WR": "WR", "TE": "TE", "QB": "QB", "K": "K", "P": "P", "LS": "LS"}
+
+
+def _mismo_grupo(p1, p2):
+    """El roster de nflverse usa grupos (OL, DL, DB) y Gemini o los snaps usan posiciones (T, DE, CB): se comparan
+    grupos; DL y LB se aceptan entre sí (los «edge» figuran de las dos formas)."""
+    a, b = GRUPO_POS.get(_texto(p1).upper(), _texto(p1).upper()), GRUPO_POS.get(_texto(p2).upper(), _texto(p2).upper())
+    return a == b or {a, b} == {"DL", "LB"}
+
+
+class VigiaIndice:
+    """Roster y snaps de 2026 listos para cruzar nombres, decidir titulares habituales y verificar quién jugó."""
+
+    def __init__(self, snaps, roster, g26):
+        import polars as pl
+        self.por_eq, self.pfr_gsis, self.gsis_pfr, self.nombre, self.pos, self.eq_de = {}, {}, {}, {}, {}, {}
+        for f in (roster.iter_rows(named=True) if roster is not None else []):
+            g = _texto(f.get("gsis_id"))
+            if not g:
+                continue
+            eq, nom = _texto(f.get("team")), _texto(f.get("full_name"))
+            self.nombre[g], self.pos[g], self.eq_de[g] = nom, _texto(f.get("position")).upper(), eq
+            apel = _texto(f.get("last_name")) or (nom.split()[-1] if nom.split() else "")
+            self.por_eq.setdefault(eq, []).append((g, _norm(nom), _norm(apel), self.pos[g]))
+            pfr = _texto(f.get("pfr_id"))
+            if pfr:
+                self.pfr_gsis[pfr], self.gsis_pfr[g] = g, pfr
+        self.part, self.pos_pfr, self.nom_pfr, self.jugaron, self.con_snaps = {}, {}, {}, {}, set()
+        for f in (snaps.filter(pl.col("game_type") == "REG").iter_rows(named=True) if snaps is not None else []):
+            gid, eq, pfr = _texto(f.get("game_id")), _texto(f.get("team")), _texto(f.get("pfr_player_id"))
+            if not gid or not eq or not pfr:
+                continue
+            self.con_snaps.add(gid)
+            tot = _f(f.get("offense_snaps")) + _f(f.get("defense_snaps")) + _f(f.get("st_snaps"))
+            if tot > 0:
+                self.jugaron.setdefault(gid, set()).add(pfr)
+            self.part.setdefault(eq, {}).setdefault(pfr, {})[gid] = max(_f(f.get("offense_pct")), _f(f.get("defense_pct")))
+            self.pos_pfr[pfr], self.nom_pfr[pfr] = _texto(f.get("position")).upper(), _texto(f.get("player"))
+        self.juegos_eq = {}
+        for r in g26.sort("inicio").iter_rows(named=True):
+            if r.get("inicio") is None:
+                continue
+            for eq in (r["away_team"], r["home_team"]):
+                self.juegos_eq.setdefault(eq, []).append((r["game_id"], r["inicio"]))
+
+    def gsis_por_nombre(self, eq, nombre, pos=""):
+        """Nombre → gsis: igual nombre normalizado en el roster del equipo; si no, apellido único (con la misma posición si
+        la hay); si no, nombre igual en toda la liga (jugador recién cambiado de equipo). ('', 'sin cruzar') si no se puede."""
+        n = _norm(nombre)
+        if not n:
+            return "", "sin cruzar"
+        lista = self.por_eq.get(eq, [])
+        c = [g for g, nf, _, _ in lista if nf == n]
+        if len(c) > 1 and pos:
+            c = [g for g in c if _mismo_grupo(self.pos.get(g, ""), pos)] or c
+        if len(c) == 1:
+            return c[0], "nombre"
+        partes = _texto(nombre).replace(".", " ").split()
+        ap = _norm(partes[-1]) if partes else ""
+        if ap in ("jr", "sr", "ii", "iii", "iv", "v", "") and len(partes) > 1:
+            ap = _norm(partes[-2])
+        c = [g for g, _, nl, p in lista if ap and nl == ap and (not pos or _mismo_grupo(p, pos))]
+        if len(c) == 1:
+            return c[0], "apellido"
+        c = [g for e, gl in self.por_eq.items() for g, nf, _, _ in gl if nf == n]
+        if len(c) == 1:
+            return c[0], "nombre (otro equipo)"
+        return "", "sin cruzar"
+
+    def titulares(self, eq, antes):
+        """{gsis o 'pfr:ID': dict(part, pos, nombre, pfr)}: participación media (máximo de ataque y defensa) ≥ 50 % en los
+        últimos 4 partidos del equipo con snaps antes de 'antes' (0 si no jugó); sin K, P ni LS. None si hay < 2."""
+        juegos = [gid for gid, ini in self.juegos_eq.get(eq, []) if ini < antes and gid in self.con_snaps][-4:]
+        if len(juegos) < 2:
+            return None
+        out = {}
+        for pfr, partes in self.part.get(eq, {}).items():
+            m = sum(partes.get(g, 0.0) for g in juegos) / len(juegos)
+            if m < 0.5 or self.pos_pfr.get(pfr) in VIGIA_SIN_TITULAR:
+                continue
+            g = self.pfr_gsis.get(pfr) or self.gsis_por_nombre(eq, self.nom_pfr.get(pfr, ""), self.pos_pfr.get(pfr, ""))[0]
+            out[g or f"pfr:{pfr}"] = dict(part=round(m, 3), pos=self.pos_pfr.get(pfr, ""), nombre=self.nom_pfr.get(pfr, ""), pfr=pfr)
+        return out
+
+    def jugo(self, gid, gsis, pfr=""):
+        """1 si jugó (algún snap), 0 si no, None si ese juego todavía no tiene snaps o no se puede saber."""
+        if gid not in self.con_snaps:
+            return None
+        pfr = pfr or self.gsis_pfr.get(gsis, "")
+        if not pfr:
+            return None
+        return int(pfr in self.jugaron.get(gid, set()))
+
+
+def _tit_txt(tit):
+    return "" if tit is None else ";".join(f"{g}|{d['pos']}|{d['part']}|{d['pfr']}" for g, d in sorted(tit.items()))
+
+
+def _tit_leer(txt):
+    out = {}
+    for p in _texto(txt).split(";"):
+        x = p.split("|")
+        if len(x) >= 4 and x[0]:
+            out[x[0]] = dict(pos=x[1], part=_f(x[2]), pfr=x[3])
+    return out
+
+
+def _anexar_csv(ruta, campos, filas, prefijo):
+    SAL.mkdir(parents=True, exist_ok=True)
+    if ruta.exists():
+        with open(ruta, encoding="utf-8") as fh:
+            if fh.readline().strip().split(",") != campos:
+                viejo = ruta.with_name(f"{prefijo}_previo_{int(time.time())}.csv")
+                ruta.rename(viejo)
+                log(f"Vigía: {ruta.name} tenía otras columnas; lo guardé como {viejo.name}")
+    nuevo = not ruta.exists()
+    with open(ruta, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=campos)
+        if nuevo:
+            w.writeheader()
+        for f in filas:
+            w.writerow({k: ("" if f.get(k) is None else f.get(k)) for k in campos})
+
+
+def _leer_csv(ruta):
+    if not ruta.exists():
+        return []
+    with open(ruta, encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def vigia_modelos(estado):
+    """Modelos que consultan: el elegido por la regla del piloto, o los dos mientras no haya ganador."""
+    el = (estado.get("vigia") or {}).get("elegido")
+    return [el["clave"]] if el and el.get("clave") in VIGIA_MODELOS else ["A", "B"]
+
+
+def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
+    """El vigía de una corrida automática T−85 (después de g1). pendientes = [(juego, FuentesQB)]; filas_proy = las filas
+    de la proyección de esta corrida (para saber con qué QB proyectó la máquina). Devuelve el resumen para Telegram y la
+    hoja, o None. Nunca detiene la corrida."""
+    try:
+        activo, tope = vigia_cfg()
+        if not pendientes or not GEMINI_LLAVE.exists() or not activo:
+            return None
+        from concurrent.futures import ThreadPoolExecutor, wait
+        try:
+            vigia_piloto_aplicar(g26, estado, ahora)
+        except Exception as e:  # noqa: BLE001
+            log(f"Vigía: no pude evaluar el piloto ({type(e).__name__}); sigo con los modelos de antes")
+        claves = vigia_modelos(estado)
+        juegos = [j for j, _ in pendientes]
+        momento = e2_momento(ahora)
+        hoy = momento.astimezone(CARACAS).date().isoformat()
+        usado = estado.setdefault("vigia_dia", {})
+        for k in [k for k in usado if k != hoy]:
+            usado.pop(k)
+        tareas_v = [(j, c) for j in juegos for c in claves]
+        disponibles = max(tope - usado.get(hoy, 0), 0)
+        a_consultar, sin_cupo = tareas_v[:disponibles], tareas_v[disponibles:]
+        usado[hoy] = usado.get(hoy, 0) + len(a_consultar)
+        snaps, roster = vigia_datos()
+        ind = VigiaIndice(snaps, roster, g26)
+        qb_usado = {}
+        for f in filas_proy:
+            qb_usado[(f["game_id"], f["local"])] = _texto(f.get("qb_local_id"))
+            qb_usado[(f["game_id"], f["visita"])] = _texto(f.get("qb_visita_id"))
+        llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+        t0 = time.time()
+        limite = t0 + VIGIA_PLAZO_S
+        res = {}
+        if a_consultar:
+            ex = ThreadPoolExecutor(max_workers=VIGIA_HILOS)
+            futs = {ex.submit(vigia_llamar, llave, j, c, momento, limite): (j, c) for j, c in a_consultar}
+            hechos, _ = wait(futs, timeout=max(limite - time.time(), 0) + 1.0)
+            for fu, (j, c) in futs.items():
+                res[(j["game_id"], c)] = (fu.result() if fu in hechos and fu.exception() is None else
+                                          dict(equipos={}, forma="esquema", estado="tiempo agotado", latencia_s=float(VIGIA_PLAZO_S),
+                                               detalle="" if fu not in hechos else f"excepción {type(fu.exception()).__name__}"))
+            ex.shutdown(wait=False, cancel_futures=True)
+        del llave
+        for j, c in sin_cupo:
+            res[(j["game_id"], c)] = dict(equipos={}, forma="", estado="tope", detalle=f"tope de {tope} consultas del día", latencia_s=0.0)
+        filas_c, filas_h = [], []
+        resumen = dict(momento=momento, semanas=sorted({j["semana"] for j in juegos}), claves=claves, juegos=[], costo=0.0,
+                       consultas={c: [0, 0] for c in claves}, inactivos=[0, 0], inicio=min(j["inicio"] for j in juegos))
+        for j in juegos:
+            gid = j["game_id"]
+            minutos = round((j["inicio"] - momento).total_seconds() / 60, 1)
+            valida = int(minutos > 0)
+            tit = {eq: ind.titulares(eq, j["inicio"]) for eq in (j["visita"], j["local"])}
+            avisos = {j["visita"]: {}, j["local"]: {}}
+            inact_eq = {j["visita"]: False, j["local"]: False}
+            for c in claves:
+                x = res[(gid, c)]
+                n_h = n_a = 0
+                if x["estado"] != "tope":
+                    resumen["consultas"][c][1] += 1
+                    resumen["consultas"][c][0] += int(x["estado"] in ("ok", "parcial"))
+                resumen["costo"] += float(x.get("costo_usd") or 0)
+                for eq in (j["visita"], j["local"]):
+                    e = x["equipos"].get(eq)
+                    if not e:
+                        continue
+                    if e.get("inactivos") == 1:
+                        inact_eq[eq] = True
+                    vistos = set()
+                    for h in e["jugadores"]:
+                        motivo = vigia_validar(h, momento)
+                        g, cruce = ind.gsis_por_nombre(eq, h["nombre"], h["posicion"]) if h["nombre"] else ("", "sin cruzar")
+                        tt = (tit.get(eq) or {}).get(g) if g else None
+                        es_qb = int(bool(g) and g == qb_usado.get((gid, eq), ""))
+                        pos = (tt or {}).get("pos") or ind.pos.get(g, "") or h["posicion"]
+                        aviso = int(not motivo and valida == 1 and h["estado_jugador"] in VIGIA_NO_JUEGA and bool(g)
+                                    and g not in vistos and ((tt is not None and pos != "QB") or es_qb == 1))
+                        if g:
+                            vistos.add(g)
+                        n_h += 1
+                        n_a += aviso
+                        filas_h.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], modelo_clave=c,
+                                            huella=vigia_huella(c), equipo=eq, nombre=h["nombre"], posicion=h["posicion"],
+                                            estado_jugador=h["estado_jugador"], tipo_fuente=h["tipo_fuente"], url=h["url"],
+                                            publicada=h["publicada"], evidencia=h["evidencia"], valido=int(not motivo),
+                                            motivo_invalido=motivo, gsis_id=g, cruce=cruce, titular=int(tt is not None),
+                                            part_media="" if tt is None else tt["part"], es_qb_usado=es_qb, aviso=aviso,
+                                            minutos_antes=minutos, nombre_roster=ind.nombre.get(g, "") if g else ""))
+                        if aviso:
+                            a = avisos[eq].setdefault(g, dict(nombre=ind.nombre.get(g) or h["nombre"], pos=pos, qb=es_qb,
+                                                              estado=h["estado_jugador"], fuente=h["tipo_fuente"], modelos=[]))
+                            if c not in a["modelos"]:
+                                a["modelos"].append(c)
+                filas_c.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], game_type=j.get("game_type", "REG"),
+                                    inicio_utc=iso(j["inicio"]), minutos_antes=minutos, valida=valida, modelo_clave=c,
+                                    modelo=VIGIA_MODELOS[c], huella=vigia_huella(c), forma=x.get("forma", ""),
+                                    model_version=x.get("model_version", ""), estado=x["estado"], http=x.get("http", ""),
+                                    latencia_s=x.get("latencia_s", ""), costo_usd=x.get("costo_usd", ""),
+                                    busquedas=x.get("busquedas", ""), evidencia_busqueda=x.get("evidencia_busqueda", ""),
+                                    inactivos_visita=(x["equipos"].get(j["visita"]) or {}).get("inactivos", ""),
+                                    inactivos_local=(x["equipos"].get(j["local"]) or {}).get("inactivos", ""),
+                                    titulares_visita=_tit_txt(tit[j["visita"]]), titulares_local=_tit_txt(tit[j["local"]]),
+                                    n_hechos=n_h, n_avisos=n_a, detalle=x.get("detalle", "")))
+            resumen["inactivos"][0] += sum(inact_eq.values())
+            resumen["inactivos"][1] += 2
+            resumen["juegos"].append(dict(game_id=gid, visita=j["visita"], local=j["local"], valida=valida, avisos=avisos,
+                                          sin_titulares=[eq for eq in (j["visita"], j["local"]) if tit[eq] is None]))
+        _anexar_csv(VIGIA_CONSULTAS, CAMPOS_VC, filas_c, "vigia_consultas")
+        _anexar_csv(VIGIA_HECHOS, CAMPOS_VH, filas_h, "vigia_hechos")
+        n_av = sum(len(v) for jj in resumen["juegos"] for v in jj["avisos"].values())
+        log(f"Vigía ({'+'.join(claves)}; " + ", ".join(f"{c} {vigia_huella(c)}" for c in claves) + f"): {len(juegos)} juegos en "
+            f"{time.time() - t0:.1f} s · " + " · ".join(f"{VIGIA_NOMBRE[c]} {resumen['consultas'][c][0]}/{resumen['consultas'][c][1]}"
+                                                       for c in claves)
+            + f" · {len(filas_h)} hechos · {n_av} avisos · USD {resumen['costo']:.4f}")
+        return resumen
+    except Exception as e:  # noqa: BLE001
+        log(f"Vigía: error ({type(e).__name__}: {str(e)[:200]}); la proyección, g1 y e2 no se afectan")
+        return None
+
+
+def texto_vigia(resumen):
+    """Mensaje de Telegram del vigía (aparte de la proyección)."""
+    piloto = len(resumen["claves"]) > 1
+    lin = [f"🔎 VIGÍA T−85 · semana {', '.join(map(str, resumen['semanas']))} · juegos de las {fecha_cc(resumen['inicio'])} (Caracas)"
+           + (" · piloto: Flash-Lite y 3.8 Flash" if piloto else f" · {VIGIA_NOMBRE[resumen['claves'][0]]}")]
+    sin = []
+    for jj in resumen["juegos"]:
+        nombre = f"{jj['visita']} @ {jj['local']}"
+        partes = []
+        for eq in (jj["visita"], jj["local"]):
+            av = jj["avisos"][eq]
+            qb = [a for a in av.values() if a["qb"]]
+            otros = [a for a in av.values() if not a["qb"]]
+            marca = lambda a: (" [los dos]" if len(a["modelos"]) > 1 else f" [solo {VIGIA_NOMBRE[a['modelos'][0]]}]") if piloto else ""  # noqa: E731
+            for a in qb:
+                partes.append(f"⚠️ {eq}: la máquina proyectó con {a['nombre']} y la fuente oficial lo da fuera "
+                              f"({ESTADO_ES.get(a['estado'], a['estado'])} · {FUENTE_ES.get(a['fuente'], a['fuente'])}){marca(a)}")
+            if otros:
+                lista = ", ".join(f"{a['pos']} {a['nombre']} ({ESTADO_ES.get(a['estado'], a['estado'])} · "
+                                  f"{FUENTE_ES.get(a['fuente'], a['fuente'])}){marca(a)}" for a in otros)
+                partes.append(f"🔎 {eq}: falta{'n' if len(otros) > 1 else ''} {len(otros)} titular{'es' if len(otros) > 1 else ''} "
+                              f"que la máquina no conoce: {lista}")
+        if not jj["valida"]:
+            partes.append(f"{nombre}: consulta después del inicio (no cuenta)")
+        if partes:
+            lin.append(f"{nombre}:")
+            lin += ["  " + p for p in partes]
+        else:
+            sin.append(nombre)
+        if jj["sin_titulares"]:
+            lin.append(f"  (sin titulares calculables todavía: {', '.join(jj['sin_titulares'])})")
+    if sin:
+        lin.append("Sin bajas de titulares: " + ", ".join(sin))
+    lin.append(f"Lista oficial de inactivos encontrada en {resumen['inactivos'][0]} de {resumen['inactivos'][1]} equipos · consultas "
+               + ", ".join(f"{VIGIA_NOMBRE[c]} {v[0]}/{v[1]}" for c, v in resumen["consultas"].items())
+               + f" · USD {resumen['costo']:.3f}".replace(".", ","))
+    lin.append("Solo hechos con fuente oficial; el código decide quién es titular (snaps). No cambia la máquina ni las selecciones.")
+    return "\n".join(lin)
+
+
+def vigia_avisos_semana(semana):
+    """{game_id: {equipo: [aviso, …]}} de la última corrida del vigía de cada juego de la semana (juntando los modelos)."""
+    filas = [f for f in _leer_csv(VIGIA_HECHOS) if f.get("semana") == str(semana)]
+    ultima = {}
+    for f in filas:
+        if f["corrida_utc"] > ultima.get(f["game_id"], ""):
+            ultima[f["game_id"]] = f["corrida_utc"]
+    out = {}
+    for f in filas:
+        if f["corrida_utc"] != ultima.get(f["game_id"]) or f.get("aviso") != "1":
+            continue
+        eq = out.setdefault(f["game_id"], {}).setdefault(f["equipo"], {})
+        a = eq.setdefault(f["gsis_id"], dict(nombre=f.get("nombre_roster") or f["nombre"], pos=f["posicion"],
+                                             qb=f.get("es_qb_usado") == "1", modelos=[]))
+        if f["modelo_clave"] not in a["modelos"]:
+            a["modelos"].append(f["modelo_clave"])
+    return {g: {e: list(v.values()) for e, v in d.items()} for g, d in out.items()}
+
+
+def vigia_frase(av):
+    """Texto que se agrega a la columna de la máquina (E) cuando el vigía avisó en ese juego."""
+    if not av:
+        return ""
+    partes = []
+    for eq, lista in sorted(av.items()):
+        qb = [a for a in lista if a["qb"]]
+        otros = [a for a in lista if not a["qb"]]
+        if qb:
+            partes.append(f"la fuente oficial da fuera al QB con que proyectó la máquina ({apodo(eq)}: {qb[0]['nombre']})")
+        if otros:
+            n = len(otros)
+            partes.append(f"a {apodo(eq)} le falta{'n' if n > 1 else ''} {n} titular{'es' if n > 1 else ''} que la máquina no "
+                          f"conoce ({', '.join(a['nombre'] for a in otros[:4])}{'…' if n > 4 else ''})")
+    return " · 🔎 el vigía: " + "; ".join(partes)
+
+
+def vigia_verificar(g26):
+    """Verificación con los snaps (código, sin IA). Devuelve (métricas por (modelo, semana), filas de hechos con 'jugo')."""
+    consultas = [f for f in _leer_csv(VIGIA_CONSULTAS) if f.get("valida") == "1"]
+    hechos = [f for f in _leer_csv(VIGIA_HECHOS) if f.get("minutos_antes") and _f(f.get("minutos_antes")) > 0]
+    if not consultas:
+        return {}, []
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    met = {}
+
+    def m_(c, s):
+        return met.setdefault((c, s), dict(consultas=0, fallas=0, hechos=0, verificables=0, correctos=0,
+                                           no_jugaron=0, avisados=0, juegos=set(), sin_snaps=set()))
+    ult = {}
+    for f in consultas:                              # la última consulta de cada juego y modelo (una por corrida T−85)
+        k = (f["game_id"], f["modelo_clave"])
+        if f["corrida_utc"] > ult.get(k, ""):
+            ult[k] = f["corrida_utc"]
+    filas_ver = []
+    for f in consultas:
+        k = (f["game_id"], f["modelo_clave"])
+        if f["corrida_utc"] != ult[k] or f["estado"] == "tope":
+            continue
+        s, c, gid = int(f["semana"]), f["modelo_clave"], f["game_id"]
+        m = m_(c, s)
+        m["consultas"] += 1
+        m["fallas"] += int(f["estado"] not in ("ok", "parcial"))
+        m["juegos"].add(gid)
+        if gid not in ind.con_snaps:
+            m["sin_snaps"].add(gid)
+        hs = [h for h in hechos if h["game_id"] == gid and h["modelo_clave"] == c and h["corrida_utc"] == f["corrida_utc"]]
+        avisados = {}
+        for h in hs:
+            if h["valido"] == "1" and h["estado_jugador"] in VIGIA_NO_JUEGA and h["gsis_id"]:
+                avisados.setdefault(h["equipo"], set()).add(h["gsis_id"])
+        vistos = set()
+        for h in hs:
+            jugo = None
+            if h["gsis_id"]:
+                tt = _tit_leer(f["titulares_local"] if h["equipo"] == gid.split("_")[-1] else f["titulares_visita"]).get(h["gsis_id"])
+                jugo = ind.jugo(gid, h["gsis_id"], (tt or {}).get("pfr", ""))
+            filas_ver.append({**h, "jugo": "" if jugo is None else jugo})
+            clave_h = (h["equipo"], h["gsis_id"])
+            if (h["valido"] == "1" and h["titular"] == "1" and h["estado_jugador"] in VIGIA_NO_JUEGA and h["gsis_id"]
+                    and clave_h not in vistos):
+                vistos.add(clave_h)
+                m["hechos"] += 1
+                if jugo is not None:
+                    m["verificables"] += 1
+                    m["correctos"] += int(jugo == 0)
+        for eq, col in ((gid.split("_")[-2], "titulares_visita"), (gid.split("_")[-1], "titulares_local")):
+            if f.get("inactivos_visita" if col == "titulares_visita" else "inactivos_local", "") == "":
+                continue                                 # el modelo no respondió por ese equipo
+            for g, d in _tit_leer(f[col]).items():
+                jugo = ind.jugo(gid, g, d.get("pfr", ""))
+                if jugo == 0:
+                    m["no_jugaron"] += 1
+                    m["avisados"] += int(g in avisados.get(eq, set()))
+    for m in met.values():
+        m["precision"] = (m["correctos"] / m["verificables"]) if m["verificables"] else None
+        m["cobertura"] = (m["avisados"] / m["no_jugaron"]) if m["no_jugaron"] else None
+        m["tasa_fallas"] = (m["fallas"] / m["consultas"]) if m["consultas"] else None
+    return met, filas_ver
+
+
+def vigia_piloto(met):
+    """Regla del piloto (registro 55, escrita antes). Devuelve dict(estado, semanas, por_modelo, ganador, motivo)."""
+    semanas = sorted({s for (c, s) in met if c == "A"} & {s for (c, s) in met if c == "B"})
+    if len(semanas) < VIGIA_PILOTO_SEMANAS:
+        return dict(estado="en curso", semanas=semanas, por_modelo={}, ganador=None,
+                    motivo=f"{len(semanas)} de {VIGIA_PILOTO_SEMANAS} semanas con los dos modelos")
+
+    def junta(c, ss):
+        t = dict(consultas=0, fallas=0, hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0, sin_snaps=0)
+        for s in ss:
+            m = met.get((c, s))
+            if m:
+                for k in t:
+                    t[k] += len(m[k]) if k == "sin_snaps" else m[k]
+        t["precision"] = t["correctos"] / t["verificables"] if t["verificables"] else None
+        t["cobertura"] = t["avisados"] / t["no_jugaron"] if t["no_jugaron"] else None
+        t["tasa_fallas"] = t["fallas"] / t["consultas"] if t["consultas"] else None
+        return t
+    k = VIGIA_PILOTO_SEMANAS
+    while True:
+        ss = semanas[:k]
+        pm = {c: junta(c, ss) for c in ("A", "B")}
+        if any(pm[c]["sin_snaps"] for c in pm):
+            return dict(estado="en curso", semanas=ss, por_modelo=pm, ganador=None, motivo="faltan snaps de nflverse de esas semanas")
+        if all(pm[c]["verificables"] >= VIGIA_MIN_HECHOS for c in pm) or k >= VIGIA_PILOTO_MAX:
+            break
+        if len(semanas) <= k:
+            return dict(estado="en curso", semanas=ss, por_modelo=pm, ganador=None,
+                        motivo=f"menos de {VIGIA_MIN_HECHOS} hechos verificables: el piloto se alarga una semana")
+        k += 1
+    eleg = [c for c in ("A", "B") if pm[c]["precision"] is not None and pm[c]["precision"] >= VIGIA_MIN_PRECISION
+            and pm[c]["verificables"] >= VIGIA_MIN_HECHOS and (pm[c]["tasa_fallas"] or 0) <= VIGIA_MAX_FALLAS]
+    if not eleg:
+        return dict(estado="sin ganador", semanas=ss, por_modelo=pm, ganador=None,
+                    motivo="ninguno cumple precisión ≥ 90 %, ≥ 10 hechos y ≤ 20 % de fallas: siguen los dos y decide Ozz")
+    if len(eleg) == 1:
+        return dict(estado="decidido", semanas=ss, por_modelo=pm, ganador=eleg[0], motivo=f"solo {VIGIA_NOMBRE[eleg[0]]} es elegible")
+    ca, cb = pm["A"]["cobertura"] or 0.0, pm["B"]["cobertura"] or 0.0
+    if abs(ca - cb) < VIGIA_DIF_COBERTURA:
+        return dict(estado="decidido", semanas=ss, por_modelo=pm, ganador="A",
+                    motivo="los dos elegibles y la cobertura difiere menos de 5 pp: gana el más barato (Flash-Lite)")
+    g = "A" if ca > cb else "B"
+    return dict(estado="decidido", semanas=ss, por_modelo=pm, ganador=g, motivo=f"los dos elegibles: gana la mayor cobertura ({VIGIA_NOMBRE[g]})")
+
+
+def vigia_piloto_aplicar(g26, estado, ahora):
+    """Si la regla ya da resultado y todavía no se aplicó, lo anota en el estado (una sola vez). Devuelve (piloto, métricas)."""
+    v = estado.setdefault("vigia", {})
+    met, _ = vigia_verificar(g26)
+    p = vigia_piloto(met)
+    if not v.get("elegido") and not v.get("sin_ganador") and p["estado"] in ("decidido", "sin ganador"):
+        resumen_pm = {c: {k: (round(x, 4) if isinstance(x, float) else x) for k, x in d.items()} for c, d in p["por_modelo"].items()}
+        reg = dict(fecha=iso(ahora), semanas=p["semanas"], motivo=p["motivo"], por_modelo=resumen_pm)
+        if p["ganador"]:
+            v["elegido"] = dict(clave=p["ganador"], modelo=VIGIA_MODELOS[p["ganador"]], **reg)
+            log(f"Vigía: piloto decidido por la regla → {VIGIA_NOMBRE[p['ganador']]} ({p['motivo']})")
+        else:
+            v["sin_ganador"] = reg
+            log(f"Vigía: piloto sin ganador ({p['motivo']})")
+    return p, met
+
+
+def texto_vigia_piloto(p, estado):
+    v = estado.get("vigia") or {}
+    if v.get("elegido"):
+        e = v["elegido"]
+        return f"Piloto del vigía: decidido el {fecha_cc(t_utc(e['fecha']))} → {VIGIA_NOMBRE[e['clave']]} ({e['motivo']})"
+    if v.get("sin_ganador"):
+        return f"Piloto del vigía: sin ganador ({v['sin_ganador']['motivo']})"
+    if p["estado"] == "decidido":
+        return f"Piloto del vigía: la regla eligió {VIGIA_NOMBRE[p['ganador']]} ({p['motivo']}); se aplica en la próxima T−85"
+    if p["estado"] == "sin ganador":
+        return f"Piloto del vigía: sin ganador ({p['motivo']}); se anota en la próxima T−85"
+    return f"Piloto del vigía: en curso ({p['motivo']}; semanas {', '.join(map(str, p['semanas'])) or '—'})"
+
+
+def texto_vigia_estado(ahora, estado):
+    """Conteos del vigía para el modo estado (y /estado por Telegram)."""
+    activo, tope = vigia_cfg()
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    claves = vigia_modelos(estado)
+    cab = (f"Vigía (55): {'activo' if activo else 'APAGADO en semana.ini'} · "
+           + (f"piloto {' + '.join(VIGIA_NOMBRE[c] for c in claves)}" if len(claves) > 1 else f"modelo elegido {VIGIA_NOMBRE[claves[0]]}")
+           + " · huellas " + ", ".join(f"{c} {vigia_huella(c)}" for c in claves)
+           + f" · hoy {estado.get('vigia_dia', {}).get(hoy, 0)}/{tope} consultas")
+    cons = [f for f in _leer_csv(VIGIA_CONSULTAS) if f.get("valida") == "1"]
+    if not cons:
+        return cab + " · todavía sin consultas (empieza en la próxima T−85 automática)"
+    hs = [f for f in _leer_csv(VIGIA_HECHOS) if f.get("aviso") == "1"]
+    costo = sum(_f(f.get("costo_usd")) for f in _leer_csv(VIGIA_CONSULTAS))
+    return (cab + f" · {len({f['game_id'] for f in cons})} juegos consultados · {len(hs)} avisos (sumando modelos) · "
+            f"USD {costo:.2f}")
+
+
+VIGIA_MAX_PRUEBA_DIA = 4                           # consultas reales de prueba por día (aparte; nunca cuentan)
+
+
+def vigia_prueba_real(g26, ahora, estado):
+    """Una consulta REAL por modelo sobre el próximo juego (para ver que Google acepta el pedido de los dos modelos).
+    No escribe en los registros del vigía, no cuenta para el piloto ni para nada; tope aparte de 4 por día."""
+    import polars as pl
+    if not GEMINI_LLAVE.exists():
+        return "Sin credenciales/gemini.key: el vigía no puede consultar."
+    prox = g26.filter(pl.col("inicio") > ahora).sort("inicio").head(1)
+    if prox.height == 0:
+        return "No hay juegos por jugar en el calendario."
+    r = prox.row(0, named=True)
+    j = dict(game_id=r["game_id"], semana=int(r["week"]), game_type=r["game_type"], visita=r["away_team"], local=r["home_team"],
+             inicio=r["inicio"])
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    usado = estado.setdefault("vigia_prueba", {})
+    for k in [k for k in usado if k != hoy]:
+        usado.pop(k)
+    if usado.get(hoy, 0) + 2 > VIGIA_MAX_PRUEBA_DIA:
+        return f"Tope de pruebas reales del día ({VIGIA_MAX_PRUEBA_DIA} consultas): prueba mañana."
+    usado[hoy] = usado.get(hoy, 0) + 2
+    momento = e2_momento(ahora)
+    llave = GEMINI_LLAVE.read_text(encoding="utf-8").strip()
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    tit = {eq: ind.titulares(eq, j["inicio"]) for eq in (j["visita"], j["local"])}
+    lin = [f"Prueba REAL del vigía (no cuenta): {j['visita']} @ {j['local']} · {fecha_cc(j['inicio'])} Caracas · "
+           f"titulares calculados: {j['visita']} {len(tit[j['visita']] or {})}, {j['local']} {len(tit[j['local']] or {})}"]
+    for c in ("A", "B"):
+        x = vigia_llamar(llave, j, c, momento, time.time() + VIGIA_PLAZO_S)
+        hs = [(eq, h) for eq, e in x.get("equipos", {}).items() for h in e["jugadores"]]
+        val = [(eq, h) for eq, h in hs if not vigia_validar(h, momento)]
+        cruz = [(eq, h) for eq, h in val if ind.gsis_por_nombre(eq, h["nombre"], h["posicion"])[0]]
+        lin.append(f"  {VIGIA_NOMBRE[c]} ({VIGIA_MODELOS[c]}): {x['estado']}" + (f" (HTTP {x['http']})" if x.get("http") not in (None, "", 200) else "")
+                   + f" · forma {x.get('forma', '')} · {x.get('latencia_s', 0)} s · USD {float(x.get('costo_usd') or 0):.4f} · "
+                   f"{len(hs)} hechos, {len(val)} válidos, {len(cruz)} cruzados con el roster"
+                   + (f" · {x.get('detalle')}" if x.get("detalle") else ""))
+        for eq, h in hs[:6]:
+            lin.append(f"    {eq} {h['posicion']} {h['nombre']} · {h['estado_jugador']} · {h['tipo_fuente']} · {h['publicada']}"
+                       + (f" · INVÁLIDO: {vigia_validar(h, momento)}" if vigia_validar(h, momento) else ""))
+    del llave
+    return "\n".join(lin)
+
+
+def vigia_autoprueba(g26):
+    """Prueba sin consultar a Gemini (la usa el instalador): pedido y esquema de los dos modelos, lectura de una respuesta
+    de ejemplo, validación de hechos, titulares con los snaps reales y la regla del piloto con números de ejemplo."""
+    ok = []
+    j = dict(game_id="2026_06_AAA_BBB", semana=6, game_type="REG", visita="GB", local="CHI",
+             inicio=dt.datetime(2026, 10, 18, 17, 0, tzinfo=dt.timezone.utc))
+    momento = j["inicio"] - dt.timedelta(minutes=84)
+    for c in ("A", "B"):
+        cu = vigia_cuerpo(j, momento)
+        assert cu["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "medium"
+        assert cu["generationConfig"]["responseFormat"]["text"]["schema"]["properties"]["home"]["properties"]["team"]["enum"] == ["CHI"]
+        assert "84 minutes before kickoff" in cu["contents"][0]["parts"][0]["text"]
+        assert "@V@" not in json.dumps(vigia_cuerpo(j, momento, False))
+    ok.append("pedido")
+    resp = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+        "away": {"team": "GB", "inactives_published": True, "players": [
+            {"name": "Elgton Jenkins", "position": "C", "status": "inactive", "source_type": "official_inactive_list",
+             "source_url": PREFIJO_BUSQUEDA + "x", "source_published": "2026-10-18T15:30", "evidence": "Inactive"},
+            {"name": "Rumor Man", "position": "WR", "status": "out", "source_type": "anonymous", "source_url": "https://x.com",
+             "source_published": "2026-10-18", "evidence": "sources say"},
+            {"name": "Futuro", "position": "WR", "status": "out", "source_type": "official_injury_report",
+             "source_url": "https://x.com", "source_published": "2026-10-19", "evidence": "x"}]},
+        "home": {"team": "CHI", "inactives_published": False, "players": []}})}]}}],
+        "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 500, "thoughtsTokenCount": 500}}
+    x = vigia_leer(resp, j, "B", momento)
+    assert x["estado"] == "ok" and len(x["equipos"]["GB"]["jugadores"]) == 3 and x["equipos"]["CHI"]["inactivos"] == 0
+    assert abs(x["costo_usd"] - (1000 * 0.75e-6 + 1000 * 3.75e-6)) < 1e-9
+    mot = [vigia_validar(h, momento) for h in x["equipos"]["GB"]["jugadores"]]
+    assert mot == ["", "fuente no oficial", "fuente posterior a la consulta"], mot
+    ok.append("lectura y validación")
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    con = [r for r in g26.sort("inicio").iter_rows(named=True) if r["game_id"] in ind.con_snaps]
+    n_tit = []
+    if con:
+        ult = con[-1]
+        for eq in (ult["away_team"], ult["home_team"]):
+            t = ind.titulares(eq, ult["inicio"] + dt.timedelta(days=1))
+            if t is not None:
+                n_tit.append(len(t))
+    assert not n_tit or all(10 <= n <= 30 for n in n_tit), n_tit
+    ok.append(f"titulares con snaps ({', '.join(map(str, n_tit)) or 'sin snaps todavía'})")
+    met = {}
+    for c, (ver, cor, noj, av) in (("A", (20, 19, 30, 21)), ("B", (20, 19, 30, 24))):
+        for s in (6, 7):
+            met[(c, s)] = dict(consultas=16, fallas=0, hechos=ver, verificables=ver, correctos=cor, no_jugaron=noj, avisados=av,
+                               juegos=set(), sin_snaps=set())
+    p = vigia_piloto(met)
+    assert p["ganador"] == "B", p
+    ok.append("regla del piloto")
+    huellas = ", ".join(f"{c} {vigia_huella(c)}" for c in ("A", "B"))
+    return f"vigía OK ({'; '.join(ok)}) · huellas {huellas} · g1 {gemini_huella('g1')} · e2 {e2_huella()}"
+
+
+# --------------------------------------------------------------------------------------
 # Corrida (hacia adelante y retrospectiva)
 # --------------------------------------------------------------------------------------
 def preparar_contexto(g_all, g26):
@@ -3133,6 +4020,11 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
     info = {r["game_id"]: r for r in jg.iter_rows(named=True)}
     bloque, eq = filas_equipos(g26, semana)
     ult = ultimas_proyecciones(semana)
+    try:
+        vig = vigia_avisos_semana(semana)              # v8.3 (55): avisos del vigía en la columna de la máquina
+    except Exception as e:  # noqa: BLE001
+        log(f"Vigía: no pude leer sus avisos para la hoja ({type(e).__name__})")
+        vig = {}
     filas, cierres, filas_info = [], [], []
     for gid in claves:
         g = info.get(gid)
@@ -3142,8 +4034,8 @@ def actualizar_hoja(hoja, g26, semana, nombres_qb, ahora):
         loc, vis = g["home_team"], g["away_team"]
         f = favorito_de(g, u)
         filas_info.append((g, f, u))
-        simple = [partido_txt(g, eq), cuando_txt(g["inicio"]), favorito_txt(f), seguro_txt(f), maquina_txt(u, f),
-                  teaser_txt(u), resultado_simple(g, f, u)]
+        simple = [partido_txt(g, eq), cuando_txt(g["inicio"]), favorito_txt(f), seguro_txt(f),
+                  maquina_txt(u, f) + vigia_frase(vig.get(gid)), teaser_txt(u), resultado_simple(g, f, u)]
         c = cierre_de(g, u)
         cierres.append(c)
         if not u:
@@ -3466,10 +4358,46 @@ def datos_semana(g26, semana, bot_dir):
     return info, senal_que_cuenta(semana), cierre_pin(bot_dir, inicios)
 
 
+def piso_semana(senal, cierre):
+    """52: «un lado cualquiera». CLV sin vig (46) de TODOS los lados de la semana con la señal que cuenta, Pinnacle de ≤ 3 h
+    en la señal y cierre del bot, estén o no excluidos por el filtro, el sesgo o el QB dudoso. Tipo de lado: no favorito si
+    su P(moneyline, Pinnacle sin vig en la señal) < 0,5; si no, favorito (vale para los dos mercados). Spread: P(cubrir la
+    línea de la señal), con el mismo cálculo de 46. Devuelve ({(mercado, tipo): media}, {(game_id, lado): tipo},
+    {(mercado, tipo): n})."""
+    sumas, tipo = {}, {}
+    for gid, r in senal.items():
+        c = cierre.get(gid)
+        pml = _num(r.get("pin_p_ml_local"))
+        if pml is None or not c:
+            continue
+        p_cie_ml = (sin_vig_potencia(c["ml_local"], c["ml_visit"]) if c.get("ml_local") is not None
+                    and c.get("ml_visit") is not None else None)
+        h, qs = _num(r.get("pin_hcp_local")), _num(r.get("pin_p_sp_local"))
+        for lado in ("local", "visita"):
+            p_l = pml if lado == "local" else 1.0 - pml
+            t = "no favorito" if p_l < 0.5 else "favorito"
+            tipo[(gid, lado)] = t
+            q_cie = _p_ml_lado(p_cie_ml, lado)
+            if p_l > 0 and q_cie is not None:
+                s = sumas.setdefault(("ML", t), [0.0, 0])
+                s[0] += q_cie / p_l - 1.0
+                s[1] += 1
+            if h is not None and qs is not None:
+                q_sig = qs if lado == "local" else 1.0 - qs
+                q_c = p_cubre_sin_vig(c, h, lado)
+                if q_sig > 0 and q_c is not None:
+                    s = sumas.setdefault(("SP", t), [0.0, 0])
+                    s[0] += q_c / q_sig - 1.0
+                    s[1] += 1
+    return {k: v[0] / v[1] for k, v in sumas.items() if v[1]}, tipo, {k: v[1] for k, v in sumas.items()}
+
+
 def clv_selecciones(g26, semana, bot_dir, datos=None):
-    """CLV de cada selección de 29A de la semana con la señal que cuenta (46: decide el CLV sin vig; se reportan el CLV
-    con el precio de Pinnacle de la señal y con el precio de BetOnline)."""
+    """CLV de cada selección de 29A de la semana con la señal que cuenta. v8.3 (52): decide el EXCESO = CLV sin vig − el
+    piso de su semana, mercado y tipo de lado; se reportan el CLV sin vig sin restar (46), el CLV con el precio de
+    Pinnacle de la señal y con el precio de BetOnline."""
     info, senal, cierre = datos or datos_semana(g26, semana, bot_dir)
+    pisos, tipos, _ = piso_semana(senal, cierre)
     cuenta_31a = semana >= SEMANA_31A
     sels = []
     for gid, r in senal.items():
@@ -3512,6 +4440,9 @@ def clv_selecciones(g26, semana, bot_dir, datos=None):
             f["p_senal"] = q_sig
             f["p_cierre"] = q_cie
             f["clv_sin_vig"] = None if q_sig in (None, 0) or q_cie is None else q_cie / q_sig - 1.0
+            f["tipo_lado"] = tipos.get((gid, lado), "")                                          # v8.3 (52)
+            f["piso"] = pisos.get((f["mercado"], f["tipo_lado"])) if f["tipo_lado"] else None
+            f["exceso"] = None if f["clv_sin_vig"] is None or f["piso"] is None else f["clv_sin_vig"] - f["piso"]
             f["clv_precio_pinnacle"] = None if q_cie is None or cuota_pin is None else q_cie * decimal(cuota_pin) - 1.0
             f["clv_precio_betonline"] = None if q_bo is None or cuota_bo is None else q_bo * decimal(cuota_bo) - 1.0
             f["resultado"] = "" if res is None else ("push" if gano is None else ("ganó" if gano else "perdió"))
@@ -3532,10 +4463,15 @@ def informe_semana(g26, semana, bot_dir, ahora):
     def bloque(filas, semilla):
         val = [x for x in filas if x["clv_sin_vig"] is not None]
         b = _bootstrap([x["clv_sin_vig"] for x in val], [x["game_id"] for x in val], semilla)
+        vx = [x for x in val if x.get("exceso") is not None]                          # v8.3 (52): decide el exceso
+        bx = _bootstrap([x["exceso"] for x in vx], [x["game_id"] for x in vx], semilla)
         pin_ = [x["clv_precio_pinnacle"] for x in val if x["clv_precio_pinnacle"] is not None]
         bo_ = [x["clv_precio_betonline"] for x in val if x["clv_precio_betonline"] is not None]
         ac = [x for x in val if x["resultado"] in ("ganó", "perdió")]
+        nf = [x for x in val if x.get("mercado") == "ML"]
         return dict(n=len(val), juegos=len({x["game_id"] for x in val}), sin_cierre=len(filas) - len(val), boot=b,
+                    n_exc=len(vx), boot_exc=bx,
+                    no_fav_ml=(sum(1 for x in nf if x.get("tipo_lado") == "no favorito") / len(nf)) if nf else None,
                     pin=(sum(pin_) / len(pin_)) if pin_ else None, bo=(sum(bo_) / len(bo_)) if bo_ else None,
                     aciertos=sum(1 for x in ac if x["resultado"] == "ganó"), n_res=len(ac),
                     esperado=sum(x["p_cierre"] for x in ac))
@@ -3622,9 +4558,15 @@ def informe_semana(g26, semana, bot_dir, ahora):
         if not b or not b["boot"]:
             return f"{nombre}: sin selecciones con cierre."
         m, lo, hi, lo1 = b["boot"]
-        return (f"{nombre}: {b['n']} selecciones en {b['juegos']} juegos · CLV sin vig {_pct(m)} "
+        exc = ""
+        if b.get("boot_exc"):
+            mx, lox, hix, lo1x = b["boot_exc"]
+            exc = (f" · EXCESO sobre un lado cualquiera del mismo tipo (decide 29A, 52) {_pct(mx)} (IC 95 % {_pct(lox)} a "
+                   f"{_pct(hix)}; límite inferior unilateral {_pct(lo1x)}; n {b['n_exc']})")
+        return (f"{nombre}: {b['n']} selecciones en {b['juegos']} juegos" + exc + f" · CLV sin vig sin restar {_pct(m)} "
                 f"(IC 95 % {_pct(lo)} a {_pct(hi)}; límite inferior unilateral {_pct(lo1)}) · con el precio de Pinnacle "
                 f"{_pct(b['pin'])} · con el de BetOnline {_pct(b['bo'])}"
+                + (f" · no favoritos en moneyline {_pct(b['no_fav_ml'], False)}" if b.get("no_fav_ml") is not None else "")
                 + (f" · aciertos {b['aciertos']} de {b['n_res']} (el cierre esperaba {b['esperado']:.1f})".replace(".", ",") if b["n_res"] else "")
                 + (f" · {b['sin_cierre']} sin cierre del bot" if b["sin_cierre"] else ""))
     cajas = {}
@@ -3637,7 +4579,7 @@ def informe_semana(g26, semana, bot_dir, ahora):
     tel = [titulo,
            linea_bloque("Selecciones que cuentan (29A)" if cuenta_31a else "Selecciones (no cuentan)", b_sem)]
     if b_acu:
-        faltan = max(N_VEREDICTO - b_acu["n"], 0)
+        faltan = max(N_VEREDICTO - b_acu["n_exc"], 0)
         tel.append(linea_bloque(f"Acumulado desde la semana {SEMANA_31A}", b_acu)
                    + (f" · faltan {faltan} para poder dar veredicto" if faltan else " · ya hay n para el veredicto (se da al final de la temporada)"))
     tel.append(f"Autopsia ({len(auto)} juegos donde el modelo difería ≥ {UMBRAL_AUTOPSIA:.0f} pt de la línea de la señal): "
@@ -3646,13 +4588,33 @@ def informe_semana(g26, semana, bot_dir, ahora):
                + (f" · pasó lo que el modelo esperaba: {sum(a['prueba2'] for a in p2)} de {len(p2)}" if p2 else ""))
     if falta_pbp:
         tel.append(f"Aviso: {len(falta_pbp)} juegos todavía sin jugada por jugada en nflverse (la autopsia queda parcial).")
-    tel.append("CLV sin vig = cuánto se movió la probabilidad justa de Pinnacle hacia el lado elegido, de la señal al cierre "
-               "(decide 29A, decisión 46). Descriptivo: el veredicto se da al final de la temporada con n ≥ 60 y solo si 31A pasa.")
-    completo = list(tel) + ["", "Excluidas (se registran, no cuentan): " + linea_bloque("excluidas", b_exc), "",
-                            "SELECCIONES (señal → cierre de Pinnacle, probabilidades sin vig)"]
+    # ---- v8.3 (50): juegos «Fuera» ----
+    try:
+        fu_sem, fu_txt_tel, fu_txt = seccion_fuera(g26, semana, bot_dir, datos)
+    except Exception as e:  # noqa: BLE001
+        fu_sem, fu_txt_tel, fu_txt = [], f"Fuera (50): no se pudo armar ({type(e).__name__}).", []
+    tel.append(fu_txt_tel)
+    # ---- v8.3 (55): verificación del vigía ----
+    try:
+        vg_tel, vg_txt, vg_filas = seccion_vigia(g26)
+    except Exception as e:  # noqa: BLE001
+        vg_tel, vg_txt, vg_filas = f"Vigía (55): no se pudo verificar ({type(e).__name__}).", [], []
+    if vg_tel:
+        tel.append(vg_tel)
+    tel.append("Exceso = CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo (no favorito o "
+               "favorito), mercado y semana (decide 29A, decisión 52). CLV sin vig = cuánto se movió la probabilidad justa de "
+               "Pinnacle hacia el lado elegido, de la señal al cierre (46). Descriptivo: el veredicto se da al final de la "
+               "temporada con n ≥ 60 y solo si 31A pasa.")
+    pisos, _, n_pisos = piso_semana(senal, cierre)
+    completo = list(tel) + ["", "Excluidas (se registran, no cuentan): " + linea_bloque("excluidas", b_exc),
+                            "Piso de la semana (52; todos los lados con Pinnacle en la señal y al cierre): "
+                            + (" · ".join(f"{m} {t} {_pct(pisos[(m, t)])} (n {n_pisos[(m, t)]})"
+                                          for m in ("ML", "SP") for t in ("no favorito", "favorito") if (m, t) in pisos) or "sin datos"),
+                            "", "SELECCIONES (señal → cierre de Pinnacle, probabilidades sin vig)"]
     for x in sels:
-        completo.append(f"  {x['juego']} · {x['mercado']} {x['equipo']} · {x['estado']} · {x['precio_senal']} · "
+        completo.append(f"  {x['juego']} · {x['mercado']} {x['equipo']} ({x.get('tipo_lado') or '—'}) · {x['estado']} · {x['precio_senal']} · "
                         f"P señal {_pct(x['p_senal'], False)} → cierre {_pct(x['p_cierre'], False)} · CLV sin vig {_pct(x['clv_sin_vig'])}"
+                        f" · piso {_pct(x.get('piso'))} · exceso {_pct(x.get('exceso'))}"
                         f" · precio Pinnacle {_pct(x['clv_precio_pinnacle'])} · BetOnline {_pct(x['clv_precio_betonline'])} · {x['resultado'] or 'sin resultado'}")
     completo += ["", "AUTOPSIA (lado del modelo · prueba 1 en pp · se reportan: puntos y μ · prueba 2 · prueba 3 · caja)"]
     for a in auto:
@@ -3663,14 +4625,163 @@ def informe_semana(g26, semana, bot_dir, ahora):
                         f" ({sino(a.get('prueba2'))}) · prueba 3 suerte: {sino(a.get('prueba3'))} · {a['caja']}")
     if falta_pbp:
         completo.append("Sin jugada por jugada todavía: " + ", ".join(falta_pbp))
+    completo += [""] + fu_txt + [""] + vg_txt
     completo.append(f"Generado {iso(ahora)} · {VERSION_SEMANA}")
-    return "\n".join(tel), "\n".join(completo), sels, auto
+    return "\n".join(tel), "\n".join(completo), sels, auto, {"fuera": fu_sem, "vigia": vg_filas}
 
 
-def guardar_informe(semana, completo, sels, auto):
+def _boot_media(valores, semilla):
+    """Media e IC 95 % por remuestreo de juegos (un valor por juego)."""
+    import numpy as np
+    v = np.asarray(valores, dtype=float)
+    if len(v) == 0:
+        return None
+    rng = np.random.default_rng(semilla)
+    m = v[rng.integers(0, len(v), size=(N_BOOT, len(v)))].mean(axis=1)
+    return float(v.mean()), float(np.percentile(m, 2.5)), float(np.percentile(m, 97.5))
+
+
+def fuera_juegos(g26, semana, bot_dir, datos=None):
+    """50 (solo registro): los juegos cuya proyección que cuenta quedó «Fuera». Por juego: motivo; spread (señal, modelo,
+    cierre de Pinnacle a T−10 o, si falta, nflverse; error del modelo y del cierre; lado del modelo y si cubrió el cierre)
+    y total (modelo, consenso de la señal y del cierre de nflverse, errores, lado y si acertó); cambio de QB (primer
+    dropback, 43, distinto del de su juego anterior de 2026)."""
+    info, senal, cierre = datos or datos_semana(g26, semana, bot_dir)
+    verdad = verdad_qb()
+    previo = {}
+    for r in g26.sort("inicio").iter_rows(named=True):
+        if r.get("inicio") is None:
+            continue
+        for eq in (r["away_team"], r["home_team"]):
+            previo.setdefault(eq, []).append((r["inicio"], r["game_id"]))
+    out = []
+    for gid, r in sorted(senal.items()):
+        if not fuera(r):
+            continue
+        g = info.get(gid) or {}
+        mot = [m for m, si in (("spread", r.get("marcado_spread") in (1, "1")), ("total", r.get("marcado_total") in (1, "1")),
+                               ("QB dudoso", es_dudoso(r))) if si]
+        d = dict(semana=semana, game_id=gid, juego=f"{r['visita']} @ {r['local']}", motivo=" + ".join(mot),
+                 resultado=resultado_txt(g))
+        res, h_sen, sm = _num(g.get("result")), _num(r.get("spread_ref")), _num(r.get("spread_modelo"))
+        c = cierre.get(gid)
+        hc, ref_c = (_num(c.get("hcp_local")) if c else None), "pinnacle"
+        if hc is None and _num(g.get("spread_line")) is not None:
+            hc, ref_c = -_num(g.get("spread_line")), "nflverse"
+        if "spread" in mot or "QB dudoso" in mot:
+            d.update(linea_senal=h_sen, ref_senal=r.get("ref_spread") or "", linea_modelo=sm, linea_cierre=hc,
+                     ref_cierre=ref_c if hc is not None else "")
+            if res is not None and sm is not None and hc is not None:
+                d["err_modelo"], d["err_cierre"] = round(abs(res + sm), 2), round(abs(res + hc), 2)
+                d["dif"] = round(d["err_modelo"] - d["err_cierre"], 2)       # > 0: el cierre acertó mejor
+                if h_sen is not None and abs(h_sen - sm) > 1e-9:
+                    lado = "local" if h_sen - sm > 0 else "visita"
+                    d["lado_modelo"] = r["local"] if lado == "local" else r["visita"]
+                    x = res + hc
+                    d["cubrio"] = None if abs(x) < 1e-9 else int((x > 0) == (lado == "local"))
+        if "total" in mot:
+            tm, tl_s, tl_c, tr = _num(r.get("total")), _num(r.get("nfl_total_line")), _num(g.get("total_line")), _num(g.get("total"))
+            d.update(total_modelo=tm, total_senal=tl_s, total_cierre=tl_c)
+            if tr is not None and tm is not None and tl_c is not None:
+                d["err_total_modelo"], d["err_total_cierre"] = round(abs(tr - tm), 2), round(abs(tr - tl_c), 2)
+                d["dif_total"] = round(d["err_total_modelo"] - d["err_total_cierre"], 2)
+                if tl_s is not None and abs(tm - tl_s) > 1e-9:
+                    d["lado_total"] = "over" if tm > tl_s else "under"
+                    d["acerto_total"] = None if abs(tr - tl_c) < 1e-9 else int((tr > tl_c) == (tm > tl_s))
+        cambios = []
+        ini = g.get("inicio")
+        for eq in (r["local"], r["visita"]):
+            ahora_qb = verdad.get((gid, eq))
+            prev = [p for t, p in previo.get(eq, []) if ini is not None and t < ini and (p, eq) in verdad]
+            antes_qb = verdad.get((prev[-1], eq)) if prev else None
+            cambios.append(None if ahora_qb is None or antes_qb is None else int(ahora_qb != antes_qb))
+        d["cambio_qb"] = 1 if 1 in cambios else (0 if all(x == 0 for x in cambios) else None)
+        out.append(d)
+    return out
+
+
+def seccion_fuera(g26, semana, bot_dir, datos=None):
+    """50: (filas de la semana, línea de Telegram, líneas del informe completo). Acumulado desde la semana 5."""
+    sem_f = fuera_juegos(g26, semana, bot_dir, datos)
+    acu = []
+    for s_ in range(SEMANA_31A, semana + 1):
+        acu += sem_f if s_ == semana else fuera_juegos(g26, s_, bot_dir)
+    if semana < SEMANA_31A:
+        acu = []
+    sp = [x for x in acu if x.get("dif") is not None]
+    tt = [x for x in acu if x.get("dif_total") is not None]
+
+    def resumen(filas, col, col_lado, nombre):
+        if not filas:
+            return f"{nombre}: sin juegos con resultado"
+        b = _boot_media([x[col] for x in filas], 5002026)
+        lados = [x[col_lado] for x in filas if x.get(col_lado) is not None]
+        txt = (f"{nombre}: {len(filas)} juegos · error del modelo − error del cierre {_num_txt(b[0])} pts "
+               f"(IC 95 % {_num_txt(b[1])} a {_num_txt(b[2])}; > 0 = el cierre acertó mejor) · el lado del modelo acertó "
+               f"{sum(lados)} de {len(lados)}")
+        for et, v in (("con cambio de QB", 1), ("sin cambio", 0)):
+            sub = [x[col] for x in filas if x.get("cambio_qb") == v]
+            if sub:
+                txt += f" · {et} {_num_txt(sum(sub) / len(sub))} (n {len(sub)})"
+        return txt
+    cuenta = {}
+    for x in sem_f:
+        for m in x["motivo"].split(" + "):
+            cuenta[m] = cuenta.get(m, 0) + 1
+    tel = (f"Fuera (50, solo registro): esta semana {len(sem_f)} juegos"
+           + (" (" + ", ".join(f"{k} {v}" for k, v in cuenta.items()) + ")" if cuenta else "")
+           + ("" if semana >= SEMANA_31A else " · semana informativa: no entra al acumulado")
+           + (f" · acumulado desde la semana {SEMANA_31A}: " + resumen(sp, "dif", "cubrio", "spread")
+              + " · " + resumen(tt, "dif_total", "acerto_total", "total") if acu else "")
+           + " · referencia H29: en los marcados de 2023-2025 la diferencia fue +0,98 (el cierre acertó mejor).")
+    txt = ["JUEGOS «FUERA» (50; solo registro: no decide nada, no cuenta para 29A ni 31A)"]
+    for x in sem_f:
+        partes = [f"  {x['juego']} · {x['motivo']} · {x['resultado'] or 'sin resultado'}"]
+        if "linea_modelo" in x:
+            partes.append(f"spread: señal {_num_txt(x.get('linea_senal'))} ({x.get('ref_senal')}) · modelo {_num_txt(x.get('linea_modelo'))}"
+                          f" · cierre {_num_txt(x.get('linea_cierre'))} ({x.get('ref_cierre') or '—'}) · error modelo "
+                          f"{_num_txt(x.get('err_modelo'), False)} / cierre {_num_txt(x.get('err_cierre'), False)}"
+                          f" · lado del modelo {x.get('lado_modelo', '—')}: "
+                          + {1: "cubrió", 0: "no cubrió", None: "push o sin dato"}[x.get("cubrio")])
+        if "total_modelo" in x:
+            partes.append(f"total: modelo {_num_txt(x.get('total_modelo'), False)} · señal {_num_txt(x.get('total_senal'), False)}"
+                          f" · cierre {_num_txt(x.get('total_cierre'), False)} · error modelo {_num_txt(x.get('err_total_modelo'), False)}"
+                          f" / cierre {_num_txt(x.get('err_total_cierre'), False)} · {x.get('lado_total', '—')}: "
+                          + {1: "acertó", 0: "falló", None: "push o sin dato"}[x.get("acerto_total")])
+        partes.append("cambio de QB: " + {1: "sí", 0: "no", None: "sin dato"}[x.get("cambio_qb")])
+        txt.append(" · ".join(partes))
+    if not sem_f:
+        txt.append("  (ningún juego quedó Fuera esta semana)")
+    return sem_f, tel, txt
+
+
+def seccion_vigia(g26):
+    """55: verificación del vigía con los snaps (por modelo y semana) y estado del piloto. ('', [], []) si no hay datos."""
+    met, filas = vigia_verificar(g26)
+    if not met:
+        return "", [], []
+    est = leer_estado()
+    p = vigia_piloto(met)
+    lin = ["VIGÍA (55): verificación con los snaps de nflverse (código, sin IA)"]
+    tot = {}
+    for (c, s), m in sorted(met.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        lin.append(f"  semana {s} · {VIGIA_NOMBRE[c]}: {m['consultas']} consultas ({m['fallas']} fallidas) · hechos sobre titulares "
+                   f"{m['hechos']}, verificables {m['verificables']}, correctos {m['correctos']} · precisión {_pct(m['precision'], False)}"
+                   f" · cobertura {_pct(m['cobertura'], False)} ({m['avisados']} de {m['no_jugaron']} titulares que no jugaron)"
+                   + (f" · {len(m['sin_snaps'])} juegos sin snaps todavía" if m["sin_snaps"] else ""))
+        t = tot.setdefault(c, [0, 0, 0, 0])
+        t[0] += m["correctos"]; t[1] += m["verificables"]; t[2] += m["avisados"]; t[3] += m["no_jugaron"]
+    lin.append("  " + texto_vigia_piloto(p, est))
+    tel = ("Vigía (55): " + " · ".join(f"{VIGIA_NOMBRE[c]} precisión {_pct(t[0] / t[1], False) if t[1] else '—'} "
+                                        f"({t[0]} de {t[1]}), cobertura {_pct(t[2] / t[3], False) if t[3] else '—'}" for c, t in tot.items())
+           + " · " + texto_vigia_piloto(p, est))
+    return tel, lin, filas
+
+
+def guardar_informe(semana, completo, sels, auto, extra=None):
     INFORMES.mkdir(parents=True, exist_ok=True)
     (INFORMES / f"informe_semana_{semana}.txt").write_text(completo + "\n", encoding="utf-8")
-    for nombre, filas in (("selecciones", sels), ("autopsia", auto)):
+    for nombre, filas in (("selecciones", sels), ("autopsia", auto)) + tuple((extra or {}).items()):
         ruta = INFORMES / f"informe_semana_{semana}_{nombre}.csv"
         campos = []
         for f in filas:
@@ -3715,8 +4826,8 @@ def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
     """Arma el informe de la semana, lo guarda en salidas/semana/informes/ y lo manda por Telegram. Anota en el estado
     las semanas que cuentan y están completas (así el modo auto no lo repite). Devuelve el texto completo."""
     import polars as pl
-    tel, completo, sels, auto = informe_semana(g26, semana, bot_dir, ahora)
-    ruta = guardar_informe(semana, completo, sels, auto)
+    tel, completo, sels, auto, extra = informe_semana(g26, semana, bot_dir, ahora)
+    ruta = guardar_informe(semana, completo, sels, auto, extra)
     log(f"informe de la semana {semana}: {len(sels)} selecciones, {len(auto)} juegos en la autopsia → {ruta.name}")
     if not sin_telegram:
         sys.path.insert(0, str(BASE))
@@ -3733,13 +4844,15 @@ def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
 # --------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe"])
+    ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe",
+                                     "vigia-prueba"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
     ap.add_argument("--tipo", default="manual")
     ap.add_argument("--ahora")
     ap.add_argument("--sin-telegram", action="store_true")
+    ap.add_argument("--real", action="store_true")     # v8.3: vigia-prueba --real hace 1 consulta real por modelo (no cuenta)
     ap.add_argument("--sin-hoja", action="store_true")
     ap.add_argument("--bot-dir", default=str(Path.home() / "nfl_ev"))
     ap.add_argument("--n-sims", type=int, default=N_SIMS)
@@ -3836,6 +4949,10 @@ def main():
             print("Agente Gemini (sombra): apagado (no hay credenciales/gemini.key)")
         if GEMINI_LLAVE.exists():
             print(texto_e2_estado(ahora, estado))
+            try:
+                print(texto_vigia_estado(ahora, estado))
+            except Exception as e:  # noqa: BLE001
+                print(f"Vigía (55): no pude leer su registro ({type(e).__name__})")
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -3848,6 +4965,14 @@ def main():
 
     if args.modo == "qb":
         print(texto_qb(g26, ahora, args.semana))
+        return
+
+    if args.modo == "vigia-prueba":                    # v8.3 (55): sin consultar a Gemini; --real: 1 consulta por modelo
+        if args.real:
+            print(vigia_prueba_real(g26, ahora, estado))
+            guardar_estado(estado)
+        else:
+            print(vigia_autoprueba(g26))
         return
 
     if args.modo == "informe":                         # v8.1 (45): informe de CLV y autopsia de una semana jugada
@@ -3956,6 +5081,24 @@ def main():
     if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
         gemini_sombra(sombra, ahora, estado)
         guardar_estado(estado)
+    if sombra and args.modo == "auto":                # v8.3 (55): el vigía, después de g1 y antes de e2
+        res_v = vigia_t85(sombra, [f for _, _, filas, _ in resumenes for f in filas], ahora, estado, g26)
+        guardar_estado(estado)
+        if res_v:
+            if hoja is not None:
+                for s_ in res_v["semanas"]:
+                    try:
+                        actualizar_hoja(hoja, g26, s_, nombres_qb, ahora)
+                        log(f"hoja: pestaña {pestana(s_)} actualizada con el vigía")
+                    except Exception as e:  # noqa: BLE001
+                        log(f"Hoja: no pude agregar el vigía a {pestana(s_)} ({type(e).__name__}: {str(e)[:200]})")
+            if not args.sin_telegram:
+                try:
+                    sys.path.insert(0, str(BASE))
+                    import sprint2 as s2
+                    s2.telegram(texto_vigia(res_v))
+                except Exception as e:  # noqa: BLE001
+                    log(f"Vigía: no pude mandar el Telegram ({type(e).__name__})")
     if sombra and args.modo == "auto":                # v8.2 (49): registro en vivo e2, aparte de g1 y después de él
         e2_vivo(sombra, ahora, estado)
         guardar_estado(estado)
