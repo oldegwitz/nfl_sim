@@ -75,7 +75,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8.3.1 (11-oct-2026)"
+VERSION_SEMANA = "semana-v8.4 (13-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -144,6 +144,12 @@ VERSION_SEMANA = "semana-v8.3.1 (11-oct-2026)"
 #     300 s en vez de 180 y 16 consultas a la vez en vez de 8 (todas las de 3.8 Flash de un grupo empiezan juntas).
 #     Huellas nuevas: el piloto cuenta solo consultas con las huellas actuales y desde la semana 6 (VIGIA_PILOTO_DESDE);
 #     lo consultado con v8.3 queda en el registro y en la verificación, pero no en el piloto. Nada más cambia.
+# v8.4 (decisiones 57 y 58 de Ozz, 13-oct; registradas en claude/registro_57_58_tablero.md antes de construir):
+#     · 57 (P1 = a): la bandera de sesgo (21A) sigue igual; el informe suma una línea, solo de registro, con cuántas
+#       veces cambió en la semana y qué juegos decidieron con ella encendida o apagada (seccion_bandera).
+#     · 58: al terminar cada corrida que escribió algo (y al cerrar resultados), llama a tablero.py en un proceso aparte
+#       con límite de tiempo (TABLERO_TIMEOUT); si falla o tarda, se anota en el log y la corrida sigue igual.
+#       Modo nuevo «tablero» para correrlo a mano. No cambian la proyección, s2-v1, g1, e2, el vigía ni las huellas.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -153,6 +159,8 @@ ESTADO = SAL / "estado.json"
 MAX_EDAD_CAL_H = 1.0                                 # el calendario (resultados y QB) se refresca cada hora
 CONFIG = BASE / "semana.ini"
 MD5_SPRINT2 = "baad72c6a5dc0054a7de22a79c88616f"     # s2-v1 congelado (31A)
+TABLERO = BASE / "tablero.py"                        # v8.4 (58): tablero tipo PFF Pro (descriptivo), hoja aparte
+TABLERO_TIMEOUT = 150                                # segundos; si se pasa, se corta y la corrida sigue
 CARACAS = ZoneInfo("America/Caracas")
 NUEVA_YORK = ZoneInfo("America/New_York")
 TEMPORADA = 2026
@@ -4465,6 +4473,66 @@ def clv_selecciones(g26, semana, bot_dir, datos=None):
     return sels
 
 
+def _es_uno(v):
+    return str(v).strip().lower() in ("1", "1.0", "true", "si", "sí")
+
+
+def seccion_bandera(semana, senal):
+    """v8.4 (57, solo registro): la bandera de sesgo (21A) se recalcula en cada corrida con la última proyección de cada
+    juego. Cuenta las corridas que cuentan de la semana, cuántas veces cambió la bandera y qué juegos decidieron con ella
+    encendida o apagada (su señal que cuenta). No decide nada. Devuelve (línea para Telegram, líneas del informe)."""
+    import polars as pl
+    corr = {}
+    for r in leer_registro().filter(pl.col("semana") == str(semana)).iter_rows(named=True):
+        if r.get("tipo") in TIPOS_QUE_CUENTAN and r.get("corrida_utc"):
+            corr.setdefault(r["corrida_utc"], r)
+    seq = [(c, _es_uno(corr[c].get("bandera_sesgo")), corr[c].get("sesgo_total_semana"), corr[c].get("sesgo_spread_semana"),
+            corr[c].get("tipo")) for c in sorted(corr)]
+    if not seq:
+        return "Bandera de sesgo (57, solo registro): sin corridas que cuenten esta semana.", []
+    cambios = sum(1 for a, b in zip(seq, seq[1:]) if a[1] != b[1])
+    con = sorted(f"{r['visita']} @ {r['local']}" for r in senal.values() if _es_uno(r.get("bandera_sesgo")))
+    sin = sorted(f"{r['visita']} @ {r['local']}" for r in senal.values() if not _es_uno(r.get("bandera_sesgo")))
+    tel = (f"Bandera de sesgo (21A; 57, solo registro): {sum(1 for x in seq if x[1])} de {len(seq)} corridas con la bandera "
+           f"encendida · cambió {cambios} {'vez' if cambios == 1 else 'veces'} en la semana · decidieron con la bandera "
+           f"encendida {len(con)} juegos y apagada {len(sin)}")
+    det = ["BANDERA DE SESGO (21A; 57, solo registro: no decide nada)"]
+    for c, b, st, ss, tp in seq:
+        det.append(f"  {fecha_cc(t_utc(c))} Caracas · {NOMBRE_CORRIDA.get(tp, tp)} · sesgo total {st or '—'} · spread "
+                   f"{ss or '—'} · {'ENCENDIDA' if b else 'apagada'}")
+    det.append("  Encendida en la señal que cuenta: " + (", ".join(con) or "ninguno"))
+    det.append("  Apagada en la señal que cuenta: " + (", ".join(sin) or "ninguno"))
+    return tel, det
+
+
+def actualizar_tablero(motivo):
+    """v8.4 (58): corre tablero.py (hoja «NFL Secret LAB — Tablero», solo pestañas datos_*) en un proceso aparte con
+    límite de tiempo. Nunca frena ni cambia la corrida: cualquier falla queda en el log."""
+    import subprocess
+    if not TABLERO.exists():
+        return "tablero: no instalado"
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG, encoding="utf-8")
+    if not cfg.has_section("tablero") or not cfg["tablero"].get("hoja_id", "").strip():
+        return "tablero: sin hoja_id en semana.ini [tablero]"
+    if cfg["tablero"].get("activo", "si").strip().lower() in ("no", "0", "false"):
+        return "tablero: apagado en semana.ini"
+    t0 = time.time()
+    try:
+        r = subprocess.run([sys.executable, str(TABLERO)], cwd=str(BASE), capture_output=True, text=True,
+                           timeout=TABLERO_TIMEOUT)
+        ult = ((r.stdout or "").strip().splitlines() or [""])[-1]
+        err = ((r.stderr or "").strip().splitlines() or [""])[-1]
+        txt = (f"tablero ({motivo}): {'ok' if r.returncode == 0 else 'FALLÓ'} en {time.time() - t0:.0f} s · "
+               f"{(ult if r.returncode == 0 else (err or ult))[:240]}")
+    except subprocess.TimeoutExpired:
+        txt = f"tablero ({motivo}): tiempo agotado ({TABLERO_TIMEOUT} s); la corrida sigue"
+    except Exception as e:  # noqa: BLE001
+        txt = f"tablero ({motivo}): no pude correrlo ({type(e).__name__})"
+    log(txt)
+    return txt
+
+
 def informe_semana(g26, semana, bot_dir, ahora):
     """Informe semanal (45): CLV de las selecciones de 29A con la señal que cuenta y autopsia de cada juego (38, prueba 1
     en probabilidad sin vig). Devuelve (texto para Telegram, texto completo, filas de selecciones, filas de autopsia)."""
@@ -4616,6 +4684,12 @@ def informe_semana(g26, semana, bot_dir, ahora):
         vg_tel, vg_txt, vg_filas = f"Vigía (55): no se pudo verificar ({type(e).__name__}).", [], []
     if vg_tel:
         tel.append(vg_tel)
+    # ---- v8.4 (57): bandera de sesgo dentro de la semana (solo registro) ----
+    try:
+        bd_tel, bd_txt = seccion_bandera(semana, senal)
+    except Exception as e:  # noqa: BLE001
+        bd_tel, bd_txt = f"Bandera de sesgo (57): no se pudo contar ({type(e).__name__}).", []
+    tel.append(bd_tel)
     tel.append("Exceso = CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo (no favorito o "
                "favorito), mercado y semana (decide 29A, decisión 52). CLV sin vig = cuánto se movió la probabilidad justa de "
                "Pinnacle hacia el lado elegido, de la señal al cierre (46). Descriptivo: el veredicto se da al final de la "
@@ -4640,7 +4714,7 @@ def informe_semana(g26, semana, bot_dir, ahora):
                         f" ({sino(a.get('prueba2'))}) · prueba 3 suerte: {sino(a.get('prueba3'))} · {a['caja']}")
     if falta_pbp:
         completo.append("Sin jugada por jugada todavía: " + ", ".join(falta_pbp))
-    completo += [""] + fu_txt + [""] + vg_txt
+    completo += [""] + fu_txt + [""] + vg_txt + ([""] + bd_txt if bd_txt else [])
     completo.append(f"Generado {iso(ahora)} · {VERSION_SEMANA}")
     return "\n".join(tel), "\n".join(completo), sels, auto, {"fuera": fu_sem, "vigia": vg_filas}
 
@@ -4860,7 +4934,7 @@ def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe",
-                                     "vigia-prueba"])
+                                     "vigia-prueba", "tablero"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
@@ -4982,6 +5056,10 @@ def main():
         print(texto_qb(g26, ahora, args.semana))
         return
 
+    if args.modo == "tablero":                         # v8.4 (58): tablero tipo PFF Pro a mano (no toca el motor)
+        print(actualizar_tablero("a mano"))
+        return
+
     if args.modo == "vigia-prueba":                    # v8.3 (55): sin consultar a Gemini; --real: 1 consulta por modelo
         if args.real:
             print(vigia_prueba_real(g26, ahora, estado))
@@ -5039,6 +5117,7 @@ def main():
                 else:
                     estado.pop("ultima_falla_hoja", None)
                 guardar_estado(estado)
+                actualizar_tablero("resultados nuevos")       # v8.4 (58)
             # v8.1 (45): informe de CLV y autopsia cuando cierra una semana que cuenta (una sola vez por semana; si falla,
             # reintenta cada 30 min y nunca frena el temporizador)
             falla_inf = t_utc(estado.get("ultima_falla_informe"))
@@ -5117,6 +5196,7 @@ def main():
     if sombra and args.modo == "auto":                # v8.2 (49): registro en vivo e2, aparte de g1 y después de él
         e2_vivo(sombra, ahora, estado)
         guardar_estado(estado)
+    actualizar_tablero(", ".join(sorted({t for t, _, _ in lista})))   # v8.4 (58): al final, sin frenar nada
     log("== LISTO")
 
 
