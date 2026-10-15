@@ -44,7 +44,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.3.2 (11-oct-2026)"  # v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
+VERSION = "parlay-v1.4 (15-oct-2026)"  # v1.4: props de jugador (42n) · v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -86,7 +86,8 @@ APODO_EQ = {"ARI": "Cardinals", "ATL": "Falcons", "BAL": "Ravens", "BUF": "Bills
             "TEN": "Titans", "WAS": "Commanders"}
 CAUSAS = {"balones": "Perdió más balones", "td_def": "TD de defensa o de equipos especiales", "qb": "El QB titular no terminó",
           "lesion": "Lesiones durante el partido", "rival_mejor": "El rival movió mejor el balón", "clima": "Viento o lluvia",
-          "sin_causa": "Sin causa clara", "sorpresa": "Sorpresa grande (13+ pts contra el cierre)", "sin_datos": "Sin datos de nflverse"}
+          "sin_causa": "Sin causa clara", "sorpresa": "Sorpresa grande (13+ pts contra el cierre)", "sin_datos": "Sin datos de nflverse",
+          "prop": "El jugador no llegó a su línea"}
 
 # Aproximación en vivo (registro 42; ajustada con nflverse 2016-2019 y comprobada con 2020-2022).
 # La serie en curso termina en TD (+7), gol de campo (+3), TD del rival (−7) o nada, con las tasas de nflverse por down,
@@ -592,9 +593,183 @@ def prob_vivo(pata, juego, ref, res=None):
     return (po if over else 1 - po - pp), pp
 
 
+# ---------------------------------------------------------------- v1.4 (42n): props de jugador
+# Estadística → (claves del boxscore de ESPN que se suman, singular, plural). Claves verificadas el 15-oct-2026 con los
+# resúmenes reales de SF @ SEA y DEN @ LAC (semana 5). «Anota TD»: carrera, recepción, devoluciones y TD de defensa.
+PROP_STATS = {
+    "TD": (("rushingTouchdowns", "receivingTouchdowns", "kickReturnTouchdowns", "puntReturnTouchdowns", "defensiveTouchdowns"), "TD", "TD"),
+    "PASS_TD": (("passingTouchdowns",), "pase de TD", "pases de TD"),
+    "FG": (("fieldGoalsMade/fieldGoalAttempts",), "gol de campo", "goles de campo"),
+    "PASS_YDS": (("passingYards",), "yarda de pase", "yardas de pase"),
+    "RUSH_YDS": (("rushingYards",), "yarda por tierra", "yardas por tierra"),
+    "REC_YDS": (("receivingYards",), "yarda de recepción", "yardas de recepción"),
+    "RECEPTIONS": (("receptions",), "recepción", "recepciones"),
+}
+YARDAS = ("PASS_YDS", "RUSH_YDS", "REC_YDS")
+ALIAS_STAT = {"TOUCHDOWN": "TD", "TOUCHDOWNS": "TD", "ANYTIME_TD": "TD", "SCORE": "TD", "PASSING_TD": "PASS_TD", "PASSING_TDS": "PASS_TD",
+              "PASS_TDS": "PASS_TD", "FIELD_GOALS": "FG", "FIELD_GOAL": "FG", "FGS": "FG", "PASSING_YARDS": "PASS_YDS",
+              "RUSHING_YARDS": "RUSH_YDS", "RECEIVING_YARDS": "REC_YDS", "REC": "RECEPTIONS", "RECEPTION": "RECEPTIONS"}
+TIPOS_PROP = ("PROP", "PLAYER", "PLAYER PROP", "PLAYER PROPS", "PROPS", "PLAYER TDS", "PLAYER STATS", "PLAYER TD")
+
+
+def _norm_nombre(x):
+    x = unicodedata.normalize("NFKD", str(x or "")).encode("ascii", "ignore").decode().lower().replace("-", " ")
+    return [w for w in re.sub(r"[^a-z ]", " ", x).split() if w not in ("jr", "sr", "ii", "iii", "iv", "v")]
+
+
+def mismo_jugador(a, b):
+    """'W. Lutz' = 'Wil Lutz' · 'J. Smith-Njigba' = 'Jaxon Smith-Njigba' (apellido igual e inicial del nombre igual)."""
+    ta, tb = _norm_nombre(a), _norm_nombre(b)
+    if not ta or not tb:
+        return False
+    if ta == tb:
+        return True
+    return len(ta) >= 2 and len(tb) >= 2 and ta[1:] == tb[1:] and ta[0][0] == tb[0][0]
+
+
+def stats_jugadores(res):
+    """{nombre en ESPN: {clave: valor}} del boxscore del resumen de ESPN; None si todavía no hay estadísticas."""
+    jug = {}
+    for t_ in ((res or {}).get("boxscore") or {}).get("players") or []:
+        for s in t_.get("statistics") or []:
+            keys = s.get("keys") or []
+            for a in s.get("athletes") or []:
+                nom = (a.get("athlete") or {}).get("displayName") or ""
+                if not nom:
+                    continue
+                d = jug.setdefault(nom, {})
+                for k, v in zip(keys, a.get("stats") or []):
+                    if k == "fieldGoalsMade/fieldGoalAttempts":
+                        v = str(v).split("/")[0]
+                    try:
+                        d[k] = d.get(k, 0.0) + float(str(v).replace(",", ""))
+                    except (TypeError, ValueError):
+                        pass
+    return jug or None
+
+
+def buscar_jugador(jug, nombre):
+    """(nombre en ESPN, estadísticas) o (None, None). Primero nombre e inicial; si no, el apellido, solo si es único."""
+    if not jug or not nombre:
+        return None, None
+    exactos = [n for n in jug if mismo_jugador(n, nombre)]
+    if len(exactos) == 1:
+        return exactos[0], jug[exactos[0]]
+    tn = _norm_nombre(nombre)
+    cand = [n for n in jug if tn and _norm_nombre(n)[-1:] == tn[-1:]]
+    if len(cand) == 1:
+        return cand[0], jug[cand[0]]
+    return None, None
+
+
+def valor_prop(p, res):
+    """(valor de la estadística, nombre en ESPN); (None, None) si no hay resumen o el jugador no aparece."""
+    nom, d = buscar_jugador(stats_jugadores(res), p.get("jugador"))
+    if d is None:
+        return None, None
+    return float(sum(d.get(k, 0.0) for k in PROP_STATS.get(p.get("stat"), ((),))[0])), nom
+
+
+def prob_prop(p, juego, res):
+    """(pg, pp, valor). Antes del juego: sin probabilidad (no hay línea gratuita de props). En juego: decidida solo si ya
+    pasó la línea (gana el over, pierde el under). Terminado: 1/0 o push; si el jugador no aparece en ESPN, cuenta 0."""
+    if juego["estado"] == "pre" or juego.get("cancelado"):
+        return None, None, None
+    v, _ = valor_prop(p, res)
+    if v is None:
+        if juego["estado"] != "post" or stats_jugadores(res) is None:
+            return None, None, None
+        v = 0.0
+    linea = float(p.get("linea") if p.get("linea") is not None else 0.5)
+    over = p.get("lado", "OVER") == "OVER"
+    if juego["estado"] != "post":
+        if v > linea:
+            return (1.0, 0.0, v) if over else (0.0, 0.0, v)
+        return None, None, v
+    if abs(v - linea) < 1e-9:
+        return 0.0, 1.0, v
+    return (1.0, 0.0, v) if (v > linea) == over else (0.0, 0.0, v)
+
+
+def leer_prop(p):
+    """dict(jugador, stat, linea, lado) de una pata de prop leída por Gemini; si faltan campos, del texto del boleto
+    («Bo Nix Score Anytime (Game)», «W. Lutz 2+ Field Goals (Game)», «S. Darnold Under 1.5 Passing TDs»). None si no es un prop."""
+    txt = str(p.get("texto") or "")
+    t_ = normal(txt)
+    st = re.sub(r"[\s\-/]+", "_", str(p.get("estadistica") or p.get("stat") or "").upper().strip())
+    st = ALIAS_STAT.get(st, st)
+    if st not in PROP_STATS:
+        st = ("PASS_TD" if re.search(r"passing (td|touchdown)", t_) else
+              "FG" if "field goal" in t_ else
+              "PASS_YDS" if "passing yard" in t_ else
+              "RUSH_YDS" if "rushing yard" in t_ else
+              "REC_YDS" if "receiving yard" in t_ else
+              "RECEPTIONS" if "reception" in t_ else
+              "TD" if re.search(r"anytime|score|touchdown scorer|to score", t_) else None)
+    if st is None:
+        return None
+    linea, lado = _linea(p.get("linea")), str(p.get("lado") or "").upper()
+    lado = "UNDER" if ("UNDER" in lado or re.search(r"\bunder\b", t_)) else "OVER"
+    if linea is None:
+        m = re.search(r"(\d+)\s*\+", t_)
+        n = re.search(r"\b(?:over|under|o|u)\s*(\d+(?:\.\d+)?)", t_)
+        linea = (int(m.group(1)) - 0.5) if m else (float(n.group(1)) if n else 0.5)
+    jugador = str(p.get("jugador") or "").strip()
+    txt = re.sub(r"^\s*(?:player\s+(?:tds?|touchdowns|stats|props)|props?)\s*[-–:]\s*", "", txt, flags=re.I)
+    if not jugador:
+        jugador = re.split(r"\s(?:\d+\s*\+|over\b|under\b|score\b|anytime\b|to score\b|passing\b|rushing\b|receiving\b|receptions?\b|field goals?\b)",
+                          txt, maxsplit=1, flags=re.I)[0].strip(" -·:")
+    return dict(jugador=jugador, stat=st, linea=float(linea), lado=lado)
+
+
+def prop_txt(p):
+    """«Bo Nix anota TD» · «W. Lutz 2+ goles de campo» · «S. Darnold menos de 1½ pases de TD» · «X más de 249½ yardas de pase»."""
+    st = PROP_STATS.get(p.get("stat"))
+    jug = p.get("jugador") or "?"
+    if not st:
+        return f"{jug}: {p.get('texto') or 'prop'}"
+    linea = float(p.get("linea") if p.get("linea") is not None else 0.5)
+    over = p.get("lado", "OVER") == "OVER"
+    if p["stat"] == "TD" and over and abs(linea - 0.5) < 1e-9:
+        return f"{jug} anota TD"
+    if over and p["stat"] not in YARDAS and abs(linea - math.floor(linea) - 0.5) < 1e-9:
+        n = int(linea + 0.5)
+        return f"{jug} {n}+ {st[1] if n == 1 else st[2]}"
+    return f"{jug} {'más' if over else 'menos'} de {media_txt(linea)} {st[2]}"
+
+
+def umbral_txt(p):
+    """«1 o más» · «1 o menos» · «más de 224½» (yardas)."""
+    linea = float(p.get("linea") if p.get("linea") is not None else 0.5)
+    over = p.get("lado", "OVER") == "OVER"
+    if p.get("stat") in YARDAS or abs(linea - math.floor(linea) - 0.5) > 1e-9:
+        return f"{'más' if over else 'menos'} de {media_txt(linea)}"
+    return f"{int(math.floor(linea)) + 1} o más" if over else f"{int(math.floor(linea))} o menos"
+
+
+def avance_prop(p, j):
+    v = p.get("_valor")
+    st = PROP_STATS.get(p.get("stat"), ((), "", ""))
+    if v is None:
+        return "sin estadísticas todavía" if j["estado"] != "post" else "sin datos de ESPN"
+    linea = float(p.get("linea") if p.get("linea") is not None else 0.5)
+    over = p.get("lado", "OVER") == "OVER"
+    lleva = f"{num_txt(v)} {st[1] if abs(v - 1) < 1e-9 else st[2]}"
+    if j["estado"] == "post":
+        r = "push" if abs(v - linea) < 1e-9 else ("ganada" if (v > linea) == over else "perdida")
+        return f"terminó con {lleva}: {r}"
+    if over:
+        falta = math.floor(linea) + 1 - v
+        return f"lleva {lleva}; " + ("ya la ganó" if v > linea else f"le falta{'n' if falta > 1 else ''} {num_txt(falta)}")
+    necesita = math.floor(linea) + 1 - v
+    return f"lleva {lleva}; " + ("ya se pasó" if v > linea else f"se pierde con {num_txt(necesita)} más")
+
+
 # ---------------------------------------------------------------- textos de una pata
 def nombre_pata(p):
     c = americana_txt(p.get("cuota"))
+    if p.get("tipo") == "PROP":
+        return f"{prop_txt(p)} {c}".strip()
     if p["tipo"] == "ML":
         return f"{p['equipo']} ML {c}".strip()
     if p["tipo"] == "SPREAD":
@@ -611,6 +786,8 @@ def pata_corta(p):
     if p.get("tipo") == "TOTAL":
         lado = "Over" if p.get("lado_total", "OVER") == "OVER" else "Under"
         return f"{lado} {media_txt(p.get('linea'))}" + (f" ({p['partido']})" if p.get("partido") else "")
+    if p.get("tipo") == "PROP":
+        return prop_txt(p)
     return str(p.get("texto") or "?")[:40]
 
 
@@ -630,6 +807,8 @@ def avance_txt(p, j):
         return "juego suspendido"
     if j["estado"] == "pre":
         return f"{hora_ccs(j['inicio'])} (Caracas)"
+    if p.get("tipo") == "PROP":
+        return avance_prop(p, j)
     if p["tipo"] in ("ML", "SPREAD"):
         dif = (loc - vis) if p["equipo"] == j["local"].get("abbr") else (vis - loc)
         v = dif + (0 if p["tipo"] == "ML" else float(p["linea"]))
@@ -653,6 +832,13 @@ def estado_marcador(p, j):
     en el spread). Totales: el ritmo (los puntos que van, llevados al partido completo, contra la línea); con menos del 10 %
     del partido jugado, 'igual'."""
     loc, vis = j["local"].get("puntos", 0) or 0, j["visita"].get("puntos", 0) or 0
+    if p.get("tipo") == "PROP":                       # v1.4: el over va perdiendo hasta que pasa la línea
+        if p.get("_valor") is None:
+            return "igual"
+        v = p["_valor"] - float(p.get("linea") if p.get("linea") is not None else 0.5)
+        if p.get("lado", "OVER") != "OVER":
+            v = -v
+        return "gana" if v > 1e-9 else "pierde" if v < -1e-9 else "igual"
     if p["tipo"] in ("ML", "SPREAD"):
         dif = (loc - vis) if p["equipo"] == j["local"].get("abbr") else (vis - loc)
         v = dif + (0 if p["tipo"] == "ML" else float(p["linea"]))
@@ -935,6 +1121,9 @@ class Parlays:
         return []
 
     def _guardar(self, lista):
+        for b in lista:                                  # v1.4: «_valor» es solo de pantalla
+            for p in b.get("patas") or []:
+                p.pop("_valor", None)
         _guardar_json(REGISTRO, lista)
 
     def de_semana(self, clave, lista=None, con_borrados=False):
@@ -953,11 +1142,25 @@ class Parlays:
 
     # -- probabilidades de un boleto: 'ahora' (en vivo), 'previa' (línea vigente) o 'cierre'
     def filas(self, b, juegos, modo="ahora", con_resumen=False):
-        out = []
+        out, resumenes = [], {}
         for p in b["patas"]:
             j = juegos.get(p.get("evento"))
             if not j:
                 out.append(dict(p=p, j=None, pg=None, pp=None, res=None))
+                continue
+            if p.get("tipo") == "PROP":                   # v1.4 (42n): ESPN; sin probabilidad antes ni al cierre
+                if modo != "ahora" or j["estado"] == "pre":
+                    out.append(dict(p=p, j=j, pg=None, pp=None, res=None, fuente="sin línea de props"))
+                    continue
+                if j["id"] not in resumenes:
+                    try:
+                        resumenes[j["id"]] = self.espn.resumen(j["id"])
+                    except Exception:  # noqa: BLE001
+                        resumenes[j["id"]] = None
+                res = resumenes[j["id"]]
+                pg, pp, v = prob_prop(p, j, res)
+                p["_valor"] = v
+                out.append(dict(p=p, j=j, pg=pg, pp=pp, res=res if j["estado"] == "in" else None, res_final=res, fuente="ESPN (props)"))
                 continue
             if modo == "ahora" and j["estado"] != "pre":
                 res = None
@@ -985,10 +1188,19 @@ class Parlays:
         for i, p in enumerate(lectura.get("patas", []), 1):
             tipo = (p.get("tipo") or "").upper().strip()
             tipo = {"MONEYLINE": "ML", "PUNTOS": "SPREAD", "HANDICAP": "SPREAD", "OVER/UNDER": "TOTAL"}.get(tipo, tipo)
+            prop = None
+            if tipo in TIPOS_PROP or tipo not in ("ML", "SPREAD", "TOTAL"):      # v1.4 (42n)
+                prop = leer_prop(p)
+                if prop:
+                    tipo = "PROP"
             txt_eq = normal(p.get("equipo") or p.get("texto") or "")
             txt_todo = normal(" ".join(str(p.get(k) or "") for k in ("equipo", "partido", "texto")))
             juego, equipo = None, None
-            if tipo in ("ML", "SPREAD"):
+            if tipo == "PROP":
+                cand = [j for j in juegos if _menciona(txt_todo, j["local"]) and _menciona(txt_todo, j["visita"])] or \
+                       [j for j in juegos if _menciona(txt_todo, j["local"]) or _menciona(txt_todo, j["visita"])]
+                juego = cand[0] if len(cand) == 1 else None
+            elif tipo in ("ML", "SPREAD"):
                 cand = [(j, s) for j in juegos for s in ("local", "visita") if _menciona(txt_eq, j[s])]
                 if len(cand) == 1:
                     juego, equipo = cand[0][0], cand[0][0][cand[0][1]]["abbr"]
@@ -1003,13 +1215,26 @@ class Parlays:
                         evento=juego["id"] if juego else None,
                         partido=f"{juego['visita']['abbr']} @ {juego['local']['abbr']}" if juego else "",
                         inicio=juego["inicio"] if juego else None, texto=p.get("texto") or "")
-            if tipo not in ("ML", "SPREAD", "TOTAL"):
+            if prop:
+                pata.update(prop, linea=prop["linea"])
+            if tipo not in ("ML", "SPREAD", "TOTAL", "PROP"):
                 avisos.append(f"pata {i}: tipo «{p.get('tipo')}» no reconocido")
-            elif not juego:
+            elif not juego and tipo != "PROP":
                 avisos.append(f"pata {i}: no encontré el juego de «{p.get('texto') or p.get('equipo')}» en el calendario de esta semana")
             if tipo in ("SPREAD", "TOTAL") and linea is None:
                 avisos.append(f"pata {i}: falta la línea")
             patas.append(pata)
+        # v1.4 (42n): un prop sin juego toma el del resto del boleto si todas sus patas son de un solo juego
+        ids = {p["evento"] for p in patas if p.get("evento")}
+        por_id = {j["id"]: j for j in juegos}
+        for p in patas:
+            if p["tipo"] != "PROP" or p.get("evento"):
+                continue
+            if len(ids) == 1 and next(iter(ids)) in por_id:
+                j = por_id[next(iter(ids))]
+                p.update(evento=j["id"], partido=f"{j['visita']['abbr']} @ {j['local']['abbr']}", inicio=j["inicio"])
+            else:
+                avisos.append(f"pata {p['k']}: no encontré el juego de «{p.get('texto') or p.get('jugador')}» en el calendario de esta semana")
         return patas, avisos
 
     def preparar_uno(self, lectura, lista, tab, archivo=None):
@@ -1032,6 +1257,9 @@ class Parlays:
             avisos.append(f"el pago no cuadra con las cuotas que leí (diferencia {pct(d)}): revisa montos y cuotas")
         if not b["monto"] or not b["pago"]:
             avisos.append("no leí el monto o el pago: el EV y el costo quedan incompletos")
+        if any(p["tipo"] == "PROP" for p in patas):
+            avisos.append("props de jugador: no hay línea de mercado gratuita, así que no hay P(cobrar) ni EV; "
+                          "el bot las sigue en vivo y las liquida con ESPN")
         por_juego = {}
         for p in patas:
             if p.get("evento"):
@@ -1197,6 +1425,10 @@ class Parlays:
         fila = self.fila_nfl(j)
         if fila:
             out["gid"] = fila["game_id"]
+        if p.get("tipo") == "PROP":                     # v1.4 (42n)
+            v, nom = valor_prop(p, f.get("res_final")) if f.get("res_final") is not None else (p.get("_valor"), None)
+            out.update(valor=p.get("_valor") if v is None else v, jugador_espn=nom)
+            return out
         r = self.ref(j, cierre=True)
         if p["tipo"] in ("ML", "SPREAD"):
             es_loc = p["equipo"] == loc.get("abbr")
@@ -1231,12 +1463,13 @@ class Parlays:
             fc = None
             cb, cp = {}, {}
             for i, f in enumerate(fa):
-                if f["p"].get("res") is None and f["j"] is not None and f["j"]["estado"] == "post":
+                if f["p"].get("res") is None and f["j"] is not None and f["j"]["estado"] == "post" \
+                        and not (f["p"].get("tipo") == "PROP" and f["pg"] is None):      # v1.4: prop sin datos de ESPN: espera
                     fc = fc or self.filas(b, juegos, modo="cierre")
                     cp[f["p"]["k"]] = self.resultado_pata(f, fc[i])
             if b.get("estado") == "vivo" and not any(f["j"] is None for f in fa):
                 perdida = any(f["j"]["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 for f in fa)
-                if perdida or all(f["j"]["estado"] == "post" for f in fa):
+                if perdida or all(f["j"]["estado"] == "post" and not (f["p"].get("tipo") == "PROP" and f["pg"] is None) for f in fa):
                     fc = fc or self.filas(b, juegos, modo="cierre")
                     probs_c = [(f["pg"], f["pp"]) for f in fc]
                     ev_c = ev_boleto(b, probs_c)
@@ -1290,8 +1523,8 @@ class Parlays:
         post = [f for f in fa if f["j"] and f["j"]["estado"] == "post"]
         gan = sum(1 for f in post if f["pg"] == 1.0)
         push = sum(1 for f in post if f["pp"] == 1.0)
-        per = len(post) - gan - push
-        vivas = len(fa) - len(post)
+        per = sum(1 for f in post if f["pg"] == 0.0 and (f["pp"] or 0.0) == 0.0)      # v1.4: un prop sin datos no cuenta como perdida
+        vivas = len(fa) - gan - push - per
         estado = "PERDIDO" if per else ("COBRADO" if vivas == 0 else "vivo")
         out = [f"🎟 {nombre_de(b)} ({nombre_semana(clave_semana(b)).lower()}, n.º {b.get('n')}) · {b.get('tipo', 'parlay').lower()} de "
                f"{len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
@@ -1309,9 +1542,9 @@ class Parlays:
                 out.append(f"{p['k']} ⚠️ {nombre_pata(p)} · juego no encontrado")
                 continue
             lin = f"{p['k']} {icono(j, f['pg'], f['pp'], p)} {nombre_pata(p)} · {marcador_txt(j)} · {avance_txt(p, j)}"
-            if j["estado"] == "in" and not j.get("cancelado") and f["pg"] is not None:
+            if j["estado"] == "in" and not j.get("cancelado") and f["pg"] is not None and p.get("tipo") != "PROP":
                 lin += " · " + prob_txt(p, f["pg"] + (f["pp"] or 0), estado_marcador(p, j))
-            elif j["estado"] == "pre" and f["pg"] is not None:
+            elif j["estado"] == "pre" and f["pg"] is not None and p.get("tipo") != "PROP":
                 lin += f" · P ≈ {pct(f['pg'] + (f['pp'] or 0))}"
             out.append(lin)
             if j["estado"] == "post" and f["pg"] == 0.0 and f["pp"] == 0.0 and not j.get("cancelado"):
@@ -1535,6 +1768,13 @@ class Razones:
 
     def explicar(self, gid, p, local, visita, ahora=None):
         """Texto y causas de una pata perdida; None si nflverse todavía no publicó el partido."""
+        if p.get("tipo") == "PROP":                     # v1.4 (42n): con lo que guardó ESPN, sin esperar a nflverse
+            st = PROP_STATS.get(p.get("stat"), ((), "", ""))
+            v = p.get("valor")
+            linea = float(p.get("linea") if p.get("linea") is not None else 0.5)
+            txt = (f"Terminó con {num_txt(v)} {st[1] if v is not None and abs(v - 1) < 1e-9 else st[2]}; "
+                   f"necesitaba {umbral_txt(p)}.") if v is not None else "Sin datos de ESPN."
+            return dict(texto=txt, causas=["prop"], parcial=False, version=RAZONES_VERSION, hora=S.iso(ahora or ahora_utc()))
         if self.juego(gid) is None:
             return None
         ahora = ahora or ahora_utc()
@@ -1882,9 +2122,12 @@ PROMPT_BOLETO = (
     "clearly separates several). For each ticket: tipo PARLAY, TEASER or SENCILLA (straight bet); monto: amount risked in dollars; "
     "pago: total payout if it wins (if the ticket shows both 'To Win' and 'Payout', use Payout, which includes the stake; if it shows "
     "only 'To Win', return To Win + risk; empty if not shown); numero: ticket number if visible. patas: one item per selection, in "
-    "ticket order: texto (the line exactly as shown), equipo (team picked; empty for totals), partido (both teams if shown), tipo (ML, "
-    "SPREAD or TOTAL), linea (signed number; 0 for ML; for totals the number), lado (OVER or UNDER, totals only) and cuota (American "
-    "odds such as -110 or +145; empty if not shown). Ignore account balances, names and account numbers. Leave any field empty if it "
+    "ticket order: texto (the line exactly as shown), equipo (team picked; empty for totals and player props), partido (both teams if shown, "
+    "e.g. the game header above the selections), tipo (ML, SPREAD, TOTAL or PROP for player props such as touchdowns, passing TDs, field "
+    "goals, yards or receptions), linea (signed number; 0 for ML; for totals the number; for props the threshold: 'N+' means N-0.5, "
+    "'score anytime' means 0.5), lado (OVER or UNDER, totals and props; 'N+' and 'anytime' are OVER), jugador (player name, props only), "
+    "estadistica (props only: TD for anytime touchdown, PASS_TD, FG for field goals made, PASS_YDS, RUSH_YDS, REC_YDS or RECEPTIONS) and "
+    "cuota (American odds such as -110 or +145; empty if not shown). Ignore account balances, names and account numbers. Leave any field empty if it "
     "cannot be read.")
 _BOLETO = {
     "type": "object",
@@ -1913,12 +2156,14 @@ MAX_ARCHIVO = 15 * 1024 * 1024
 #                        real de 1 boleto y 15 patas
 #   sin-esquema/minima   lo mismo, sin thinkingConfig
 # Salen ESQUEMA_BOLETO (rechazado por Google) y el esquema de un solo boleto (junta varios boletos en uno).
-_PATA_SIMPLE = {"type": "object", "properties": {k: {"type": "string"} for k in ("texto", "equipo", "partido", "tipo", "linea", "lado", "cuota")}}
+_PATA_SIMPLE = {"type": "object", "properties": {k: {"type": "string"} for k in ("texto", "equipo", "partido", "tipo", "linea", "lado", "cuota",
+                                                                                 "jugador", "estadistica")}}
 ESQUEMA_SIMPLE = {"type": "object", "properties": {"tipo": {"type": "string"}, "monto": {"type": "string"}, "pago": {"type": "string"},
                                                    "numero": {"type": "string"}, "patas": {"type": "array", "items": _PATA_SIMPLE}}}
 PROMPT_JSON = ('\nAnswer ONLY with a JSON object and nothing else, of this form: {"boletos": [{"tipo": "PARLAY", "monto": "10", '
                '"pago": "315.12", "numero": "", "patas": [{"texto": "...", "equipo": "...", "partido": "...", "tipo": "SPREAD", '
-               '"linea": "-7", "lado": "", "cuota": "-110"}]}]}')
+               '"linea": "-7", "lado": "", "cuota": "-110"}, {"texto": "...", "equipo": "", "partido": "...", "tipo": "PROP", '
+               '"linea": "0.5", "lado": "OVER", "jugador": "...", "estadistica": "TD", "cuota": ""}]}]}')
 # v1.3.1: diagnóstico del 4-oct (registro 42): esquema-varios falló en 2 de 3 entradas; sin-esquema leyó las 3 → sale el esquema.
 CADENA_GEMINI = (("sin-esquema", True), ("sin-esquema", False))
 ESQUEMA_VARIOS = {"type": "object", "properties": {"boletos": {"type": "array", "items": ESQUEMA_SIMPLE}}}
