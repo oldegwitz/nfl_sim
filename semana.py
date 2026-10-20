@@ -80,7 +80,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v9 (20-oct-2026)"
+VERSION_SEMANA = "semana-v9.1 (20-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -168,6 +168,10 @@ VERSION_SEMANA = "semana-v9 (20-oct-2026)"
 #     · Las órdenes largas no corren si toca una automática en ≤ 12 min. Tope diario en USD ([claude_motor]).
 #     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2 ni el vigía de Gemini
 #     (ni sus huellas): la proyección es idéntica a la de v8.4.
+# v9.1 (20-oct, después de la primera consulta real, NE @ CHI: 160 s, 6 búsquedas, USD 1,22, la búsqueda llegó al tope de
+#     8.000 tokens de salida): tope de salida 16.000 en el vigía-alineador (4.000 en la autopsia, 20.000 en el analista),
+#     reservas de costo con lo medido (USD 1,30 por juego) y la prueba real muestra tokens y fin de cada paso. Antes de la
+#     primera T−85 del vigía-alineador: el piloto empieza con la huella de v9.1. Nada más cambia.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -4035,12 +4039,13 @@ def automatica_cerca(g26, ahora, estado, minutos=None):
 
 # ---------------------------------------------------------------- A1 · vigía-alineador
 A1_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 8, "allowed_domains": DOMINIOS_OFICIALES}
-A1_MAX_TOKENS = 8000
+A1_MAX_TOKENS = 16000                                     # v9.1: con 8000 la búsqueda real (20-oct) se cortó; el filtrado
+                                                           # dinámico escribe código que también cuenta como salida
 A1_PLAZO_S = 420                                   # 300 s para la búsqueda (como 55) + 120 s reservados para la extracción
 A1_RESERVA_EXTRACCION_S = 120
-A1_RESERVA_USD = {"busqueda": 0.50, "extraccion": 0.20}  # costo que se anota si el pedido salió y no hubo respuesta
+A1_RESERVA_USD = {"busqueda": 1.00, "extraccion": 0.30}  # costo que se anota si el pedido salió y no hubo respuesta
 A1_HILOS = 16
-A1_USD_JUEGO = 0.70                                        # reserva por juego para el tope del día (estimación; se mide)
+A1_USD_JUEGO = 1.30                                        # v9.1: reserva por juego para el tope del día (medido el 20-oct: USD 1,22)
 A1_MAX_FUERA, A1_MAX_ALIN = 15, 30
 A1_TIPOS_ALIN = ("official_depth_chart", "espn_depth_chart", "official_inactive_list", "team_or_coach_statement", "other")
 A1_UNIDADES = ("offense", "defense", "special")
@@ -4684,7 +4689,7 @@ def texto_claude_estado(ahora, estado):
 
 # ---------------------------------------------------------------- A3 · autopsia del lunes
 A3_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 3, "allowed_domains": ["espn.com", "nfl.com"]}
-A3_MAX_TOKENS = 1500
+A3_MAX_TOKENS = 4000                               # v9.1: el código del filtrado dinámico también cuenta como salida
 A3_PLAZO_S = 240
 A3_HILOS = 8
 A3_USD_JUEGO = 0.25
@@ -4957,7 +4962,7 @@ def semana_reciente(g26):
 # ---------------------------------------------------------------- A4 · analista del sábado
 A4_DOMINIOS = ["nfl.com", "espn.com", "nbcsports.com"] + [DOMINIOS_EQUIPOS[e] for e in sorted(DOMINIOS_EQUIPOS)]
 A4_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 12, "allowed_domains": A4_DOMINIOS}
-A4_MAX_TOKENS = 12000
+A4_MAX_TOKENS = 20000                              # v9.1: idem
 A4_PLAZO_S = 600                                   # búsqueda hasta 480 s + 120 s reservados para la extracción
 A4_USD = 2.0                                        # reserva para el tope del día
 A4_MAX_DIA = 3                                      # /briefing por día de Caracas
@@ -5335,11 +5340,14 @@ def claude_prueba_real(g26, ahora, estado):
     x = a1_consultar(j, momento, time.time() + A1_PLAZO_S, "prueba")
     snaps, roster = vigia_datos()
     ind = VigiaIndice(snaps, roster, g26)
-    lim = {}
+    lim, pasos = {}, []
     for f in reversed(_leer_csv(CLAUDE_LLAMADAS)):
-        if f.get("origen") == "prueba" and f.get("game_id") == j["game_id"]:
-            lim = f
-            break
+        if f.get("origen") == "prueba" and f.get("game_id") == j["game_id"] and f.get("paso") in ("busqueda", "extraccion"):
+            if not lim.get("lim_entrada") and f.get("lim_entrada"):
+                lim = f
+            pasos.insert(0, f)
+            if len(pasos) == 2 or f.get("paso") == "busqueda":
+                break
     lin = [f"Prueba REAL del vigía-alineador (no cuenta): {j['visita']} @ {j['local']} · {fecha_cc(j['inicio'])} Caracas · "
            f"{CLAUDE_MODELO} · huella {a1_huella()}",
            f"  estado {x['estado']}" + (f" (HTTP {x['http']})" if x.get("http") not in (None, "", 200) else "")
@@ -5347,6 +5355,10 @@ def claude_prueba_real(g26, ahora, estado):
            + (f" · {x['detalle']}" if x.get("detalle") else ""),
            "  límites de la API (pedidos/min, tokens de entrada/min, de salida/min): "
            f"{lim.get('lim_pedidos') or '—'} · {lim.get('lim_entrada') or '—'} · {lim.get('lim_salida') or '—'}"]
+    for f in pasos:                                    # v9.1: de dónde sale el costo
+        lin.append(f"  paso {f.get('paso')}: {f.get('tok_entrada')} tokens de entrada · {f.get('tok_salida')} de salida (tope "
+                   f"{A1_MAX_TOKENS}) · {f.get('busquedas') or 0} búsquedas · fin {f.get('stop_reason') or '—'} · "
+                   f"{f.get('continuaciones') or 0} continuaciones · {f.get('latencia_s')} s · USD {_f(f.get('costo_usd')):.4f}")
     for eq, e in x["equipos"].items():
         val_f = [h for h in e["fuera"] if not vigia_validar(h, momento) and _url_norm(h["url"]) in x["urls"]]
         val_a = [a for a in e["alineacion"] if not _a1_validar_alin(a, momento) and _url_norm(a["url"]) in x["urls"]]
