@@ -13,6 +13,12 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /qb      → QB titular de cada juego por fuente (nflverse, ESPN, Sleeper), consenso y confiabilidad (semana.py qb)
   /piloto [variante] → piloto del agente Gemini con los criterios P1-P4 (semana.py gemini-piloto); variante opcional:
              g1 (por omisión), g1-low, g1-texto o g1-high. Tipo 'prueba': no cuenta para el piso de 35A.
+  v4.4 (decisiones 63, 65 y 65.1; semana.py v9):
+  /vigia [EQUIPO] → simula como /correr el próximo grupo de juegos (o el próximo juego de ese equipo) y consulta a los dos
+             vigías: Gemini y Claude (semana.py vigia-manual). No cuenta; registros aparte. Tope 10 por día.
+  /autopsia [N] → por qué perdieron los favoritos del cierre de la semana N (o la más reciente) (semana.py autopsia)
+  /briefing → analista de los juegos que faltan de la semana (semana.py briefing). Tope 3 por día.
+  Las tres no corren si en ≤ 12 min toca una corrida automática (la que cuenta).
   Parlays (v4, decisión 42; parlay.py, descriptivo, no cuenta para nada):
   «Parlay» (v4.2, también «Teaser» o «Boleto») → el bot pregunta el nombre y el formato (botones PDF, Texto, Imagen) y
              espera ese formato: otro tipo de archivo se rechaza y sigue esperando; /cancelar sale. Se olvida a los 15 min.
@@ -47,7 +53,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4.3 (8-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto
+VERSION = "orden-v4.4 (20-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto · v4.4: /vigia, /autopsia, /briefing
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -76,6 +82,9 @@ ORDENES = {
     "/estado": (["estado"], None),
     "/qb": (["qb"], None),
     "/piloto": (["gemini-piloto"], "Piloto de Gemini: una consulta por juego pendiente, en paralelo (≈1-2 min). No cuenta para el piso."),
+    "/vigia": (["vigia-manual"], "Simulo y consulto a los dos vigías (Gemini y Claude), hasta ~9 min. A pedido: no cuenta."),
+    "/autopsia": (["autopsia"], "Autopsia de los favoritos que perdieron (≈1-3 min)."),
+    "/briefing": (["briefing"], "Analista de los juegos que faltan (≈3-8 min)."),
 }
 VARIANTES = ("g1", "g1-low", "g1-texto", "g1-high")
 SALIDA_COMPLETA = ("/qb", "/estado", "/piloto")
@@ -96,6 +105,9 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/estado — qué toca y cuándo\n"
          "/qb — QB de cada juego por fuente y su confiabilidad\n"
          "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
+         "/vigia — simula el próximo grupo y consulta a los vigías (Gemini y Claude); /vigia KC para un equipo. No cuenta\n"
+         "/autopsia — por qué perdieron los favoritos de la semana más reciente; /autopsia 7 para otra\n"
+         "/briefing — analista de los juegos que faltan (rankings de la prensa, bajas y opinión)\n"
          "Parlays (cada semana NFL empieza otra vez en «Parlay 1»):\n"
          "/parlay — cargar uno nuevo: te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
          "   También escribiendo «Parlay», o mandando el boleto directo como foto, PDF o texto. /si lo guarda, /no lo descarta\n"
@@ -111,7 +123,9 @@ COMANDOS = [("parlay", "Cargar un boleto nuevo (o /parlay 2 para ver cómo va)")
             ("si", "Guardar el boleto que leí"), ("no", "Descartar el boleto que leí"), ("cancelar", "Salir de la carga del boleto"),
             ("borrar_parlay", "Sacar un parlay de la lista"), ("estado", "Motor: qué toca y cuándo"), ("qb", "Motor: QB de cada juego"),
             ("correr", "Motor: proyectar ahora (no cuenta)"), ("hoja", "Motor: rehacer la hoja"), ("retro", "Motor: rehacer la retrospectiva"),
-            ("piloto", "Motor: piloto del agente Gemini"), ("ayuda", "Todas las órdenes")]
+            ("piloto", "Motor: piloto del agente Gemini"), ("vigia", "Motor: vigías a pedido (o /vigia KC); no cuenta"),
+            ("autopsia", "Por qué perdieron los favoritos (o /autopsia 7)"), ("briefing", "Analista de los juegos que faltan"),
+            ("ayuda", "Todas las órdenes")]
 AUTO_CADA_S = 30 * 60                 # v4.3: parlay.py auto cada 30 min
 AUTO_PRIMERA_S = 120                  # la primera, 2 min después de arrancar el servicio
 AUTO_PRONTO_S = 60                    # después de /si o /borrar_parlay
@@ -431,6 +445,24 @@ def atender_parlay(tg, chat, texto, partes):
     return codigo
 
 
+def preparar_orden(texto, extra):
+    """v4.4: (argumentos de semana.py, aviso) de una orden del motor, o (None, mensaje de error) si el argumento no sirve."""
+    args, aviso = ORDENES[texto]
+    if texto == "/piloto" and extra:
+        if extra[0] not in VARIANTES:
+            return None, f"Variante desconocida: {extra[0]}. Usa una de: {', '.join(VARIANTES)}."
+        return args + ["--variante", extra[0]], aviso
+    if texto == "/vigia" and extra:
+        if not re.fullmatch(r"[a-z]{2,3}", extra[0]):
+            return None, "Dime el equipo con su abreviatura: /vigia KC (o /vigia solo para el próximo grupo de juegos)."
+        return args + ["--equipo", extra[0].upper()], aviso
+    if texto == "/autopsia" and extra:
+        if not re.fullmatch(r"\d{1,2}", extra[0]) or not 1 <= int(extra[0]) <= 22:
+            return None, "Dime la semana con un número: /autopsia 7 (o /autopsia sola para la más reciente)."
+        return args + ["--semana", extra[0]], aviso
+    return args, aviso
+
+
 def main():
     tg = Telegram(leer_token())
     chat = leer_chat()
@@ -519,12 +551,11 @@ def main():
                 codigo = atender_parlay(tg, chat, texto, partes)
                 if codigo == 0 and texto in ("/si", "/borrar_parlay"):
                     auto.pronto()                              # la hoja de parlays se actualiza en ~1 min
-            elif texto == "/piloto" and extra and extra[0] not in VARIANTES:
-                tg.enviar(chat, f"Variante desconocida: {extra[0]}. Usa una de: {', '.join(VARIANTES)}.")
             elif texto in ORDENES:
-                args, aviso = ORDENES[texto]
-                if texto == "/piloto" and extra:
-                    args = args + ["--variante", extra[0]]
+                args, aviso = preparar_orden(texto, extra)
+                if args is None:
+                    tg.enviar(chat, aviso)
+                    continue
                 if aviso:
                     tg.enviar(chat, aviso)
                 t0 = time.time()

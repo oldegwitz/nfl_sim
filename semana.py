@@ -56,6 +56,10 @@ Uso
                                                            cuenta para nada, no escribe en el registro; tope 4 por día)
   venv/bin/python semana.py hoja-prueba                   (prueba la hoja: conexión, y crea y borra una pestaña semanal y
                                                            un boleto de prueba con el formato real)
+  (v9) venv/bin/python semana.py vigia-manual [--equipo KC]   (/vigia: simula y consulta a los vigías; no cuenta)
+  (v9) venv/bin/python semana.py autopsia [--semana N]        (/autopsia: por qué perdieron los favoritos del cierre)
+  (v9) venv/bin/python semana.py briefing                     (/briefing: analista de los juegos que faltan)
+  (v9) venv/bin/python semana.py claude-prueba [--real]       (prueba de los agentes de Claude; --real: 1 consulta real)
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
 Solo lee ~/nfl_ev (líneas del bot y config.ini para Telegram); escribe solo en ~/nfl_sim y en la hoja.
@@ -71,11 +75,12 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v8.4 (13-oct-2026)"
+VERSION_SEMANA = "semana-v9 (20-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -150,6 +155,19 @@ VERSION_SEMANA = "semana-v8.4 (13-oct-2026)"
 #     · 58: al terminar cada corrida que escribió algo (y al cerrar resultados), llama a tablero.py en un proceso aparte
 #       con límite de tiempo (TABLERO_TIMEOUT); si falla o tarda, se anota en el log y la corrida sigue igual.
 #       Modo nuevo «tablero» para correrlo a mano. No cambian la proyección, s2-v1, g1, e2, el vigía ni las huellas.
+# v9 (decisiones 63, 65 y 65.1 de Ozz, 15-20 oct; especificación en claude/registro_65_agentes_claude.md, escrita antes):
+#     agentes de Claude (Opus 5.5, «Opus en todo»), en sombra y descriptivos:
+#     · A1 vigía-alineador: en cada T−85, en un hilo aparte y en paralelo con el vigía de Gemini (no alarga la corrida),
+#       hechos «fuera» de fuente oficial cuya URL apareció en los resultados de búsqueda y la alineación esperada; el
+#       código decide titulares, titulares nuevos y quién no tiene historia en la NFL. Registros vigia_claude_*.csv,
+#       Telegram aparte («piloto»), verificación con los snaps en el informe y comparación con Gemini en los mismos juegos.
+#     · A3 autopsia del lunes: causas de H41 en puntos (código) y crónica corta de Opus para cada favorito del cierre que
+#       perdió; automática desde la semana 7 después del informe y con el modo 'autopsia'.
+#     · A4 analista del sábado: después de la corrida del sábado 10:15 y con el modo 'briefing'.
+#     · 63: modo 'vigia-manual' (/vigia): simula como /correr (no cuenta) y consulta a los dos vigías; registros aparte.
+#     · Las órdenes largas no corren si toca una automática en ≤ 12 min. Tope diario en USD ([claude_motor]).
+#     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2 ni el vigía de Gemini
+#     (ni sus huellas): la proyección es idéntica a la de v8.4.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -3256,24 +3274,28 @@ def vigia_modelos(estado):
     return [el["clave"]] if el and el.get("clave") in VIGIA_MODELOS else ["A", "B"]
 
 
-def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
+def vigia_t85(pendientes, filas_proy, ahora, estado, g26, manual=False):
     """El vigía de una corrida automática T−85 (después de g1). pendientes = [(juego, FuentesQB)]; filas_proy = las filas
     de la proyección de esta corrida (para saber con qué QB proyectó la máquina). Devuelve el resumen para Telegram y la
-    hoja, o None. Nunca detiene la corrida."""
+    hoja, o None. Nunca detiene la corrida. v9 (63): manual=True es /vigia: mismos modelos y reglas, registros aparte
+    (vigia_manual_*.csv, huella marcada «manual:»), con su propio contador diario (no gasta el cupo de la T−85 que
+    cuenta), no aplica la regla del piloto y no entra a ninguna medición."""
+    marca = "manual:" if manual else ""
     try:
         activo, tope = vigia_cfg()
         if not pendientes or not GEMINI_LLAVE.exists() or not activo:
             return None
         from concurrent.futures import ThreadPoolExecutor, wait
-        try:
-            vigia_piloto_aplicar(g26, estado, ahora)
-        except Exception as e:  # noqa: BLE001
-            log(f"Vigía: no pude evaluar el piloto ({type(e).__name__}); sigo con los modelos de antes")
+        if not manual:
+            try:
+                vigia_piloto_aplicar(g26, estado, ahora)
+            except Exception as e:  # noqa: BLE001
+                log(f"Vigía: no pude evaluar el piloto ({type(e).__name__}); sigo con los modelos de antes")
         claves = vigia_modelos(estado)
         juegos = [j for j, _ in pendientes]
         momento = e2_momento(ahora)
         hoy = momento.astimezone(CARACAS).date().isoformat()
-        usado = estado.setdefault("vigia_dia", {})
+        usado = estado.setdefault("vigia_manual_dia_gemini" if manual else "vigia_dia", {})   # v9: /vigia no gasta el cupo de la T−85
         for k in [k for k in usado if k != hoy]:
             usado.pop(k)
         tareas_v = [(j, c) for j in juegos for c in claves]
@@ -3303,7 +3325,7 @@ def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
         for j, c in sin_cupo:
             res[(j["game_id"], c)] = dict(equipos={}, forma="", estado="tope", detalle=f"tope de {tope} consultas del día", latencia_s=0.0)
         filas_c, filas_h = [], []
-        resumen = dict(momento=momento, semanas=sorted({j["semana"] for j in juegos}), claves=claves, juegos=[], costo=0.0,
+        resumen = dict(momento=momento, semanas=sorted({j["semana"] for j in juegos}), claves=claves, juegos=[], costo=0.0, manual=manual,
                        consultas={c: [0, 0] for c in claves}, inactivos=[0, 0], inicio=min(j["inicio"] for j in juegos))
         for j in juegos:
             gid = j["game_id"]
@@ -3339,7 +3361,7 @@ def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
                         n_h += 1
                         n_a += aviso
                         filas_h.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], modelo_clave=c,
-                                            huella=vigia_huella(c), equipo=eq, nombre=h["nombre"], posicion=h["posicion"],
+                                            huella=marca + vigia_huella(c), equipo=eq, nombre=h["nombre"], posicion=h["posicion"],
                                             estado_jugador=h["estado_jugador"], tipo_fuente=h["tipo_fuente"], url=h["url"],
                                             publicada=h["publicada"], evidencia=h["evidencia"], valido=int(not motivo),
                                             motivo_invalido=motivo, gsis_id=g, cruce=cruce, titular=int(tt is not None),
@@ -3352,7 +3374,7 @@ def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
                                 a["modelos"].append(c)
                 filas_c.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], game_type=j.get("game_type", "REG"),
                                     inicio_utc=iso(j["inicio"]), minutos_antes=minutos, valida=valida, modelo_clave=c,
-                                    modelo=VIGIA_MODELOS[c], huella=vigia_huella(c), forma=x.get("forma", ""),
+                                    modelo=VIGIA_MODELOS[c], huella=marca + vigia_huella(c), forma=x.get("forma", ""),
                                     model_version=x.get("model_version", ""), estado=x["estado"], http=x.get("http", ""),
                                     latencia_s=x.get("latencia_s", ""), costo_usd=x.get("costo_usd", ""),
                                     busquedas=x.get("busquedas", ""), evidencia_busqueda=x.get("evidencia_busqueda", ""),
@@ -3364,10 +3386,10 @@ def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
             resumen["inactivos"][1] += 2
             resumen["juegos"].append(dict(game_id=gid, visita=j["visita"], local=j["local"], valida=valida, avisos=avisos,
                                           sin_titulares=[eq for eq in (j["visita"], j["local"]) if tit[eq] is None]))
-        _anexar_csv(VIGIA_CONSULTAS, CAMPOS_VC, filas_c, "vigia_consultas")
-        _anexar_csv(VIGIA_HECHOS, CAMPOS_VH, filas_h, "vigia_hechos")
+        _anexar_csv(VIGIA_MANUAL_C if manual else VIGIA_CONSULTAS, CAMPOS_VC, filas_c, "vigia_manual_consultas" if manual else "vigia_consultas")
+        _anexar_csv(VIGIA_MANUAL_H if manual else VIGIA_HECHOS, CAMPOS_VH, filas_h, "vigia_manual_hechos" if manual else "vigia_hechos")
         n_av = sum(len(v) for jj in resumen["juegos"] for v in jj["avisos"].values())
-        log(f"Vigía ({'+'.join(claves)}; " + ", ".join(f"{c} {vigia_huella(c)}" for c in claves) + f"): {len(juegos)} juegos en "
+        log(f"Vigía{' a pedido' if manual else ''} ({'+'.join(claves)}; " + ", ".join(f"{c} {vigia_huella(c)}" for c in claves) + f"): {len(juegos)} juegos en "
             f"{time.time() - t0:.1f} s · " + " · ".join(f"{VIGIA_NOMBRE[c]} {resumen['consultas'][c][0]}/{resumen['consultas'][c][1]}"
                                                        for c in claves)
             + f" · {len(filas_h)} hechos · {n_av} avisos · USD {resumen['costo']:.4f}")
@@ -3380,7 +3402,7 @@ def vigia_t85(pendientes, filas_proy, ahora, estado, g26):
 def texto_vigia(resumen):
     """Mensaje de Telegram del vigía (aparte de la proyección)."""
     piloto = len(resumen["claves"]) > 1
-    lin = [f"🔎 VIGÍA T−85 · semana {', '.join(map(str, resumen['semanas']))} · juegos de las {fecha_cc(resumen['inicio'])} (Caracas)"
+    lin = [f"{'🔎 VIGÍA A PEDIDO (no cuenta)' if resumen.get('manual') else '🔎 VIGÍA T−85'} · semana {', '.join(map(str, resumen['semanas']))} · juegos de las {fecha_cc(resumen['inicio'])} (Caracas)"
            + (" · piloto: Flash-Lite y 3.8 Flash" if piloto else f" · {VIGIA_NOMBRE[resumen['claves'][0]]}")]
     sin = []
     for jj in resumen["juegos"]:
@@ -3413,7 +3435,8 @@ def texto_vigia(resumen):
     lin.append(f"Lista oficial de inactivos encontrada en {resumen['inactivos'][0]} de {resumen['inactivos'][1]} equipos · consultas "
                + ", ".join(f"{VIGIA_NOMBRE[c]} {v[0]}/{v[1]}" for c, v in resumen["consultas"].items())
                + f" · USD {resumen['costo']:.3f}".replace(".", ","))
-    lin.append("Solo hechos con fuente oficial; el código decide quién es titular (snaps). No cambia la máquina ni las selecciones.")
+    lin.append("Solo hechos con fuente oficial; el código decide quién es titular (snaps). No cambia la máquina ni las selecciones."
+               + (" Registro aparte (a pedido): no entra al piloto ni a la medición." if resumen.get("manual") else ""))
     return "\n".join(lin)
 
 
@@ -3719,6 +3742,1762 @@ def vigia_autoprueba(g26):
     ok.append("regla del piloto")
     huellas = ", ".join(f"{c} {vigia_huella(c)}" for c in ("A", "B"))
     return f"vigía OK ({'; '.join(ok)}) · huellas {huellas} · g1 {gemini_huella('g1')} · e2 {e2_huella()}"
+
+
+# --------------------------------------------------------------------------------------
+# v9 (decisiones 65 y 65.1, 20-oct): agentes de Claude (Opus 5.5) — vigía-alineador A1 (T−85 y /vigia), autopsia
+# del lunes A3 y analista del sábado A4; /vigia a pedido (63). Todo en sombra y descriptivo: no tocan s2-v1, la
+# proyección, el consenso del QB, 29A ni 31A, ni a g1, e2 o el vigía de Gemini (ni sus huellas).
+# Especificación: claude/registro_65_agentes_claude.md (65.1 y «Especificación del paquete 2»), escrita antes.
+# --------------------------------------------------------------------------------------
+CLAUDE_LLAVE = BASE / "credenciales" / "anthropic.key"     # la carga cargar_anthropic.sh (entrada oculta, 600)
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_VERSION_API = "2023-06-01"
+CLAUDE_MODELO = "claude-opus-5-5"                          # 65.1 (Ozz, 20-oct): Opus en todo
+CLAUDE_NOMBRE = "Opus 5.5"
+CLAUDE_PRECIO = (4.0e-6, 20.0e-6)                          # USD por token de entrada y de salida (verificado el 18-oct-2026)
+CLAUDE_USD_BUSQUEDA = 0.01                                 # USD 10 por 1.000 búsquedas
+CLAUDE_BUSQUEDA = "web_search_20260318"
+CLAUDE_TOPE_USD_DIA = 25.0                                 # semana.ini [claude_motor] tope_usd_dia (aparte del lector de boletos)
+CLAUDE_MAX_CONT = 3                                        # continuaciones pause_turn por consulta
+CLAUDE_LLAMADAS = SAL / "claude_llamadas.csv"
+CAMPOS_CL = ["hora_utc", "fecha_ccs", "agente", "origen", "huella", "game_id", "paso", "modelo", "estado", "http",
+             "latencia_s", "tok_entrada", "tok_salida", "tok_cache_escritura", "tok_cache_lectura", "busquedas", "costo_usd",
+             "continuaciones", "stop_reason", "detalle", "lim_entrada", "lim_salida", "lim_pedidos"]
+DOMINIOS_EQUIPOS = {"ARI": "azcardinals.com", "ATL": "atlantafalcons.com", "BAL": "baltimoreravens.com",
+                    "BUF": "buffalobills.com", "CAR": "panthers.com", "CHI": "chicagobears.com", "CIN": "bengals.com",
+                    "CLE": "clevelandbrowns.com", "DAL": "dallascowboys.com", "DEN": "denverbroncos.com",
+                    "DET": "detroitlions.com", "GB": "packers.com", "HOU": "houstontexans.com", "IND": "colts.com",
+                    "JAX": "jaguars.com", "KC": "chiefs.com", "LA": "therams.com", "LAC": "chargers.com", "LV": "raiders.com",
+                    "MIA": "miamidolphins.com", "MIN": "vikings.com", "NE": "patriots.com", "NO": "neworleanssaints.com",
+                    "NYG": "giants.com", "NYJ": "newyorkjets.com", "PHI": "philadelphiaeagles.com", "PIT": "steelers.com",
+                    "SEA": "seahawks.com", "SF": "49ers.com", "TB": "buccaneers.com", "TEN": "tennesseetitans.com",
+                    "WAS": "commanders.com"}
+DOMINIOS_OFICIALES = ["nfl.com", "espn.com"] + [DOMINIOS_EQUIPOS[e] for e in sorted(DOMINIOS_EQUIPOS)]
+_CL_CANDADO = threading.Lock()
+
+
+def claude_cfg():
+    """(activo, tope en USD por día de Caracas) desde semana.ini [claude_motor]."""
+    cfg = configparser.ConfigParser()
+    if CONFIG.exists():
+        cfg.read(CONFIG)
+    sec = cfg["claude_motor"] if cfg.has_section("claude_motor") else {}
+    activo = str(sec.get("activo", "si")).strip().lower() not in ("no", "0", "false", "apagado")
+    try:
+        tope = float(str(sec.get("tope_usd_dia", CLAUDE_TOPE_USD_DIA)).strip().replace(",", ".") or CLAUDE_TOPE_USD_DIA)
+    except ValueError:
+        tope = CLAUDE_TOPE_USD_DIA
+    return activo, tope
+
+
+def claude_gasto_hoy(hoy):
+    """USD que costaron hoy (día de Caracas) las consultas de los agentes del motor (claude_llamadas.csv)."""
+    return round(sum(_f(f.get("costo_usd")) for f in _leer_csv(CLAUDE_LLAMADAS) if f.get("fecha_ccs") == hoy), 6)
+
+
+def claude_cupo(ahora):
+    """(USD que quedan hoy, motivo si no se puede consultar). Sin llave o apagado → (0, motivo)."""
+    if not CLAUDE_LLAVE.exists():
+        return 0.0, "sin credenciales/anthropic.key"
+    activo, tope = claude_cfg()
+    if not activo:
+        return 0.0, "apagado en semana.ini [claude_motor]"
+    resto = tope - claude_gasto_hoy(ahora.astimezone(CARACAS).date().isoformat())
+    return max(resto, 0.0), ("" if resto > 0 else f"tope del día (USD {tope:.2f})")
+
+
+def _motivo_claude(r):
+    """Tipo, código y mensaje de error de la API de Claude (nunca trae la llave)."""
+    try:
+        err = (r.json() or {}).get("error") or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    det = err.get("details") if isinstance(err.get("details"), dict) else {}
+    cod = _texto(det.get("error_code"))
+    return f"{_texto(err.get('type'))}{' ' + cod if cod else ''}: {_texto(err.get('message'))}".strip(": ")[:300]
+
+
+def _registrar_claude(reg, out):
+    momento = reg.get("momento") or dt.datetime.now(dt.timezone.utc)
+    fila = dict(hora_utc=iso(momento), fecha_ccs=momento.astimezone(CARACAS).date().isoformat(), agente=reg.get("agente", ""),
+                origen=reg.get("origen", ""), huella=reg.get("huella", ""), game_id=reg.get("game_id", ""),
+                paso=reg.get("paso", ""), modelo=CLAUDE_MODELO, estado=out["estado"], http=out["http"],
+                latencia_s=out["latencia_s"], tok_entrada=out["tok_entrada"], tok_salida=out["tok_salida"],
+                tok_cache_escritura=out["tok_cache_escritura"], tok_cache_lectura=out["tok_cache_lectura"],
+                busquedas=out["busquedas"], costo_usd=out["costo_usd"], continuaciones=out["continuaciones"],
+                stop_reason=out["stop_reason"], detalle=_texto(out["detalle"])[:300],
+                lim_entrada=out["limites"].get("entrada", ""), lim_salida=out["limites"].get("salida", ""),
+                lim_pedidos=out["limites"].get("pedidos", ""))
+    with _CL_CANDADO:
+        try:
+            _anexar_csv(CLAUDE_LLAMADAS, CAMPOS_CL, [fila], "claude_llamadas")
+        except OSError as e:
+            log(f"Claude: no pude anotar la consulta ({type(e).__name__})")
+
+
+def claude_post(cuerpo, limite, reg, post=None, dormir=time.sleep):
+    """Una consulta a la API de Claude (Messages) con sus continuaciones (pause_turn, hasta 3; si la respuesta trae un
+    contenedor del filtrado dinámico, la continuación lo reutiliza) y un reintento si la API pide esperar (429 con retry-after, o 529) y queda plazo. Un 429 sin retry-after (tope de gasto de la Console) no se
+    reintenta. Si el pedido salió y no hubo respuesta a tiempo, anota como costo la reserva del paso (reg['reserva_usd']):
+    así el tope del día no queda corto cuando la API anda lenta. Anota la consulta en claude_llamadas.csv. Devuelve dict(estado, http, contenido, texto, tokens, búsquedas,
+    costo_usd, latencia_s, detalle, stop_reason, continuaciones, limites). Nunca lanza excepciones ni registra la llave."""
+    import requests
+    out = dict(estado="", http="", contenido=[], texto="", tok_entrada=0, tok_salida=0, tok_cache_escritura=0,
+               tok_cache_lectura=0, busquedas=0, costo_usd=0.0, latencia_s=0.0, detalle="", stop_reason="",
+               continuaciones=0, limites={}, estimado=0.0)
+    t0 = time.time()
+    if not CLAUDE_LLAVE.exists():
+        out["estado"] = "sin llave"
+    else:
+        llave = CLAUDE_LLAVE.read_text(encoding="utf-8").strip()
+        asistente, reintentos, contenedor = [], 0, ""
+        while True:
+            resta = limite - time.time()
+            if resta < 5:
+                out.update(estado="tiempo agotado", detalle=out["detalle"] or "sin tiempo para seguir")
+                break
+            msgs = list(cuerpo["messages"]) + ([{"role": "assistant", "content": asistente}] if asistente else [])
+            pedido = {**cuerpo, "messages": msgs, **({"container": contenedor} if contenedor else {})}
+            try:
+                r = (post or requests.post)(CLAUDE_URL, headers={"x-api-key": llave, "anthropic-version": CLAUDE_VERSION_API,
+                                                                 "content-type": "application/json"},
+                                            json=pedido, timeout=(min(10.0, resta), resta))
+            except requests.exceptions.ConnectTimeout:
+                out.update(estado="tiempo agotado", detalle="sin conexión con la API")
+                break
+            except requests.exceptions.Timeout:          # el pedido salió: la API pudo cobrar lo que alcanzó a hacer
+                out.update(estado="tiempo agotado", detalle="sin respuesta a tiempo: costo estimado (reserva del paso)")
+                out["estimado"] = float(reg.get("reserva_usd") or 0.0)
+                break
+            except Exception as e:  # noqa: BLE001 — solo el tipo: el texto podría traer datos de la conexión
+                out.update(estado="error de red", detalle=type(e).__name__)
+                if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError)):
+                    out["estimado"] = float(reg.get("reserva_usd") or 0.0)   # pudo cortarse con el pedido ya enviado
+                    if out["estimado"]:
+                        out["detalle"] += ": costo estimado (reserva del paso)"
+                break
+            out["http"] = r.status_code
+            hs = getattr(r, "headers", None) or {}
+            for k, n in (("entrada", "anthropic-ratelimit-input-tokens-limit"), ("salida", "anthropic-ratelimit-output-tokens-limit"),
+                         ("pedidos", "anthropic-ratelimit-requests-limit")):
+                if hs.get(n):
+                    out["limites"][k] = _texto(hs.get(n))
+            if r.status_code in (429, 529) and reintentos < 1:
+                ra = hs.get("retry-after")
+                espera = _f(ra) if ra else (5.0 if r.status_code == 529 else None)
+                if espera is not None and time.time() + espera + 15 < limite:
+                    reintentos += 1
+                    dormir(espera)
+                    continue
+            if r.status_code != 200:
+                out.update(estado="error HTTP", detalle=_motivo_claude(r))
+                break
+            try:
+                d = r.json()
+            except ValueError:
+                out.update(estado="respuesta inválida", detalle="la respuesta no es JSON")
+                break
+            u = d.get("usage") or {}
+            out["tok_entrada"] += int(u.get("input_tokens") or 0)
+            out["tok_salida"] += int(u.get("output_tokens") or 0)
+            out["tok_cache_escritura"] += int(u.get("cache_creation_input_tokens") or 0)
+            out["tok_cache_lectura"] += int(u.get("cache_read_input_tokens") or 0)
+            out["busquedas"] += int(((u.get("server_tool_use") or {}).get("web_search_requests")) or 0)
+            asistente = asistente + [b for b in (d.get("content") or []) if isinstance(b, dict)]
+            if isinstance(d.get("container"), dict) and d["container"].get("id"):
+                contenedor = _texto(d["container"]["id"])      # el filtrado dinámico usa un contenedor: se reutiliza al continuar
+            out["stop_reason"] = _texto(d.get("stop_reason"))
+            if out["stop_reason"] == "pause_turn":
+                if out["continuaciones"] < CLAUDE_MAX_CONT:
+                    out["continuaciones"] += 1
+                    continue
+                out.update(estado="pausada", detalle=f"siguió en pausa después de {CLAUDE_MAX_CONT} continuaciones")
+                break
+            out["estado"] = "cortada" if out["stop_reason"] == "max_tokens" else "ok"
+            if out["estado"] == "cortada":
+                out["detalle"] = "llegó al tope de tokens de salida"
+            break
+        out["contenido"] = asistente
+        del llave
+    out["texto"] = "".join(b.get("text") or "" for b in out["contenido"] if b.get("type") == "text")
+    pe, ps = CLAUDE_PRECIO
+    out["costo_usd"] = round(out["tok_entrada"] * pe + out["tok_cache_escritura"] * pe * 1.25 + out["tok_cache_lectura"] * pe * 0.1
+                             + out["tok_salida"] * ps + out["busquedas"] * CLAUDE_USD_BUSQUEDA + out["estimado"], 6)
+    out["latencia_s"] = round(time.time() - t0, 2)
+    _registrar_claude(reg, out)
+    return out
+
+
+def _urls_de(bloques):
+    """Las URL de los resultados de búsqueda y de las citas de una respuesta (no las del pedido de búsqueda)."""
+    vistas = set()
+
+    def rec(x):
+        if isinstance(x, dict):
+            if x.get("type") == "server_tool_use":
+                return
+            u = x.get("url")
+            if isinstance(u, str) and u.startswith("http"):
+                vistas.add(u)
+            for v in x.values():
+                rec(v)
+        elif isinstance(x, list):
+            for v in x:
+                rec(v)
+    rec(bloques)
+    return vistas
+
+
+def _errores_busqueda(bloques):
+    """Códigos de error de las búsquedas que vinieron dentro de una respuesta 200 (web_search_tool_result_error)."""
+    cods = []
+
+    def rec(x):
+        if isinstance(x, dict):
+            if x.get("type") == "web_search_tool_result_error":
+                cods.append(_texto(x.get("error_code")) or "desconocido")
+            for v in x.values():
+                rec(v)
+        elif isinstance(x, list):
+            for v in x:
+                rec(v)
+    rec(bloques)
+    return cods
+
+
+def _url_norm(u):
+    """URL comparable: sin esquema, www, consulta, fragmento ni barra final; en minúsculas."""
+    from urllib.parse import urlsplit
+    try:
+        p = urlsplit(_texto(u))
+    except ValueError:
+        return ""
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return (host + p.path.rstrip("/")).lower() if host else ""
+
+
+def _vars_juego(j, momento):
+    fase = (f"regular season, week {j['semana']}" if j.get("game_type", "REG") == "REG"
+            else f"postseason, {RONDAS.get(j['game_type'], j['game_type'])}")
+    return dict(ahora_utc=momento.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"), ahora_et=_fmt_et(momento),
+                minutos=max(int((j["inicio"] - momento).total_seconds() // 60), 0), temporada=TEMPORADA, fase=fase,
+                visita_nombre=EQUIPOS.get(j["visita"], j["visita"]), visita=j["visita"],
+                local_nombre=EQUIPOS.get(j["local"], j["local"]), local=j["local"],
+                inicio_utc=j["inicio"].astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"))
+
+
+def _huella(cfg):
+    return hashlib.md5(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+
+
+def enviar_tg(txt, sin_telegram=False):
+    """Manda un texto por Telegram en partes de ≤ 3.800 caracteres cortadas en saltos de línea (con --sin-telegram lo
+    imprime). Devuelve True si todo salió."""
+    if sin_telegram:
+        print(txt)
+        return True
+    sys.path.insert(0, str(BASE))
+    import sprint2 as s2
+    partes, cur = [], ""
+    for lin in txt.split("\n"):
+        while len(lin) > 3800:
+            if cur:
+                partes.append(cur)
+                cur = ""
+            partes.append(lin[:3800])
+            lin = lin[3800:]
+        if cur and len(cur) + len(lin) + 1 > 3800:
+            partes.append(cur)
+            cur = lin
+        else:
+            cur = f"{cur}\n{lin}" if cur else lin
+    if cur:
+        partes.append(cur)
+    ok = True
+    for p in partes:
+        ok = bool(s2.telegram(p)) and ok
+    return ok
+
+
+def automatica_cerca(g26, ahora, estado, minutos=None):
+    """La corrida automática (T−85, miércoles o sábado 10:15) que toca dentro de 'minutos' (o ya toca), o None. Las
+    órdenes largas (/vigia, /autopsia, /briefing) no corren entonces, para no retrasar la señal que cuenta (65)."""
+    minutos = ANTES_AUTOMATICA_MIN if minutos is None else minutos
+    for t in (ahora, ahora + dt.timedelta(minutes=minutos)):
+        lista, _ = tareas(g26, t, estado)
+        if lista:
+            return lista[0]
+    return None
+
+
+# ---------------------------------------------------------------- A1 · vigía-alineador
+A1_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 8, "allowed_domains": DOMINIOS_OFICIALES}
+A1_MAX_TOKENS = 8000
+A1_PLAZO_S = 420                                   # 300 s para la búsqueda (como 55) + 120 s reservados para la extracción
+A1_RESERVA_EXTRACCION_S = 120
+A1_RESERVA_USD = {"busqueda": 0.50, "extraccion": 0.20}  # costo que se anota si el pedido salió y no hubo respuesta
+A1_HILOS = 16
+A1_USD_JUEGO = 0.70                                        # reserva por juego para el tope del día (estimación; se mide)
+A1_MAX_FUERA, A1_MAX_ALIN = 15, 30
+A1_TIPOS_ALIN = ("official_depth_chart", "espn_depth_chart", "official_inactive_list", "team_or_coach_statement", "other")
+A1_UNIDADES = ("offense", "defense", "special")
+A1_PILOTO_SEMANAS = 2
+VIGIA_MANUAL_MAX_DIA = 10                                  # 63: /vigia por día de Caracas
+VIGIA_MANUAL_MARGEN_MIN = 15                               # 65 (revisión): /vigia solo con juegos que empiecen en > 15 min (H36)
+ANTES_AUTOMATICA_MIN = 12                                  # 65: órdenes largas no corren si toca una automática en ≤ 12 min
+A1_RUTAS = {o: dict(consultas=SAL / f"vigia_claude{s}_consultas.csv", hechos=SAL / f"vigia_claude{s}_hechos.csv",
+                    alineacion=SAL / f"vigia_claude{s}_alineacion.csv") for o, s in (("t85", ""), ("manual", "_manual"))}
+VIGIA_MANUAL_C = SAL / "vigia_manual_consultas.csv"        # 63: el vigía de Gemini a pedido (registro aparte)
+VIGIA_MANUAL_H = SAL / "vigia_manual_hechos.csv"
+CAMPOS_A1C = CAMPOS_VC + ["origen", "n_alineacion", "n_nuevos", "n_urls"]
+CAMPOS_A1H = CAMPOS_VH + ["origen", "url_en_resultados"]
+CAMPOS_A1A = ["corrida_utc", "game_id", "semana", "origen", "huella", "equipo", "nombre", "posicion", "unidad", "tipo_fuente",
+              "url", "publicada", "valido", "motivo_invalido", "url_en_resultados", "gsis_id", "pfr_id", "cruce",
+              "titular_habitual", "jugados_2026", "years_exp", "sin_historia", "sin_2026", "nuevo", "minutos_antes",
+              "nombre_roster"]
+A1_SISTEMA = """You are a strict NFL availability and lineup fact checker with web search. Report only what official or
+authoritative sources say; never guess.
+Rules:
+1. Always search before answering: your training data is out of date. Look for the official inactive list for THIS game,
+   the final official injury report, official roster moves and the team's most recent official depth chart (team website,
+   NFL.com or ESPN).
+2. OUT: list a player only if an official source says he will not play this game: the official inactive list for this
+   game, the final injury report (Out or Doubtful), an official roster move (injured reserve, PUP, NFI, suspension,
+   release, trade), an on-record statement by the team or its head coach, or an NFL announcement. Never use rumors,
+   anonymous sources, "expected to", "questionable", "game-time decision" or predictions.
+3. LINEUP: the expected starters for THIS game: 11 on offense, 11 on defense, plus kicker, punter, kick returner and punt
+   returner. Start from the most recent official depth chart and change it only for the OUT players of rule 2.
+4. Every OUT player and every LINEUP player needs the URL of a page that appeared in your search results and that page's
+   publication time in UTC (YYYY-MM-DDTHH:MM, or YYYY-MM-DD if no time is shown; leave it empty if the page shows none).
+   Never build or guess a URL.
+5. Write a plain-text report. For each team: a line "TEAM <code> - official inactive list found: yes/no"; then "OUT:"
+   with one line per player (name | position | status | source type | URL | published | evidence in 20 words or fewer);
+   then "LINEUP:" with one line per player (name | position | offense/defense/special | source type | URL | published).
+   OUT status: inactive, out, doubtful, injured_reserve, suspended, released_or_traded or other_official. OUT source type:
+   official_inactive_list, official_injury_report, team_transaction, team_or_coach_statement or league_announcement.
+   LINEUP source type: official_depth_chart, espn_depth_chart, official_inactive_list, team_or_coach_statement or other."""
+A1_USUARIO = """Now: {ahora_utc} UTC ({ahora_et} ET), {minutos} minutes before kickoff. NFL {temporada} {fase}.
+Game: {visita_nombre} ({visita}) at {local_nombre} ({local}), kickoff {inicio_utc} UTC.
+Report OUT (at most 15 players per team) and LINEUP for both teams."""
+A1_EXTRAE = """Convert the NFL report below into JSON that follows the schema exactly.
+Rules: copy names, positions, URLs and times exactly as they appear in the report; do not add players or facts that are
+not in the report; keep a URL only if it appears in the SEARCH RESULT URLS list (otherwise leave source_url empty); use an
+empty string for any missing value. Team codes: {visita} is the away team and {local} the home team."""
+
+
+def a1_esquema(visita, local):
+    """Esquema de la extracción (output_config.format): additionalProperties false en cada objeto, sin maxItems (no los
+    acepta la API; el código corta a 15 y 30)."""
+    s = {"type": "string"}
+    fuera = {"type": "object", "additionalProperties": False,
+             "properties": {"name": s, "position": s, "status": {"type": "string", "enum": list(VIGIA_ESTADOS)},
+                            "source_type": {"type": "string", "enum": list(VIGIA_FUENTES)}, "source_url": s,
+                            "source_published": s, "evidence": s},
+             "required": ["name", "position", "status", "source_type", "source_url", "source_published", "evidence"]}
+    alin = {"type": "object", "additionalProperties": False,
+            "properties": {"name": s, "position": s, "unit": {"type": "string", "enum": list(A1_UNIDADES)},
+                           "source_type": {"type": "string", "enum": list(A1_TIPOS_ALIN)}, "source_url": s,
+                           "source_published": s},
+            "required": ["name", "position", "unit", "source_type", "source_url", "source_published"]}
+
+    def equipo(eq):
+        return {"type": "object", "additionalProperties": False,
+                "properties": {"team": {"type": "string", "enum": [eq]}, "inactives_published": {"type": "boolean"},
+                               "out": {"type": "array", "items": fuera}, "lineup": {"type": "array", "items": alin}},
+                "required": ["team", "inactives_published", "out", "lineup"]}
+    return {"type": "object", "additionalProperties": False, "properties": {"away": equipo(visita), "home": equipo(local)},
+            "required": ["away", "home"]}
+
+
+def a1_huella():
+    """Huella de la configuración completa del vigía-alineador. Cambia → versión nueva (se anota en cada fila)."""
+    return _huella(dict(modelo=CLAUDE_MODELO, sistema=A1_SISTEMA, usuario=A1_USUARIO, extrae=A1_EXTRAE,
+                        herramienta=A1_HERRAMIENTA, esquema=json.dumps(a1_esquema("AAA", "BBB"), sort_keys=True),
+                        max_tokens=A1_MAX_TOKENS, plazo=A1_PLAZO_S, reserva=A1_RESERVA_EXTRACCION_S, hilos=A1_HILOS))
+
+
+def a1_cuerpo(j, momento):
+    return {"model": CLAUDE_MODELO, "max_tokens": A1_MAX_TOKENS, "system": A1_SISTEMA,
+            "messages": [{"role": "user", "content": A1_USUARIO.format(**_vars_juego(j, momento))}], "tools": [A1_HERRAMIENTA]}
+
+
+def a1_cuerpo_extraer(j, texto, urls):
+    return {"model": CLAUDE_MODELO, "max_tokens": A1_MAX_TOKENS, "system": A1_EXTRAE.format(visita=j["visita"], local=j["local"]),
+            "messages": [{"role": "user", "content": "REPORT:\n" + texto[:60000] + "\n\nSEARCH RESULT URLS:\n"
+                          + "\n".join(sorted(urls)[:400])}],
+            "output_config": {"format": {"type": "json_schema", "schema": a1_esquema(j["visita"], j["local"])}}}
+
+
+def a1_leer(obj, j):
+    """JSON de la extracción → {equipo: dict(inactivos, fuera=[hechos], alineacion=[jugadores])} (solo equipos válidos)."""
+    equipos = {}
+    for lado, eq in (("away", j["visita"]), ("home", j["local"])):
+        x = (obj or {}).get(lado)
+        if not isinstance(x, dict) or DE_OTRAS.get(_texto(x.get("team")).upper(), _texto(x.get("team")).upper()) != eq:
+            continue
+        fuera, alin = [], []
+        for p in (x.get("out") if isinstance(x.get("out"), list) else [])[:A1_MAX_FUERA]:
+            if isinstance(p, dict):
+                fuera.append(dict(nombre=_texto(p.get("name"))[:80], posicion=_texto(p.get("position")).upper()[:6],
+                                  estado_jugador=_texto(p.get("status")).lower(), tipo_fuente=_texto(p.get("source_type")).lower(),
+                                  url=_texto(p.get("source_url"))[:300], publicada=_texto(p.get("source_published"))[:25],
+                                  evidencia=_texto(p.get("evidence"))[:200]))
+        for p in (x.get("lineup") if isinstance(x.get("lineup"), list) else [])[:A1_MAX_ALIN]:
+            if isinstance(p, dict):
+                alin.append(dict(nombre=_texto(p.get("name"))[:80], posicion=_texto(p.get("position")).upper()[:6],
+                                 unidad=_texto(p.get("unit")).lower(), tipo_fuente=_texto(p.get("source_type")).lower(),
+                                 url=_texto(p.get("source_url"))[:300], publicada=_texto(p.get("source_published"))[:25]))
+        ib = _e2_bool(x.get("inactives_published"))
+        equipos[eq] = dict(inactivos="" if ib is None else int(ib), fuera=fuera, alineacion=alin)
+    return equipos
+
+
+def a1_consultar(j, momento, limite, origen, post=None):
+    """Un juego: búsqueda con citas (Opus + web_search) y extracción a JSON con esquema (Opus, sin herramientas). Devuelve
+    dict(estado, equipos, urls normalizadas, costo_usd, busquedas, latencia_s, detalle). Nunca lanza excepciones."""
+    t0 = time.time()
+    base = dict(equipos={}, urls=set(), costo_usd=0.0, busquedas=0, latencia_s=0.0, detalle="", forma="busqueda+extraccion",
+                http="")
+    reg = dict(agente="A1", origen=origen, huella=a1_huella(), game_id=j["game_id"], momento=momento)
+    try:
+        b = claude_post(a1_cuerpo(j, momento), limite - A1_RESERVA_EXTRACCION_S,
+                        {**reg, "paso": "busqueda", "reserva_usd": A1_RESERVA_USD["busqueda"]}, post)
+        base.update(costo_usd=b["costo_usd"], busquedas=b["busquedas"], http=b["http"])
+        if b["estado"] not in ("ok", "cortada", "pausada") or not b["texto"].strip():
+            return {**base, "estado": b["estado"] or "respuesta inválida", "detalle": b["detalle"] or "sin texto",
+                    "latencia_s": round(time.time() - t0, 2)}
+        urls = _urls_de(b["contenido"])
+        base["urls"] = {_url_norm(u) for u in urls} - {""}
+        errs = _errores_busqueda(b["contenido"])
+        if not base["urls"]:                         # sin resultados no hay hechos válidos posibles: cuenta como falla
+            return {**base, "estado": "sin búsqueda", "latencia_s": round(time.time() - t0, 2),
+                    "detalle": ("errores de búsqueda: " + ", ".join(sorted(set(errs)))) if errs else "la búsqueda no trajo resultados"}
+        e = claude_post(a1_cuerpo_extraer(j, b["texto"], urls), limite,
+                        {**reg, "paso": "extraccion", "reserva_usd": A1_RESERVA_USD["extraccion"]}, post)
+        base["costo_usd"] = round(base["costo_usd"] + e["costo_usd"], 6)
+        if e["estado"] != "ok":
+            return {**base, "estado": e["estado"], "detalle": ("extracción: " + (e["detalle"] or "")).strip(),
+                    "http": e["http"], "latencia_s": round(time.time() - t0, 2)}
+        equipos = a1_leer(_objeto_json(e["texto"]), j)
+        estado = "ok" if len(equipos) == 2 else "parcial" if equipos else "respuesta inválida"
+        det = {"ok": "", "parcial": "respondió un solo equipo válido"}.get(estado, "JSON sin equipos válidos")
+        if b["estado"] != "ok":
+            det = (det + " · " if det else "") + f"búsqueda {b['estado']}"
+        if errs:
+            det = (det + " · " if det else "") + "errores de búsqueda: " + ", ".join(sorted(set(errs)))
+        return {**base, "equipos": equipos, "estado": estado, "detalle": det, "latencia_s": round(time.time() - t0, 2)}
+    except Exception as ex:  # noqa: BLE001
+        return {**base, "estado": "error", "detalle": type(ex).__name__, "latencia_s": round(time.time() - t0, 2)}
+
+
+def a1_lanzar(juegos, ahora, origen, post=None):
+    """Arranca el vigía-alineador en un hilo aparte y vuelve enseguida (la corrida sigue con g1, el vigía de Gemini y e2).
+    juegos: [dict(game_id, semana, game_type, visita, local, inicio)]. Reparte el tope del día ANTES de consultar.
+    Nunca consulta juegos empezados (H36). Devuelve el trabajo para a1_cerrar, o None si no corre (sin llave o apagado)."""
+    try:
+        resto, motivo = claude_cupo(ahora)
+        if not CLAUDE_LLAVE.exists() or motivo.startswith("apagado"):
+            return None
+        momento = e2_momento(ahora)
+        futuros = [j for j in juegos if j["inicio"] > momento]
+        if not futuros:
+            return None
+        n = int(resto // A1_USD_JUEGO)
+        a_consultar, sin_cupo = futuros[:n], futuros[n:]
+        t0 = time.time()
+        limite = t0 + A1_PLAZO_S
+        res = {}
+
+        def trabajar():
+            from concurrent.futures import ThreadPoolExecutor, wait
+            if not a_consultar:
+                return
+            ex = ThreadPoolExecutor(max_workers=A1_HILOS)
+            futs = {ex.submit(a1_consultar, j, momento, limite, origen, post): j for j in a_consultar}
+            hechos, _ = wait(futs, timeout=max(limite - time.time(), 0) + 2.0)
+            for fu, j in futs.items():
+                res[j["game_id"]] = (fu.result() if fu in hechos and fu.exception() is None else
+                                     dict(equipos={}, urls=set(), estado="tiempo agotado", detalle="", costo_usd=0.0,
+                                          busquedas=0, latencia_s=float(A1_PLAZO_S)))
+            ex.shutdown(wait=False, cancel_futures=True)
+        hilo = threading.Thread(target=trabajar, name="vigia-claude", daemon=True)
+        hilo.start()
+        log(f"Vigía-alineador Claude ({origen}): {len(a_consultar)} juegos en consulta"
+            + (f", {len(sin_cupo)} sin cupo ({motivo or 'tope del día'})" if sin_cupo else ""))
+        return dict(hilo=hilo, res=res, juegos=futuros, sin_cupo=sin_cupo, momento=momento, t0=t0, limite=limite,
+                    origen=origen, motivo=motivo)
+    except Exception as e:  # noqa: BLE001
+        log(f"Vigía-alineador Claude: no arrancó ({type(e).__name__}); la corrida sigue")
+        return None
+
+
+def _a1_historia(ind, g26, roster):
+    """(jugados: {pfr: [inicio de cada juego de 2026 con algún snap]}, exp: {gsis: years_exp del roster de nflverse})."""
+    ini = {r["game_id"]: r["inicio"] for r in g26.iter_rows(named=True) if r.get("inicio") is not None}
+    jug = {}
+    for gid, pfrs in ind.jugaron.items():
+        t = ini.get(gid)
+        if t is not None:
+            for p in pfrs:
+                jug.setdefault(p, []).append(t)
+    exp = {}
+    for f in (roster.iter_rows(named=True) if roster is not None else []):
+        g = _texto(f.get("gsis_id"))
+        try:
+            if g:
+                exp[g] = int(float(f.get("years_exp")))
+        except (TypeError, ValueError):
+            pass
+    return jug, exp
+
+
+def _pfr_por_nombre(ind, eq, nombre):
+    """El pfr de los snaps del equipo con ese nombre (para jugadores sin pfr en el roster), o ''."""
+    n = _norm(nombre)
+    if not n:
+        return ""
+    c = [p for p in ind.part.get(eq, {}) if _norm(ind.nom_pfr.get(p, "")) == n]
+    return c[0] if len(c) == 1 else ""
+
+
+def _a1_validar_alin(a, momento):
+    """'' si el jugador de la alineación tiene fuente válida; si no, el motivo. La fecha es opcional (las tablas de
+    profundidad casi nunca la muestran), pero si la hay no puede ser posterior a la consulta."""
+    if not a["nombre"]:
+        return "sin nombre"
+    if a["unidad"] not in A1_UNIDADES:
+        return "unidad desconocida"
+    if a["tipo_fuente"] not in A1_TIPOS_ALIN:
+        return "tipo de fuente desconocido"
+    if not re.match(r"^https?://\S+$", a["url"]):
+        return "sin URL"
+    f = _fecha_fuente(a["publicada"]) if a["publicada"] else None
+    if isinstance(f, dt.datetime) and f > momento + dt.timedelta(minutes=VIGIA_HOLGURA_MIN):
+        return "fuente posterior a la consulta"
+    if isinstance(f, dt.date) and not isinstance(f, dt.datetime) and f > momento.astimezone(dt.timezone.utc).date():
+        return "fuente posterior a la consulta"
+    return ""
+
+
+def a1_cerrar(trab, filas_proy, g26):
+    """Espera al hilo del vigía-alineador (hasta su plazo), cruza lo que trajo con el roster y los snaps (el código decide:
+    titulares habituales, qué no sabe la máquina, quién no tiene historia en la NFL), escribe sus registros y devuelve el
+    resumen para Telegram, o None. Nunca detiene la corrida."""
+    if not trab:
+        return None
+    try:
+        trab["hilo"].join(timeout=max(trab["limite"] - time.time(), 0) + 10.0)
+        momento, origen, huella = trab["momento"], trab["origen"], a1_huella()
+        snaps, roster = vigia_datos()
+        ind = VigiaIndice(snaps, roster, g26)
+        jug, exp = _a1_historia(ind, g26, roster)
+        qb_usado = {}
+        for f in filas_proy:
+            qb_usado[(f["game_id"], f["local"])] = _texto(f.get("qb_local_id"))
+            qb_usado[(f["game_id"], f["visita"])] = _texto(f.get("qb_visita_id"))
+        res = dict(trab["res"])
+        sin_cupo = {j["game_id"] for j in trab["sin_cupo"]}
+        filas_c, filas_h, filas_a = [], [], []
+        resumen = dict(momento=momento, origen=origen, huella=huella, semanas=sorted({j["semana"] for j in trab["juegos"]}),
+                       juegos=[], costo=0.0, consultas=[0, 0], inactivos=[0, 0], alineacion=[0, 0],
+                       inicio=min(j["inicio"] for j in trab["juegos"]), sin_roster=0)
+        for j in trab["juegos"]:
+            gid = j["game_id"]
+            if gid in sin_cupo:
+                x = dict(equipos={}, urls=set(), estado="tope", detalle=trab.get("motivo") or "tope del día en USD",
+                         costo_usd=0.0, busquedas=0, latencia_s=0.0)
+            else:
+                x = res.get(gid) or dict(equipos={}, urls=set(), estado="tiempo agotado", detalle="", costo_usd=0.0,
+                                         busquedas=0, latencia_s=float(A1_PLAZO_S))
+            minutos = round((j["inicio"] - momento).total_seconds() / 60, 1)
+            valida = int(minutos > 0)
+            if x["estado"] != "tope":
+                resumen["consultas"][1] += 1
+                resumen["consultas"][0] += int(x["estado"] in ("ok", "parcial"))
+            resumen["costo"] += float(x.get("costo_usd") or 0)
+            tit = {eq: ind.titulares(eq, j["inicio"]) for eq in (j["visita"], j["local"])}
+            avisos = {j["visita"]: {}, j["local"]: {}}
+            nuevos = {j["visita"]: [], j["local"]: []}
+            n_h = n_a = n_al = n_nu = 0
+            for eq in (j["visita"], j["local"]):
+                resumen["inactivos"][1] += 1
+                resumen["alineacion"][1] += 1
+                e = x["equipos"].get(eq)
+                if not e:
+                    continue
+                resumen["inactivos"][0] += int(e.get("inactivos") == 1)
+                resumen["alineacion"][0] += int(sum(1 for a in e["alineacion"] if a["unidad"] in ("offense", "defense")) >= 15)
+                vistos = set()
+                for h in e["fuera"]:
+                    en_res = int(bool(h["url"]) and _url_norm(h["url"]) in x["urls"])
+                    motivo = vigia_validar(h, momento) or ("" if en_res else "URL fuera de los resultados de búsqueda")
+                    g, cruce = ind.gsis_por_nombre(eq, h["nombre"], h["posicion"]) if h["nombre"] else ("", "sin cruzar")
+                    tt = (tit.get(eq) or {}).get(g) if g else None
+                    es_qb = int(bool(g) and g == qb_usado.get((gid, eq), ""))
+                    pos = (tt or {}).get("pos") or ind.pos.get(g, "") or h["posicion"]
+                    aviso = int(not motivo and valida == 1 and h["estado_jugador"] in VIGIA_NO_JUEGA and bool(g)
+                                and g not in vistos and ((tt is not None and pos != "QB") or es_qb == 1))
+                    if g:
+                        vistos.add(g)
+                    n_h += 1
+                    n_a += aviso
+                    filas_h.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], modelo_clave="C", huella=huella,
+                                        equipo=eq, nombre=h["nombre"], posicion=h["posicion"], estado_jugador=h["estado_jugador"],
+                                        tipo_fuente=h["tipo_fuente"], url=h["url"], publicada=h["publicada"], evidencia=h["evidencia"],
+                                        valido=int(not motivo), motivo_invalido=motivo, gsis_id=g, cruce=cruce,
+                                        titular=int(tt is not None), part_media="" if tt is None else tt["part"],
+                                        es_qb_usado=es_qb, aviso=aviso, minutos_antes=minutos,
+                                        nombre_roster=ind.nombre.get(g, "") if g else "", origen=origen, url_en_resultados=en_res))
+                    if aviso:
+                        avisos[eq][g] = dict(nombre=ind.nombre.get(g) or h["nombre"], pos=pos, qb=es_qb, estado=h["estado_jugador"],
+                                             fuente=h["tipo_fuente"])
+                vistos_a = set()
+                for a in e["alineacion"]:
+                    en_res = int(bool(a["url"]) and _url_norm(a["url"]) in x["urls"])
+                    motivo = _a1_validar_alin(a, momento) or ("" if en_res else "URL fuera de los resultados de búsqueda")
+                    g, cruce = ind.gsis_por_nombre(eq, a["nombre"], a["posicion"]) if a["nombre"] else ("", "sin cruzar")
+                    pfr = (ind.gsis_pfr.get(g, "") if g else "") or _pfr_por_nombre(ind, eq, a["nombre"])
+                    jugados = sum(1 for t in jug.get(pfr, []) if t < j["inicio"]) if pfr else 0
+                    ye = exp.get(g) if g else None
+                    habit = bool(tit.get(eq) is not None and g and (g in tit[eq] or (pfr and f"pfr:{pfr}" in tit[eq])))
+                    sin_hist = int(bool(g) and ye == 0 and jugados == 0)
+                    sin_26 = int(bool(g) and (ye or 0) > 0 and jugados == 0)
+                    nuevo = int(not motivo and valida == 1 and a["unidad"] in ("offense", "defense") and tit.get(eq) is not None
+                                and bool(g) and not habit)
+                    n_al += 1
+                    if not motivo and not g:
+                        resumen["sin_roster"] += 1
+                    filas_a.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], origen=origen, huella=huella,
+                                        equipo=eq, nombre=a["nombre"], posicion=a["posicion"], unidad=a["unidad"],
+                                        tipo_fuente=a["tipo_fuente"], url=a["url"], publicada=a["publicada"],
+                                        valido=int(not motivo), motivo_invalido=motivo, url_en_resultados=en_res, gsis_id=g,
+                                        pfr_id=pfr, cruce=cruce, titular_habitual=int(habit), jugados_2026=jugados,
+                                        years_exp="" if ye is None else ye, sin_historia=sin_hist, sin_2026=sin_26, nuevo=nuevo,
+                                        minutos_antes=minutos, nombre_roster=ind.nombre.get(g, "") if g else ""))
+                    clave_a = g or _norm(a["nombre"])
+                    if not motivo and valida == 1 and (nuevo or sin_hist) and clave_a not in vistos_a:
+                        vistos_a.add(clave_a)
+                        n_nu += 1
+                        nuevos[eq].append(dict(nombre=ind.nombre.get(g) or a["nombre"], pos=ind.pos.get(g) or a["posicion"],
+                                               sin_hist=sin_hist, sin_26=sin_26, unidad=a["unidad"]))
+            filas_c.append(dict(corrida_utc=iso(momento), game_id=gid, semana=j["semana"], game_type=j.get("game_type", "REG"),
+                                inicio_utc=iso(j["inicio"]), minutos_antes=minutos, valida=valida, modelo_clave="C",
+                                modelo=CLAUDE_MODELO, huella=huella, forma=x.get("forma", ""), model_version=CLAUDE_MODELO,
+                                estado=x["estado"], http=x.get("http", ""), latencia_s=x.get("latencia_s", ""),
+                                costo_usd=x.get("costo_usd", ""), busquedas=x.get("busquedas", ""),
+                                evidencia_busqueda="resultados" if x.get("urls") else "ninguna",
+                                inactivos_visita=(x["equipos"].get(j["visita"]) or {}).get("inactivos", ""),
+                                inactivos_local=(x["equipos"].get(j["local"]) or {}).get("inactivos", ""),
+                                titulares_visita=_tit_txt(tit[j["visita"]]), titulares_local=_tit_txt(tit[j["local"]]),
+                                n_hechos=n_h, n_avisos=n_a, detalle=_texto(x.get("detalle"))[:300], origen=origen,
+                                n_alineacion=n_al, n_nuevos=n_nu, n_urls=len(x.get("urls") or ())))
+            resumen["juegos"].append(dict(game_id=gid, visita=j["visita"], local=j["local"], valida=valida, avisos=avisos,
+                                          nuevos=nuevos, estado=x["estado"], detalle=_texto(x.get("detalle")),
+                                          sin_titulares=[eq for eq in (j["visita"], j["local"]) if tit[eq] is None]))
+        r_ = A1_RUTAS[origen]
+        _anexar_csv(r_["consultas"], CAMPOS_A1C, filas_c, r_["consultas"].stem)
+        _anexar_csv(r_["hechos"], CAMPOS_A1H, filas_h, r_["hechos"].stem)
+        _anexar_csv(r_["alineacion"], CAMPOS_A1A, filas_a, r_["alineacion"].stem)
+        n_av = sum(len(v) for jj in resumen["juegos"] for v in jj["avisos"].values())
+        n_nu = sum(len(v) for jj in resumen["juegos"] for v in jj["nuevos"].values())
+        log(f"Vigía-alineador Claude ({origen}, {CLAUDE_MODELO}, huella {huella}): {len(trab['juegos'])} juegos en "
+            f"{time.time() - trab['t0']:.1f} s · consultas {resumen['consultas'][0]}/{resumen['consultas'][1]} · "
+            f"{len(filas_h)} hechos · {n_av} avisos · {len(filas_a)} en la alineación · {n_nu} nuevos · USD {resumen['costo']:.4f}")
+        return resumen
+    except Exception as e:  # noqa: BLE001
+        log(f"Vigía-alineador Claude: error ({type(e).__name__}: {str(e)[:200]}); la proyección y los demás agentes no se afectan")
+        return None
+
+
+def texto_a1(r):
+    """Mensaje de Telegram del vigía-alineador (aparte; marcado piloto o «a pedido, no cuenta»)."""
+    manual = r["origen"] == "manual"
+    lin = [("🧭 VIGÍA-ALINEADOR CLAUDE A PEDIDO (no cuenta)" if manual else "🧭 VIGÍA-ALINEADOR CLAUDE · piloto 65.1")
+           + f" · {CLAUDE_NOMBRE} · semana {', '.join(map(str, r['semanas']))} · juegos de las {fecha_cc(r['inicio'])} (Caracas)"]
+    sin = []
+    for jj in r["juegos"]:
+        nombre = f"{jj['visita']} @ {jj['local']}"
+        partes = []
+        for eq in (jj["visita"], jj["local"]):
+            av = jj["avisos"][eq]
+            for a in [a for a in av.values() if a["qb"]]:
+                partes.append(f"⚠️ {eq}: la máquina proyectó con {a['nombre']} y la fuente oficial lo da fuera "
+                              f"({ESTADO_ES.get(a['estado'], a['estado'])} · {FUENTE_ES.get(a['fuente'], a['fuente'])})")
+            otros = [a for a in av.values() if not a["qb"]]
+            if otros:
+                n = len(otros)
+                partes.append(f"🔎 {eq}: falta{'n' if n > 1 else ''} {n} titular{'es' if n > 1 else ''} que la máquina no conoce: "
+                              + ", ".join(f"{a['pos']} {a['nombre']} ({ESTADO_ES.get(a['estado'], a['estado'])} · "
+                                          f"{FUENTE_ES.get(a['fuente'], a['fuente'])})" for a in otros))
+            nu = jj["nuevos"][eq]
+            if nu:
+                n = len(nu)
+                partes.append(f"🆕 {eq}: {n} titular{'es' if n > 1 else ''} nuevo{'s' if n > 1 else ''} en la alineación esperada: "
+                              + ", ".join(f"{a['pos']} {a['nombre']}" + (" (primer partido en la NFL)" if a["sin_hist"] else
+                                                                       " (no jugó en 2026)" if a["sin_26"] else "")
+                                          for a in nu))
+        if jj["estado"] not in ("ok", "parcial"):
+            partes.append(f"sin respuesta ({jj['estado']}{': ' + jj['detalle'][:80] if jj['detalle'] else ''})")
+        if not jj["valida"]:
+            partes.append("consulta después del inicio (no cuenta)")
+        if partes:
+            lin.append(f"{nombre}:")
+            lin += ["  " + p for p in partes]
+        else:
+            sin.append(nombre)
+        if jj["sin_titulares"]:
+            lin.append(f"  (sin titulares calculables todavía: {', '.join(jj['sin_titulares'])})")
+    if sin:
+        lin.append("Sin bajas de titulares ni titulares nuevos: " + ", ".join(sin))
+    lin.append(f"Lista oficial de inactivos en {r['inactivos'][0]} de {r['inactivos'][1]} equipos · alineación completa en "
+               f"{r['alineacion'][0]} de {r['alineacion'][1]} · consultas {r['consultas'][0]}/{r['consultas'][1]}"
+               + (f" · {r['sin_roster']} nombres sin cruzar con el roster" if r.get("sin_roster") else "")
+               + f" · USD {r['costo']:.2f}".replace(".", ","))
+    lin.append("Solo hechos con URL de los resultados de búsqueda; el código decide quién es titular (snaps) y quién no tiene "
+               "historia en la NFL (roster). No cambia la máquina ni las selecciones."
+               + (" Registro aparte: no entra a ninguna medición." if manual else " La columna 🔎 de la hoja sigue siendo la de Gemini."))
+    return "\n".join(lin)
+
+
+# ---------------------------------------------------------------- A1 · medición con los snaps (código, sin IA)
+def _metricas_juego(f, hs, ind):
+    """Métricas de 55 de UNA consulta (fila de consultas) con sus hechos: hechos sobre titulares, verificables, correctos
+    (no jugó), titulares que no jugaron y cuántos de ellos se avisaron. Igual que vigia_verificar."""
+    gid = f["game_id"]
+    vis, loc = gid.split("_")[-2], gid.split("_")[-1]
+    m = dict(hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0)
+    avisados = {}
+    for h in hs:
+        if h["valido"] == "1" and h["estado_jugador"] in VIGIA_NO_JUEGA and h["gsis_id"]:
+            avisados.setdefault(h["equipo"], set()).add(h["gsis_id"])
+    vistos = set()
+    for h in hs:
+        if not (h["valido"] == "1" and h["titular"] == "1" and h["estado_jugador"] in VIGIA_NO_JUEGA and h["gsis_id"]):
+            continue
+        k = (h["equipo"], h["gsis_id"])
+        if k in vistos:
+            continue
+        vistos.add(k)
+        m["hechos"] += 1
+        tt = _tit_leer(f["titulares_local"] if h["equipo"] == loc else f["titulares_visita"]).get(h["gsis_id"])
+        jugo = ind.jugo(gid, h["gsis_id"], (tt or {}).get("pfr", ""))
+        if jugo is not None:
+            m["verificables"] += 1
+            m["correctos"] += int(jugo == 0)
+    for eq, col, ci in ((vis, "titulares_visita", "inactivos_visita"), (loc, "titulares_local", "inactivos_local")):
+        if f.get(ci, "") == "":
+            continue                                     # el modelo no respondió por ese equipo
+        for g, d in _tit_leer(f[col]).items():
+            jugo = ind.jugo(gid, g, d.get("pfr", ""))
+            if jugo == 0:
+                m["no_jugaron"] += 1
+                m["avisados"] += int(g in avisados.get(eq, set()))
+    return m
+
+
+def _metricas_alin(f, als, ind):
+    """Alineación de UNA consulta: titulares de ataque y defensa dados por Claude con participación ≥ 50 % en el partido
+    (precisión) y titulares del partido que no eran habituales, cuántos estaban en su alineación (cobertura de nuevos)."""
+    gid = f["game_id"]
+    m = dict(alin=0, alin_ok=0, alin_sin_cruzar=0, nuevos_reales=0, nuevos_cubiertos=0)
+    if gid not in ind.con_snaps:
+        return m
+    vis, loc = gid.split("_")[-2], gid.split("_")[-1]
+    dados = {}
+    for a in als:
+        if a["valido"] != "1" or a["unidad"] not in ("offense", "defense"):
+            continue
+        pfr = a.get("pfr_id") or ind.gsis_pfr.get(a["gsis_id"], "") or _pfr_por_nombre(ind, a["equipo"], a["nombre"])
+        if not pfr:
+            m["alin_sin_cruzar"] += 1                    # no verificable con los snaps: se reporta aparte
+            continue
+        if (a["equipo"], pfr) in dados:
+            continue
+        dados[(a["equipo"], pfr)] = 1
+        m["alin"] += 1
+        m["alin_ok"] += int((ind.part.get(a["equipo"], {}).get(pfr, {}).get(gid) or 0.0) >= 0.5)
+    for eq, col in ((vis, "titulares_visita"), (loc, "titulares_local")):
+        if f.get(col, "") == "" or not any(k[0] == eq for k in dados):
+            continue
+        habit = {d.get("pfr") for d in _tit_leer(f[col]).values()}
+        for pfr, partes in ind.part.get(eq, {}).items():
+            if (partes.get(gid) or 0.0) >= 0.5 and pfr not in habit and ind.pos_pfr.get(pfr) not in VIGIA_SIN_TITULAR:
+                m["nuevos_reales"] += 1
+                m["nuevos_cubiertos"] += int((eq, pfr) in dados)
+    return m
+
+
+def a1_piloto_semanas(g26):
+    """Semanas completas del piloto 65.1: una consulta T−85 válida de la huella actual en cada juego de la semana. Las
+    2 primeras forman el piloto."""
+    import polars as pl
+    cons = [f for f in _leer_csv(A1_RUTAS["t85"]["consultas"]) if f.get("valida") == "1" and f.get("huella") == a1_huella()
+            and f.get("estado") != "tope"]
+    por_sem = {}
+    for f in cons:
+        por_sem.setdefault(int(f["semana"]), set()).add(f["game_id"])
+    out = []
+    for s_, ids in sorted(por_sem.items()):
+        todos = set(g26.filter(pl.col("week") == s_)["game_id"].to_list())
+        if todos and todos <= ids:
+            out.append(s_)
+    return out
+
+
+def a1_verificar(g26):
+    """Verificación del vigía-alineador con los snaps (por semana) y comparación con Gemini en los mismos juegos.
+    Devuelve (métricas por semana, comparación por modelo de Gemini, juegos en común)."""
+    cons = [f for f in _leer_csv(A1_RUTAS["t85"]["consultas"]) if f.get("valida") == "1" and f.get("huella") == a1_huella()
+            and f.get("estado") != "tope"]
+    if not cons:
+        return {}, {}, 0
+    hechos = _leer_csv(A1_RUTAS["t85"]["hechos"])
+    alins = _leer_csv(A1_RUTAS["t85"]["alineacion"])
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    ult = {}
+    for f in cons:
+        if f["corrida_utc"] > ult.get(f["game_id"], {}).get("corrida_utc", ""):
+            ult[f["game_id"]] = f
+    met = {}
+    juegos_c = {}
+    for gid, f in ult.items():
+        s_ = int(f["semana"])
+        m = met.setdefault(s_, dict(consultas=0, fallas=0, hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0,
+                                    alin=0, alin_ok=0, alin_sin_cruzar=0, nuevos_reales=0, nuevos_cubiertos=0, sin_snaps=0))
+        m["consultas"] += 1
+        m["fallas"] += int(f["estado"] not in ("ok", "parcial"))
+        if gid not in ind.con_snaps:
+            m["sin_snaps"] += 1
+            continue
+        mj = _metricas_juego(f, [h for h in hechos if h["game_id"] == gid and h["corrida_utc"] == f["corrida_utc"]], ind)
+        ma = _metricas_alin(f, [a for a in alins if a["game_id"] == gid and a["corrida_utc"] == f["corrida_utc"]], ind)
+        for k, v in {**mj, **ma}.items():
+            m[k] += v
+        juegos_c[gid] = (f, mj)
+    # Gemini (55) en los mismos juegos: huella actual de cada modelo, última consulta T−85 válida de cada juego
+    gem = {}
+    act = {c: vigia_huella(c) for c in VIGIA_MODELOS}
+    cons_g = [f for f in _leer_csv(VIGIA_CONSULTAS) if f.get("valida") == "1" and f.get("huella") == act.get(f.get("modelo_clave"))
+              and f.get("estado") != "tope" and f["game_id"] in juegos_c]
+    ult_g = {}
+    for f in cons_g:
+        k = (f["game_id"], f["modelo_clave"])
+        if f["corrida_utc"] > ult_g.get(k, {}).get("corrida_utc", ""):
+            ult_g[k] = f
+    hechos_g = _leer_csv(VIGIA_HECHOS) if ult_g else []
+    comunes = {}
+    for (gid, c), f in ult_g.items():
+        mg = _metricas_juego(f, [h for h in hechos_g if h["game_id"] == gid and h["modelo_clave"] == c
+                                 and h["corrida_utc"] == f["corrida_utc"]], ind)
+        t = gem.setdefault(c, dict(juegos=0, fallas=0, hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0))
+        tc = comunes.setdefault(c, dict(juegos=0, fallas=0, hechos=0, verificables=0, correctos=0, no_jugaron=0, avisados=0))
+        t["juegos"] += 1
+        t["fallas"] += int(f["estado"] not in ("ok", "parcial"))
+        for k, v in mg.items():
+            t[k] += v
+        fc, mc = juegos_c[gid]
+        tc["juegos"] += 1
+        tc["fallas"] += int(fc["estado"] not in ("ok", "parcial"))
+        for k, v in mc.items():
+            tc[k] += v
+    return met, dict(gemini=gem, claude=comunes), len({g for g, _ in ult_g})
+
+
+def _tasa(a, b):
+    return (a / b) if b else None
+
+
+def seccion_vigia_claude(g26):
+    """65.1: verificación del vigía-alineador de Claude con los snaps, regla de 55 aplicada a Opus en el piloto y
+    comparación con Gemini en los mismos juegos. ('', []) si todavía no hay consultas."""
+    met, comp, n_com = a1_verificar(g26)
+    if not met:
+        return "", []
+    sem_p = a1_piloto_semanas(g26)[:A1_PILOTO_SEMANAS]
+    lin = [f"VIGÍA-ALINEADOR CLAUDE (65.1, {CLAUDE_NOMBRE}, huella {a1_huella()}): verificación con los snaps de nflverse (código, sin IA)"]
+    for s_, m in sorted(met.items()):
+        lin.append(f"  semana {s_}: {m['consultas']} consultas ({m['fallas']} fallidas) · fuera: hechos sobre titulares {m['hechos']}, "
+                   f"verificables {m['verificables']}, correctos {m['correctos']} · precisión {_pct(_tasa(m['correctos'], m['verificables']), False)}"
+                   f" · cobertura {_pct(_tasa(m['avisados'], m['no_jugaron']), False)} ({m['avisados']} de {m['no_jugaron']}) · "
+                   f"alineación {_pct(_tasa(m['alin_ok'], m['alin']), False)} ({m['alin_ok']} de {m['alin']} jugaron ≥ 50 %"
+                   + (f"; {m['alin_sin_cruzar']} sin cruzar con el roster, no verificables" if m["alin_sin_cruzar"] else "") + ") · "
+                   f"titulares nuevos cubiertos {m['nuevos_cubiertos']} de {m['nuevos_reales']}"
+                   + (f" · {m['sin_snaps']} juegos sin snaps todavía" if m["sin_snaps"] else ""))
+    t = {k: sum(met[s_][k] for s_ in sem_p) for k in ("consultas", "fallas", "verificables", "correctos", "avisados", "no_jugaron")}
+    if len(sem_p) >= A1_PILOTO_SEMANAS and not any(met[s_]["sin_snaps"] for s_ in sem_p):
+        prec, fal = _tasa(t["correctos"], t["verificables"]), _tasa(t["fallas"], t["consultas"])
+        eleg = prec is not None and prec >= VIGIA_MIN_PRECISION and t["verificables"] >= VIGIA_MIN_HECHOS and (fal or 0) <= VIGIA_MAX_FALLAS
+        piloto = (f"Piloto 65.1 (semanas {', '.join(map(str, sem_p))}): regla de 55 aplicada a Opus → "
+                  f"{'ELEGIBLE' if eleg else 'NO elegible'} (precisión {_pct(prec, False)} con {t['verificables']} hechos, "
+                  f"fallas {_pct(fal, False)}, cobertura {_pct(_tasa(t['avisados'], t['no_jugaron']), False)}). "
+                  "Retirar o no a Gemini lo decide Ozz con estos números.")
+    else:
+        piloto = (f"Piloto 65.1: en curso ({len(sem_p)} de {A1_PILOTO_SEMANAS} semanas completas"
+                  + (f": {', '.join(map(str, sem_p))}" if sem_p else "") + "; cuenta una semana con consulta T−85 en todos sus juegos)")
+    lin.append("  " + piloto)
+    comp_txt = ""
+    if n_com:
+        el = (leer_estado().get("vigia") or {}).get("elegido")
+        claves = [el["clave"]] if el and el.get("clave") in comp["gemini"] else sorted(comp["gemini"])
+        partes = []
+        for c in claves:
+            g, cl = comp["gemini"][c], comp["claude"][c]
+            partes.append(f"{VIGIA_NOMBRE[c]}: precisión {_pct(_tasa(g['correctos'], g['verificables']), False)} "
+                          f"({g['correctos']} de {g['verificables']}), cobertura {_pct(_tasa(g['avisados'], g['no_jugaron']), False)} "
+                          f"contra Opus {_pct(_tasa(cl['correctos'], cl['verificables']), False)} y "
+                          f"{_pct(_tasa(cl['avisados'], cl['no_jugaron']), False)} en los mismos {g['juegos']} juegos")
+        comp_txt = "En los mismos juegos que Gemini: " + " · ".join(partes)
+        lin.append("  " + comp_txt)
+    tot = {k: sum(m[k] for m in met.values()) for k in ("correctos", "verificables", "avisados", "no_jugaron", "alin_ok", "alin")}
+    tel = (f"Vigía-alineador Claude (65.1): precisión {_pct(_tasa(tot['correctos'], tot['verificables']), False)} "
+           f"({tot['correctos']} de {tot['verificables']}), cobertura {_pct(_tasa(tot['avisados'], tot['no_jugaron']), False)}, "
+           f"alineación {_pct(_tasa(tot['alin_ok'], tot['alin']), False)} · {piloto}" + (f" · {comp_txt}" if comp_txt else ""))
+    return tel, lin
+
+
+def texto_claude_estado(ahora, estado):
+    """Conteos de los agentes de Claude para el modo estado (y /estado por Telegram)."""
+    activo, tope = claude_cfg()
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    cab = (f"Agentes de Claude (65.1, {CLAUDE_NOMBRE}): "
+           + ("llave presente" if CLAUDE_LLAVE.exists() else "SIN llave (credenciales/anthropic.key): no corren")
+           + f" · {'activos' if activo else 'APAGADOS en semana.ini [claude_motor]'} · hoy USD {claude_gasto_hoy(hoy):.2f} de {tope:.2f}"
+           + f" · huellas A1 {a1_huella()}, A3 {a3_huella()}, A4 {a4_huella()}")
+    cons = [f for f in _leer_csv(A1_RUTAS["t85"]["consultas"]) if f.get("valida") == "1"]
+    av = sum(int(f.get("n_avisos") or 0) for f in cons)
+    nu = sum(int(f.get("n_nuevos") or 0) for f in cons)
+    lin = [cab,
+           f"  Vigía-alineador (A1): {len(cons)} consultas T−85 en {len({f['game_id'] for f in cons})} juegos "
+           f"({sum(1 for f in cons if f.get('estado') not in ('ok', 'parcial', 'tope'))} fallidas) · {av} avisos · {nu} titulares nuevos"
+           f" · /vigia hoy {estado.get('vigia_manual_dia', {}).get(hoy, 0)} de {VIGIA_MANUAL_MAX_DIA}"]
+    aut = sorted(estado.get("autopsias", {}), key=int)
+    bri = sorted(estado.get("briefing", {}), key=int)
+    lin.append(f"  Autopsia (A3): semanas {', '.join(aut) or 'ninguna todavía'} (automática desde la semana {A3_DESDE}) · "
+               f"Analista del sábado (A4): semanas {', '.join(bri) or 'ninguna todavía'} · /briefing hoy "
+               f"{estado.get('briefing_dia', {}).get(hoy, 0)} de {A4_MAX_DIA}")
+    return "\n".join(lin)
+
+
+# ---------------------------------------------------------------- A3 · autopsia del lunes
+A3_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 3, "allowed_domains": ["espn.com", "nfl.com"]}
+A3_MAX_TOKENS = 1500
+A3_PLAZO_S = 240
+A3_HILOS = 8
+A3_USD_JUEGO = 0.25
+A3_DESDE = 7                                       # automática desde la semana 7 (la primera después de instalar)
+COEF_H41 = dict(perdidas=3.335, ee=0.692, neto=35.49)  # pts por balón, por punto de EPA de EE y por 1,0 de EPA/jugada (H41)
+CAUSA_ES = {"perdidas": "pérdidas de balón", "ee": "equipos especiales", "neto": "jugó peor (sin contar pérdidas)",
+            "ninguna": "ninguna de las tres (lo no medido)"}
+AUTOPSIA_CLAUDE = SAL / "autopsia_claude.csv"
+CAMPOS_A3 = ["corrida_utc", "origen", "huella", "semana", "game_id", "juego", "favorito", "ganador", "fuente_favorito",
+             "p_favorito", "esperado_pts", "resultado", "margen_favorito", "sorpresa_pts", "perdidas_dif", "perdidas_pts",
+             "ee_epa", "ee_pts", "neto_sin", "neto_pts", "explicado_pts", "cerrado", "ultima_serie", "cambio_qb", "qb_inicio",
+             "qb_final", "causa", "texto", "url", "estado", "costo_usd", "detalle"]
+A3_SISTEMA = """You explain, for a Spanish-speaking audience, why the betting favorite lost an NFL game. Search the official
+game recap on espn.com or nfl.com and rely only on it and on the numbers given. Write in Spanish, at most 70 words, plain
+text without lists: the plays that decided the game (turnovers, special teams, the last drive, an injury) as the recap
+reports them. Do not predict, do not give betting advice, do not invent quotes."""
+A3_USUARIO = """Game: {visita_nombre} at {local_nombre} (NFL {temporada}, week {semana}). Final: {resultado}.
+The favorite at the close was {favorito} and lost.
+Computed from the play-by-play, from the favorite's side: turnover differential {perd}; special-teams EPA {ee}; EPA per
+play without turnovers {neto}; close game (8 points or less): {cerrado}; decided on the last drive: {ultima}; quarterback
+change during the game: {cambio}."""
+A3_COLS = ["game_id", "play_id", "posteam", "defteam", "home_team", "away_team", "qtr", "game_seconds_remaining",
+           "total_home_score", "total_away_score", "play_type", "special_teams_play", "epa", "interception", "fumble",
+           "fumble_lost", "qb_dropback", "passer_player_id", "passer_player_name", "rusher_player_id", "rusher_player_name"]
+
+
+def a3_huella():
+    return _huella(dict(modelo=CLAUDE_MODELO, sistema=A3_SISTEMA, usuario=A3_USUARIO, herramienta=A3_HERRAMIENTA,
+                        max_tokens=A3_MAX_TOKENS, plazo=A3_PLAZO_S, coef=COEF_H41))
+
+
+def _pbp_columnas(cols, ids=None):
+    """Jugada por jugada de 2026 con esas columnas (la misma copia que baja pbp_temporada), solo esos juegos."""
+    import polars as pl
+    pbp_temporada()
+    ruta = DATOS / f"pbp_{TEMPORADA}.parquet"
+    if not ruta.exists():
+        return None
+    esquema = pl.read_parquet_schema(ruta)
+    df = pl.read_parquet(ruta, columns=[c for c in cols if c in esquema])
+    return df.filter(pl.col("game_id").is_in(list(ids))) if ids is not None else df
+
+
+def _a3_causas(q, fav, dog):
+    """Causas de H41 de un juego vistas por el favorito, con las definiciones del estudio (perdidas.py y ee_completo.py
+    del registro 64), más partido cerrado, última serie y cambio de QB. q: jugadas del juego (polars)."""
+    import polars as pl
+    q = q.sort("play_id")
+    j = q.filter(pl.col("play_type").is_in(["pass", "run"]) & pl.col("epa").is_not_null())
+
+    def entregas(t):
+        intc = int(j.filter(pl.col("posteam") == t)["interception"].fill_null(0).sum())
+        fum = int(q.filter((pl.col("fumble").fill_null(0) == 1) & (pl.col("posteam") == t))["fumble_lost"].fill_null(0).sum())
+        return intc + fum
+    perd = entregas(dog) - entregas(fav)
+    st = q.filter(((pl.col("special_teams_play").fill_null(0) == 1)
+                   | pl.col("play_type").is_in(["field_goal", "extra_point", "punt", "kickoff"])) & pl.col("epa").is_not_null())
+    ee = float(st.filter(pl.col("posteam") == fav)["epa"].sum() or 0.0) - float(st.filter(pl.col("defteam") == fav)["epa"].sum() or 0.0)
+    lim = j.filter((pl.col("interception").fill_null(0) != 1) & (pl.col("fumble_lost").fill_null(0) != 1))
+    of, de = lim.filter(pl.col("posteam") == fav)["epa"], lim.filter(pl.col("defteam") == fav)["epa"]
+    neto = (float(of.mean()) - float(de.mean())) if of.len() and de.len() else None
+    # última serie: el ganador (dog) toma la ventaja definitiva con ≤ 2:00 del 4.º cuarto o en tiempo extra
+    dog_local = q["home_team"][0] == dog if q.height else False
+    ultimo, lider_prev = None, False
+    for qtr, gsr, h, a in q.select(["qtr", "game_seconds_remaining", "total_home_score", "total_away_score"]).drop_nulls(
+            ["total_home_score", "total_away_score"]).iter_rows():
+        lider = ((h - a) if dog_local else (a - h)) > 0
+        if lider and not lider_prev:
+            ultimo = (qtr, gsr)
+        lider_prev = lider
+    ultima = None if ultimo is None else bool((ultimo[0] or 0) >= 5 or ((ultimo[0] or 0) == 4 and (ultimo[1] if ultimo[1] is not None else 9e9) <= 120))
+    # cambio de QB: el QB con más dropbacks del 2.º tiempo no es el del primer dropback
+    d = q.filter((pl.col("posteam") == fav) & (pl.col("qb_dropback").fill_null(0) == 1)).with_columns(
+        pl.coalesce([pl.col("passer_player_id"), pl.col("rusher_player_id")]).alias("qb"),
+        pl.coalesce([pl.col("passer_player_name"), pl.col("rusher_player_name")]).alias("qb_n")).filter(pl.col("qb").is_not_null())
+    cambio, q0, qf = None, "", ""
+    if d.height:
+        q0 = _texto(d["qb_n"][0])
+        s2_ = d.filter(pl.col("qtr") >= 3)
+        if s2_.height:
+            top = s2_.group_by(["qb", "qb_n"]).len().sort(["len", "qb"], descending=[True, False]).row(0)
+            cambio, qf = bool(top[0] != d["qb"][0]), _texto(top[1])
+    return dict(perdidas_dif=perd, ee_epa=round(ee, 2), neto_sin=None if neto is None else round(neto, 4), ultima_serie=ultima,
+                cambio_qb=cambio, qb_inicio=q0, qb_final=qf)
+
+
+def autopsia_calcular(g26, semana, bot_dir):
+    """Juegos de la semana con resultado en que perdió el favorito del cierre (Pinnacle sin vig del bot; si no hay,
+    nflverse), con las causas de H41 pasadas a puntos con sus coeficientes. Sin empates ni pick'em."""
+    info, _sen, cierre = datos_semana(g26, semana, bot_dir)
+    filas = []
+    for gid, g in sorted(info.items(), key=lambda kv: (kv[1].get("inicio") or dt.datetime.max.replace(tzinfo=dt.timezone.utc), kv[0])):
+        res = _num(g.get("result"))
+        if res is None or abs(res) < 1e-9:
+            continue
+        loc, vis = g["home_team"], g["away_team"]
+        c = cierre.get(gid)
+        p_loc = (sin_vig_potencia(c["ml_local"], c["ml_visit"]) if c and c.get("ml_local") is not None
+                 and c.get("ml_visit") is not None else None)
+        sl = _num(g.get("spread_line"))
+        hcp = _num(c.get("hcp_local")) if c else None
+        if p_loc is not None and abs(p_loc - 0.5) > 1e-9:
+            fav, fuente = (loc if p_loc > 0.5 else vis), "Pinnacle"
+            p_fav = p_loc if fav == loc else 1.0 - p_loc
+        elif sl is not None and abs(sl) > 1e-9:
+            fav, fuente, p_fav = (loc if sl > 0 else vis), "nflverse", None
+        else:
+            continue
+        esp_loc = -hcp if hcp is not None else sl                  # margen esperado del local en el cierre
+        esperado = None if esp_loc is None else (esp_loc if fav == loc else -esp_loc)
+        margen = res if fav == loc else -res
+        if margen > 0:
+            continue
+        dog = vis if fav == loc else loc
+        filas.append(dict(semana=semana, game_id=gid, juego=f"{vis} @ {loc}", favorito=fav, ganador=dog, fuente_favorito=fuente,
+                          p_favorito=None if p_fav is None else round(p_fav, 4), esperado_pts=esperado, resultado=resultado_txt(g),
+                          margen_favorito=margen, sorpresa_pts=None if esperado is None else round(margen - esperado, 1),
+                          cerrado=int(abs(res) <= 8), visita=vis, local=loc))
+    if not filas:
+        return filas
+    p = _pbp_columnas(A3_COLS, [f["game_id"] for f in filas])
+    for f in filas:
+        q = p.filter(p["game_id"] == f["game_id"]) if p is not None else None
+        if q is None or q.height == 0:
+            f["estado_pbp"] = "sin jugada por jugada"
+            continue
+        f.update(_a3_causas(q, f["favorito"], f["ganador"]))
+        pts = dict(perdidas=COEF_H41["perdidas"] * f["perdidas_dif"], ee=COEF_H41["ee"] * f["ee_epa"],
+                   neto=None if f["neto_sin"] is None else COEF_H41["neto"] * f["neto_sin"])
+        f["perdidas_pts"], f["ee_pts"] = round(pts["perdidas"], 1), round(pts["ee"], 1)
+        f["neto_pts"] = None if pts["neto"] is None else round(pts["neto"], 1)
+        val = {k: v for k, v in pts.items() if v is not None}
+        f["explicado_pts"] = round(sum(val.values()), 1)
+        k_min = min(val, key=val.get) if val else None
+        f["causa"] = k_min if k_min is not None and val[k_min] < 0 else "ninguna"
+    return filas
+
+
+def a3_cuerpo(f):
+    sino = lambda v: "unknown" if v is None else ("yes" if v else "no")  # noqa: E731
+    txt = A3_USUARIO.format(visita_nombre=EQUIPOS.get(f["visita"], f["visita"]), local_nombre=EQUIPOS.get(f["local"], f["local"]),
+                            temporada=TEMPORADA, semana=f["semana"], resultado=f["resultado"],
+                            favorito=EQUIPOS.get(f["favorito"], f["favorito"]),
+                            perd="unknown" if f.get("perdidas_dif") is None else f"{f['perdidas_dif']:+d}",
+                            ee="unknown" if f.get("ee_epa") is None else f"{f['ee_epa']:+.1f}",
+                            neto="unknown" if f.get("neto_sin") is None else f"{f['neto_sin']:+.3f}",
+                            cerrado=sino(f.get("cerrado")), ultima=sino(f.get("ultima_serie")),
+                            cambio=("unknown" if f.get("cambio_qb") is None else
+                                    f"yes ({f.get('qb_inicio')} to {f.get('qb_final')})" if f["cambio_qb"] else "no"))
+    return {"model": CLAUDE_MODELO, "max_tokens": A3_MAX_TOKENS, "system": A3_SISTEMA,
+            "messages": [{"role": "user", "content": txt}], "tools": [A3_HERRAMIENTA]}
+
+
+def _a3_narrar(f, limite, origen, momento, post=None):
+    reg = dict(agente="A3", origen=origen, huella=a3_huella(), game_id=f["game_id"], paso="cronica", momento=momento,
+               reserva_usd=A3_USD_JUEGO)
+    r = claude_post(a3_cuerpo(f), limite, reg, post)
+    texto = re.sub(r"\s+", " ", r["texto"]).strip()
+    urls = []
+    for b in r["contenido"]:
+        for c in (b.get("citations") or []) if isinstance(b, dict) else []:
+            u = _texto((c or {}).get("url"))
+            if u and u not in urls:
+                urls.append(u)
+    return dict(texto=texto[:700], url=urls[0] if urls else "", estado=r["estado"], costo_usd=r["costo_usd"], detalle=r["detalle"])
+
+
+def _pts_txt(x, dec=1):
+    """+1,5 / −2,0 (signo de menos tipográfico); 0 sin signo."""
+    if x is None:
+        return "—"
+    if round(x, dec) == 0:
+        return f"{0:.{dec}f}".replace(".", ",")
+    return f"{x:+.{dec}f}".replace(".", ",").replace("-", "−")
+
+
+def autopsia_enviar(g26, semana, bot_dir, ahora, estado, origen, sin_telegram=False, post=None):
+    """A3: calcula las causas (código), pide a Opus la crónica corta de cada juego (en paralelo, con plazo y tope del día),
+    guarda las filas en autopsia_claude.csv y manda el mensaje con el acumulado por causa. Devuelve una línea de resumen."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    filas = autopsia_calcular(g26, semana, bot_dir)
+    resto, motivo = claude_cupo(ahora)
+    n = min(len(filas), int(resto // A3_USD_JUEGO)) if not motivo.startswith(("sin", "apagado")) else 0
+    narr = {}
+    if n:
+        limite = time.time() + A3_PLAZO_S
+        ex = ThreadPoolExecutor(max_workers=A3_HILOS)
+        momento = e2_momento(ahora)
+        futs = {ex.submit(_a3_narrar, f, limite, origen, momento, post): f["game_id"] for f in filas[:n]}
+        hechos, _ = wait(futs, timeout=A3_PLAZO_S + 5)
+        for fu, gid in futs.items():
+            narr[gid] = (fu.result() if fu in hechos and fu.exception() is None else
+                         dict(texto="", url="", estado="tiempo agotado", costo_usd=0.0, detalle=""))
+        ex.shutdown(wait=False, cancel_futures=True)
+    huella = a3_huella()
+    for f in filas:
+        x = narr.get(f["game_id"]) or dict(texto="", url="", estado="sin Claude", costo_usd=0.0,
+                                           detalle=motivo or "tope del día en USD")
+        f.update(corrida_utc=iso(ahora), origen=origen, huella=huella, texto=x["texto"], url=x["url"], estado=x["estado"],
+                 costo_usd=x["costo_usd"], detalle=_texto(x["detalle"])[:200])
+    _anexar_csv(AUTOPSIA_CLAUDE, CAMPOS_A3, filas, "autopsia_claude")
+    import polars as pl
+    n_jug = g26.filter((pl.col("week") == semana) & pl.col("result").is_not_null()).height
+    n_tot = g26.filter(pl.col("week") == semana).height
+    lin = [f"🩺 AUTOPSIA DEL LUNES · semana {semana}{' (a pedido)' if origen != 'auto' else ''} · {CLAUDE_NOMBRE} · "
+           f"{len(filas)} favorito{'s' if len(filas) != 1 else ''} del cierre perdi{'eron' if len(filas) != 1 else 'ó'} "
+           f"(de {n_jug} juegos jugados{'' if n_jug == n_tot else f', faltan {n_tot - n_jug}'})"]
+    for f in filas:
+        prob = f" ({_pct(f['p_favorito'], False)})" if f.get("p_favorito") is not None else ""
+        esp = f"por {_num_txt(abs(f['esperado_pts']), False)}" if f.get("esperado_pts") is not None else ""
+        lin.append(f"• {f['juego']}: el cierre daba a {f['favorito']}{prob} {esp}; terminó {f['resultado']}"
+                   + (f" · sorpresa {_pts_txt(f['sorpresa_pts'])} pts" if f.get("sorpresa_pts") is not None else ""))
+        if f.get("estado_pbp"):
+            lin.append(f"  {f['estado_pbp']} todavía: sin causas")
+        else:
+            extra = [x for x, si in (("cerrado (≤ 8)", f.get("cerrado")), ("decidido en la última serie", f.get("ultima_serie")),
+                                     (f"cambio de QB en el partido ({f.get('qb_inicio')} → {f.get('qb_final')})", f.get("cambio_qb")))
+                     if si]
+            lin.append(f"  pérdidas {_pts_txt(f['perdidas_dif'], 0) if f['perdidas_dif'] else '0'} (≈ {_pts_txt(f['perdidas_pts'])} pts) · equipos especiales "
+                       f"{_pts_txt(f['ee_epa'])} EPA (≈ {_pts_txt(f['ee_pts'])} pts) · juego sin pérdidas {_pts_txt(f['neto_sin'], 3)} "
+                       f"EPA por jugada (≈ {_pts_txt(f['neto_pts'])} pts)" + (" · " + " · ".join(extra) if extra else "")
+                       + f" · causa principal: {CAUSA_ES[f['causa']]}")
+        if f.get("texto"):
+            lin.append(f"  Opus: {f['texto']}" + (f" ({f['url']})" if f.get("url") else ""))
+        elif f.get("estado") not in ("ok",):
+            lin.append(f"  (sin crónica: {f.get('estado')}{' · ' + f['detalle'][:60] if f.get('detalle') else ''})")
+    if not filas:
+        lin.append("Ningún favorito del cierre perdió (o todavía no hay resultados).")
+    # acumulado: la última autopsia de cada juego (cualquier origen)
+    ult = {}
+    for r in _leer_csv(AUTOPSIA_CLAUDE):
+        if r.get("corrida_utc", "") >= ult.get(r["game_id"], {}).get("corrida_utc", ""):
+            ult[r["game_id"]] = r
+    cuenta, n_u, n_c = {}, 0, 0
+    for r in ult.values():
+        if r.get("causa"):
+            cuenta[r["causa"]] = cuenta.get(r["causa"], 0) + 1
+        n_u += int(r.get("ultima_serie") == "True")
+        n_c += int(r.get("cerrado") == "1")
+    sem_a = sorted({int(r["semana"]) for r in ult.values()})
+    if ult:
+        lin.append(f"Acumulado 2026 (semanas {', '.join(map(str, sem_a))}; {len(ult)} favoritos que perdieron): causa principal "
+                   + " · ".join(f"{CAUSA_ES[k]} {v}" for k, v in sorted(cuenta.items(), key=lambda kv: -kv[1]))
+                   + f" · cerrados {n_c} · decididos en la última serie {n_u}")
+    costo = sum(_f(f.get("costo_usd")) for f in filas)
+    lin.append("Puntos de cada causa con los coeficientes de H41 (2006-2025: 3,34 pts por balón, 0,69 por punto de EPA de equipos "
+               "especiales, 35,5 por 1,0 de EPA por jugada). H41: pérdidas y equipos especiales casi no se repiten de un partido "
+               "al siguiente. Descriptivo: no cuenta para nada · " + f"USD {costo:.2f}".replace(".", ","))
+    enviar_tg("\n".join(lin), sin_telegram)
+    if origen == "auto":
+        estado.setdefault("autopsias", {})[str(semana)] = iso(ahora)
+    log(f"Autopsia (A3) semana {semana} ({origen}): {len(filas)} juegos, {sum(1 for f in filas if f.get('texto'))} con crónica, "
+        f"USD {costo:.4f}")
+    return f"Autopsia de la semana {semana}: {len(filas)} favoritos que perdieron; mensaje enviado."
+
+
+def autopsias_pendientes(estado):
+    """Semanas desde A3_DESDE cuyo informe semanal ya salió y que no tienen autopsia automática."""
+    hechos = set(estado.get("autopsias", {}))
+    return sorted(int(s) for s in estado.get("informes", {}) if int(s) >= A3_DESDE and s not in hechos)
+
+
+def semana_reciente(g26):
+    """La semana del último juego con resultado (para /autopsia sin número)."""
+    import polars as pl
+    j = g26.filter(pl.col("result").is_not_null()).sort("inicio")
+    return int(j["week"][-1]) if j.height else None
+
+
+# ---------------------------------------------------------------- A4 · analista del sábado
+A4_DOMINIOS = ["nfl.com", "espn.com", "nbcsports.com"] + [DOMINIOS_EQUIPOS[e] for e in sorted(DOMINIOS_EQUIPOS)]
+A4_HERRAMIENTA = {"type": CLAUDE_BUSQUEDA, "name": "web_search", "max_uses": 12, "allowed_domains": A4_DOMINIOS}
+A4_MAX_TOKENS = 12000
+A4_PLAZO_S = 600                                   # búsqueda hasta 480 s + 120 s reservados para la extracción
+A4_USD = 2.0                                        # reserva para el tope del día
+A4_MAX_DIA = 3                                      # /briefing por día de Caracas
+BRIEFINGS = SAL / "briefing"
+A4_SISTEMA = """You are an NFL analyst preparing a Saturday briefing in Spanish for a betting research lab. Use web search.
+For every game listed: (1) each team's position in this week's NFL.com power rankings and in this week's Pro Football
+Talk (PFT, nbcsports.com) power rankings; (2) the players ruled Out, Doubtful or placed on injured reserve in the final
+official injury report or official roster moves, and the starting quarterback's status if he is Questionable; (3) an
+opinion in Spanish of at most 35 words saying which team is more likely to win and why, using the lab data given and what
+you found. Rules: only facts from pages in your search results, each with its URL; never guess a ranking; never recommend
+a bet; the betting market already prices official injuries, so never present an injury as an edge. Write a plain report,
+one block per game, plus the URLs of the two power rankings."""
+A4_USUARIO = """Today: {hoy} ET. NFL {temporada}, week {semana}.
+Lab data per game (our rank 1-32 = net EPA per play this season; form = last 2 games against the season average; market =
+Pinnacle no-vig win probability):
+{tabla}"""
+A4_EXTRAE = """Convert the briefing report below into JSON following the schema exactly. Copy rankings, names and URLs exactly as
+in the report; use 0 for a ranking the report does not give; keep a URL only if it appears in the SEARCH RESULT URLS list
+(otherwise leave it empty); opinions in Spanish, at most 35 words; do not add anything that is not in the report."""
+A4_ESTADOS = ("out", "doubtful", "injured_reserve", "questionable", "suspended")
+FLECHAS = [(0.15, "↑↑"), (0.05, "↑"), (-0.05, "="), (-0.15, "↓")]
+
+
+def a4_esquema(ids):
+    s = {"type": "string"}
+    baja = {"type": "object", "additionalProperties": False,
+            "properties": {"name": s, "position": s, "status": {"type": "string", "enum": list(A4_ESTADOS)}, "source_url": s},
+            "required": ["name", "position", "status", "source_url"]}
+    eq = {"type": "object", "additionalProperties": False,
+          "properties": {"rank_nflcom": {"type": "integer"}, "rank_pft": {"type": "integer"},
+                         "injuries": {"type": "array", "items": baja}},
+          "required": ["rank_nflcom", "rank_pft", "injuries"]}
+    juego = {"type": "object", "additionalProperties": False,
+             "properties": {"game_id": {"type": "string", "enum": list(ids)}, "away": eq, "home": eq, "opinion": s},
+             "required": ["game_id", "away", "home", "opinion"]}
+    fuente = {"type": "object", "additionalProperties": False,
+              "properties": {"outlet": {"type": "string", "enum": ["NFL.com", "PFT"]}, "url": s}, "required": ["outlet", "url"]}
+    return {"type": "object", "additionalProperties": False,
+            "properties": {"games": {"type": "array", "items": juego}, "ranking_sources": {"type": "array", "items": fuente}},
+            "required": ["games", "ranking_sources"]}
+
+
+def a4_huella():
+    return _huella(dict(modelo=CLAUDE_MODELO, sistema=A4_SISTEMA, usuario=A4_USUARIO, extrae=A4_EXTRAE, herramienta=A4_HERRAMIENTA,
+                        esquema=json.dumps(a4_esquema(["X"]), sort_keys=True), max_tokens=A4_MAX_TOKENS, plazo=A4_PLAZO_S,
+                        flechas=FLECHAS))
+
+
+def _flecha(d):
+    if d is None:
+        return "—"
+    for umbral, f in FLECHAS:
+        if d >= umbral:
+            return f
+    return "↓↓"
+
+
+def a4_equipos(g26, hasta):
+    """{equipo: dict(record, rank, neto, forma, d_forma, jugados)}: EPA neto por jugada de 2026 (ataque − defensa, pases y
+    corridas con EPA) en los juegos con resultado antes de 'hasta'; forma = EPA neto de los últimos 2 partidos − temporada."""
+    import polars as pl
+    jugados = g26.filter(pl.col("result").is_not_null() & (pl.col("inicio") < hasta)).sort("inicio")
+    rec = {}
+    for r in jugados.iter_rows(named=True):
+        for eq, m in ((r["home_team"], r["result"]), (r["away_team"], -r["result"])):
+            w = rec.setdefault(eq, [0, 0, 0])
+            w[0 if m > 0 else 1 if m < 0 else 2] += 1
+    p = _pbp_columnas(["game_id", "posteam", "defteam", "play_type", "epa"], jugados["game_id"].to_list())
+    out = {}
+    if p is None:
+        return out
+    j = p.filter(pl.col("play_type").is_in(["pass", "run"]) & pl.col("epa").is_not_null())
+    of = j.group_by(["game_id", "posteam"]).agg(pl.col("epa").sum().alias("s"), pl.len().alias("n")).rename({"posteam": "eq"})
+    de = j.group_by(["game_id", "defteam"]).agg(pl.col("epa").sum().alias("sd"), pl.len().alias("nd")).rename({"defteam": "eq"})
+    x = of.join(de, on=["game_id", "eq"], how="inner")
+    orden = {gid: i for i, gid in enumerate(jugados["game_id"].to_list())}
+    por_eq = {}
+    for r in x.iter_rows(named=True):
+        por_eq.setdefault(r["eq"], []).append((orden.get(r["game_id"], 0), r["s"], r["n"], r["sd"], r["nd"]))
+    netos = {}
+    for eq, v in por_eq.items():
+        v.sort()
+        neto = sum(a[1] for a in v) / max(sum(a[2] for a in v), 1) - sum(a[3] for a in v) / max(sum(a[4] for a in v), 1)
+        ult = [a[1] / max(a[2], 1) - a[3] / max(a[4], 1) for a in v[-2:]]
+        d = (sum(ult) / len(ult) - neto) if len(v) >= 3 else None
+        netos[eq] = neto
+        out[eq] = dict(record="-".join(map(str, rec.get(eq, [0, 0, 0])[:2])) + (f"-{rec[eq][2]}" if rec.get(eq, [0, 0, 0])[2] else ""),
+                       neto=round(neto, 3), d_forma=None if d is None else round(d, 3), forma=_flecha(d), jugados=len(v))
+    for i, eq in enumerate(sorted(netos, key=lambda e: -netos[e]), 1):
+        out[eq]["rank"] = i
+    return out
+
+
+def a4_tabla(sem, juegos, eqs, proy, g26):
+    """Datos del código por juego (para el pedido y el mensaje)."""
+    import polars as pl
+    anterior = set()
+    if sem > 1:
+        g_ant = g26.filter(pl.col("week") == sem - 1)
+        anterior = set(g_ant["home_team"].to_list()) | set(g_ant["away_team"].to_list())
+    filas = []
+    for r in juegos.iter_rows(named=True):
+        u = proy.get(r["game_id"]) or {}
+        pl_ = _num(u.get("pin_p_ml_local"))
+        fila = dict(game_id=r["game_id"], visita=r["away_team"], local=r["home_team"], inicio=r["inicio"],
+                    neutral=r.get("location") == "Neutral", p_local=pl_)
+        for lado, eq in (("v", r["away_team"]), ("l", r["home_team"])):
+            e = eqs.get(eq) or {}
+            fila[lado] = dict(eq=eq, record=e.get("record", "0-0"), rank=e.get("rank"), forma=e.get("forma", "—"),
+                              bye=sem > 1 and eq not in anterior)
+        filas.append(fila)
+    return filas
+
+
+def a4_cuerpo(sem, filas, momento):
+    lin = []
+    for f in filas:
+        v, l_ = f["v"], f["l"]
+        merc = "" if f["p_local"] is None else (f" | market: {l_['eq']} {f['p_local']:.0%}" if f["p_local"] >= 0.5
+                                               else f" | market: {v['eq']} {1 - f['p_local']:.0%}")
+        lin.append(f"{f['game_id']}: {v['eq']} @ {l_['eq']}{' (neutral site)' if f['neutral'] else ''} | {_fmt_et(f['inicio'])} ET | "
+                   + " | ".join(f"{x['eq']} {x['record']}, our rank {x['rank'] or '—'}, form {x['forma']}"
+                                + (", coming off a bye" if x["bye"] else "") for x in (v, l_)) + merc)
+    txt = A4_USUARIO.format(hoy=_fmt_et(momento), temporada=TEMPORADA, semana=sem, tabla="\n".join(lin))
+    return {"model": CLAUDE_MODELO, "max_tokens": A4_MAX_TOKENS, "system": A4_SISTEMA,
+            "messages": [{"role": "user", "content": txt}], "tools": [A4_HERRAMIENTA]}
+
+
+def a4_cuerpo_extraer(texto, urls, ids):
+    return {"model": CLAUDE_MODELO, "max_tokens": A4_MAX_TOKENS, "system": A4_EXTRAE,
+            "messages": [{"role": "user", "content": "REPORT:\n" + texto[:80000] + "\n\nSEARCH RESULT URLS:\n"
+                          + "\n".join(sorted(urls)[:500])}],
+            "output_config": {"format": {"type": "json_schema", "schema": a4_esquema(ids)}}}
+
+
+def a4_leer(obj, ids, urls_n):
+    """JSON de la extracción → {game_id: dict(v=..., l=..., opinion)} y fuentes; descarta bajas sin URL de los resultados y
+    rankings fuera de 1-32 o de un medio sin URL verificada."""
+    fuentes = {}
+    for s_ in (obj or {}).get("ranking_sources") or []:
+        if isinstance(s_, dict) and _url_norm(s_.get("url")) in urls_n:
+            fuentes.setdefault(_texto(s_.get("outlet")), _texto(s_.get("url")))
+    out, descartadas = {}, 0
+    for g in (obj or {}).get("games") or []:
+        if not isinstance(g, dict) or g.get("game_id") not in ids:
+            continue
+        d = {}
+        for lado, k in (("v", "away"), ("l", "home")):
+            e = g.get(k) if isinstance(g.get(k), dict) else {}
+            bajas = []
+            for b in (e.get("injuries") if isinstance(e.get("injuries"), list) else [])[:12]:
+                if not isinstance(b, dict):
+                    continue
+                if _url_norm(b.get("source_url")) not in urls_n or _texto(b.get("status")).lower() not in A4_ESTADOS:
+                    descartadas += 1
+                    continue
+                bajas.append(dict(nombre=_texto(b.get("name"))[:60], pos=_texto(b.get("position")).upper()[:6],
+                                  estado=_texto(b.get("status")).lower()))
+
+            def rk(x, medio):
+                try:
+                    v = int(x)
+                except (TypeError, ValueError):
+                    return None
+                return v if 1 <= v <= 32 and medio in fuentes else None
+            d[lado] = dict(nflcom=rk(e.get("rank_nflcom"), "NFL.com"), pft=rk(e.get("rank_pft"), "PFT"), bajas=bajas)
+        d["opinion"] = re.sub(r"\s+", " ", _texto(g.get("opinion")))[:320]
+        out[g["game_id"]] = d
+    return out, fuentes, descartadas
+
+
+BAJA_ES = {"out": "out", "doubtful": "doubtful", "injured_reserve": "lista de lesionados", "questionable": "questionable",
+           "suspended": "suspendido"}
+
+
+def texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen):
+    lin = [f"📋 ANALISTA DEL SÁBADO · semana {sem}{' (a pedido)' if origen != 'sabado' else ''} · {CLAUDE_NOMBRE} · descriptivo, no cuenta",
+           "Cómo leer: «datos» es nuestro puesto del 1 al 32 por EPA neto por jugada (ataque menos defensa, nflverse 2026) · "
+           "NFL.com y PFT son los rankings de la prensa de esta semana · forma: últimos 2 partidos contra la temporada "
+           "(↑↑ mucho mejor, ↑ mejor, = igual, ↓ peor, ↓↓ mucho peor) · mercado: Pinnacle sin vig.",
+           "Lo que el laboratorio ya midió: las rachas no predicen el siguiente partido (H4); la sorpresa de un partido la "
+           "explican sobre todo las pérdidas de balón, los equipos especiales y el juego sin pérdidas, y las dos primeras casi "
+           "no se repiten (H41); no hay «ley del resorte» contra el mercado (H42). El mercado ya descuenta récord, momento y "
+           "bajas oficiales: esto sirve para entender los partidos, no es una señal para apostar."]
+    for f in filas:
+        d = ia.get(f["game_id"]) or {}
+        merc = ("" if f["p_local"] is None else f" · mercado {f['local']} {_pct(f['p_local'], False)}" if f["p_local"] >= 0.5
+                else f" · mercado {f['visita']} {_pct(1 - f['p_local'], False)}")
+        lin.append("")
+        lin.append(f"{f['visita']} {'vs' if f['neutral'] else '@'} {f['local']} · {cuando_txt(f['inicio'])}"
+                   + (" · sede neutral" if f["neutral"] else "") + merc)
+        for lado in ("v", "l"):
+            x, e = f[lado], d.get(lado) or {}
+            rk = lambda v: f"#{v}" if v else "—"  # noqa: E731
+            bajas = e.get("bajas") or []
+            lin.append(f"• {apodo(x['eq'])} {x['record']} · datos {rk(x['rank'])} · NFL.com {rk(e.get('nflcom'))} · PFT {rk(e.get('pft'))}"
+                       f" · forma {x['forma']}" + (" · vienen de la semana libre" if x["bye"] else "")
+                       + (" · bajas: " + ", ".join(f"{b['pos']} {b['nombre']} ({BAJA_ES.get(b['estado'], b['estado'])})"
+                                                   for b in bajas[:6]) + ("…" if len(bajas) > 6 else "") if bajas else ""))
+        if d.get("opinion"):
+            lin.append(f"• Opinión (Opus): {d['opinion']}")
+    lin.append("")
+    if fuentes:
+        lin.append("Fuentes: " + " · ".join(f"{k} {v}" for k, v in sorted(fuentes.items())))
+    if estado_ia != "ok":
+        lin.append(f"Opus no completó la parte de la prensa ({estado_ia}): se muestran solo los datos del laboratorio.")
+    lin.append(f"Datos: nflverse (jugada por jugada) y la última proyección del motor · USD {costo:.2f}".replace(".", ","))
+    return "\n".join(lin)
+
+
+def briefing_correr(g26, ahora, estado, origen, sin_telegram=False, post=None):
+    """A4: datos del código + prensa y bajas con Opus (búsqueda y extracción con esquema). Solo juegos que no empezaron.
+    origen 'sabado' (automática, una vez por semana) o 'pedido' (/briefing, tope por día). Devuelve una línea de resumen."""
+    import polars as pl
+    momento = e2_momento(ahora)
+    sem = semana_actual(g26, momento)
+    if sem is None:
+        return "No hay juegos por jugar."
+    juegos = g26.filter((pl.col("week") == sem) & (pl.col("inicio") > momento)).sort(["inicio", "game_id"])
+    if juegos.height == 0:
+        return f"Semana {sem}: no quedan juegos por empezar."
+    hoy = momento.astimezone(CARACAS).date().isoformat()
+    if origen != "sabado":
+        usado = estado.setdefault("briefing_dia", {})
+        for k in [k for k in usado if k != hoy]:
+            usado.pop(k)
+        if usado.get(hoy, 0) >= A4_MAX_DIA:
+            return f"Ya van {A4_MAX_DIA} /briefing hoy (tope por día). Prueba mañana."
+        usado[hoy] = usado.get(hoy, 0) + 1
+    eqs = a4_equipos(g26, momento)
+    filas = a4_tabla(sem, juegos, eqs, ultimas_proyecciones(sem), g26)
+    ids = [f["game_id"] for f in filas]
+    ia, fuentes, costo, estado_ia, desc = {}, {}, 0.0, "no corrió", 0
+    resto, motivo = claude_cupo(ahora)
+    if resto >= A4_USD:
+        limite = time.time() + A4_PLAZO_S
+        reg = dict(agente="A4", origen=origen, huella=a4_huella(), game_id=f"semana-{sem}", momento=momento)
+        b = claude_post(a4_cuerpo(sem, filas, momento), limite - 120, {**reg, "paso": "busqueda", "reserva_usd": 1.5}, post)
+        costo = b["costo_usd"]
+        estado_ia = b["estado"]
+        if b["estado"] in ("ok", "cortada", "pausada") and b["texto"].strip():
+            urls = _urls_de(b["contenido"])
+            e = claude_post(a4_cuerpo_extraer(b["texto"], urls, ids), limite, {**reg, "paso": "extraccion", "reserva_usd": 0.4}, post)
+            costo += e["costo_usd"]
+            estado_ia = e["estado"] if e["estado"] != "ok" else ("ok" if b["estado"] == "ok" else f"búsqueda {b['estado']}")
+            if e["estado"] == "ok":
+                ia, fuentes, desc = a4_leer(_objeto_json(e["texto"]), set(ids), {_url_norm(u) for u in urls} - {""})
+    else:
+        estado_ia = motivo or f"tope del día (quedan USD {resto:.2f})"
+    txt = texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen)
+    BRIEFINGS.mkdir(parents=True, exist_ok=True)
+    (BRIEFINGS / f"briefing_semana_{sem}_{momento.astimezone(CARACAS):%Y%m%d_%H%M}.txt").write_text(txt + "\n", encoding="utf-8")
+    enviar_tg(txt, sin_telegram)
+    if origen == "sabado":
+        estado.setdefault("briefing", {})[str(sem)] = iso(ahora)
+    log(f"Analista (A4) semana {sem} ({origen}): {len(filas)} juegos · Opus {estado_ia} · {len(ia)} juegos con prensa · "
+        f"{desc} bajas descartadas sin URL · USD {costo:.4f}")
+    return f"Analista de la semana {sem}: {len(filas)} juegos; mensaje enviado (Opus: {estado_ia})."
+
+
+# ---------------------------------------------------------------- /vigia (63) y pruebas
+def vigia_manual(g26, args, ahora, estado, hoja):
+    """/vigia (63): simula los juegos pedidos como /correr (tipo telegram: no cuenta para 31A ni 29A) y consulta a los dos
+    vigías en paralelo: Gemini (modelos del piloto 55) y Claude. Registros aparte que no entran a ninguna medición; no
+    escribe la columna del vigía. Rechaza juegos empezados y si toca una corrida automática en ≤ 12 min."""
+    import polars as pl
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    usado = estado.setdefault("vigia_manual_dia", {})
+    for k in [k for k in usado if k != hoy]:
+        usado.pop(k)
+    cerca = automatica_cerca(g26, ahora, estado)
+    if cerca:
+        print(f"No corro /vigia ahora: en menos de {ANTES_AUTOMATICA_MIN} min toca la corrida automática "
+              f"({NOMBRE_CORRIDA.get(cerca[0], cerca[0])}), que es la que cuenta. Pídelo después de esa corrida.")
+        return
+    if usado.get(hoy, 0) >= VIGIA_MANUAL_MAX_DIA:
+        print(f"Ya van {VIGIA_MANUAL_MAX_DIA} /vigia hoy (tope por día). Prueba mañana.")
+        return
+    sem = semana_actual(g26, ahora)
+    if sem is None:
+        print("No hay juegos por jugar.")
+        return
+    g_sem = g26.filter(pl.col("week") == sem)
+    if args.equipo:
+        eq = DE_OTRAS.get(args.equipo.strip().upper(), args.equipo.strip().upper())
+        if eq not in EQUIPOS:
+            print(f"No conozco el equipo «{args.equipo}». Usa la abreviatura, por ejemplo: /vigia KC")
+            return
+        g_eq = g_sem.filter((pl.col("home_team") == eq) | (pl.col("away_team") == eq))
+        if g_eq.height == 0:
+            print(f"{eq} no juega en la semana {sem}.")
+            return
+        fut = g_eq.filter(pl.col("inicio") > ahora + dt.timedelta(minutes=VIGIA_MANUAL_MARGEN_MIN)).sort("inicio")
+        if fut.height == 0:
+            print(f"El juego de {eq} de la semana {sem} ya empezó o empieza en menos de {VIGIA_MANUAL_MARGEN_MIN} min: el vigía "
+                  "no consulta juegos empezados (H36) y la consulta tarda hasta ~9 min.")
+            return
+        ids = fut.head(1)["game_id"].to_list()
+    else:
+        fut = g_sem.filter(pl.col("inicio") > ahora + dt.timedelta(minutes=VIGIA_MANUAL_MARGEN_MIN))
+        if fut.height == 0:
+            print(f"No quedan juegos de la semana {sem} que empiecen en más de {VIGIA_MANUAL_MARGEN_MIN} min.")
+            return
+        ids = fut.filter(pl.col("inicio") == fut["inicio"].min())["game_id"].to_list()
+    usado[hoy] = usado.get(hoy, 0) + 1
+    guardar_estado(estado)
+    log(f"{VERSION_SEMANA}: /vigia {args.equipo or '(próximo grupo)'} → {len(ids)} juegos (a pedido, no cuenta)")
+    g_all, g26 = calendario(0.25)
+    resumenes, nombres_qb = correr([("telegram", f"telegram-{iso(ahora)}", ids)], g_all, g26, args, ahora)
+    filas = [f for _, _, ff, _ in resumenes for f in ff]
+    if not filas:
+        print("Esos juegos ya empezaron: no hay nada que simular.")
+        return
+    if hoja is not None:
+        escribir_semanas(hoja, g26, {f["semana"] for f in filas}, nombres_qb, ahora, estado, args.bot_dir)
+        guardar_estado(estado)
+    juegos = [dict(game_id=f["game_id"], semana=f["semana"], game_type=f["game_type"], visita=f["visita"], local=f["local"],
+                   inicio=t_utc(f["inicio_utc"])) for f in filas]
+    textos = [texto_telegram(resumenes)]
+    tope_ini = e2_momento(ahora) + dt.timedelta(seconds=A1_PLAZO_S + 60)       # H36: la consulta termina antes del inicio
+    tarde = [j for j in juegos if j["inicio"] <= tope_ini]
+    juegos = [j for j in juegos if j["inicio"] > tope_ini]
+    if tarde:
+        textos.append("Vigías: no consulto " + ", ".join(f"{j['visita']} @ {j['local']}" for j in tarde)
+                      + " porque empieza antes de que termine la consulta (H36).")
+    if not juegos:
+        enviar_tg("\n\n".join(textos), args.sin_telegram)
+        print("/vigia: simulé, pero los juegos empiezan antes de que termine la consulta: no consulté a los vigías (H36).")
+        return
+    trab = a1_lanzar(juegos, ahora, "manual")
+    res_v = vigia_t85([(j, None) for j in juegos], filas, ahora, estado, g26, manual=True)
+    guardar_estado(estado)
+    if res_v:
+        textos.append(texto_vigia(res_v))
+    else:
+        textos.append("Vigía de Gemini: no corrió (sin credenciales/gemini.key, apagado en semana.ini o error; ver el log).")
+    res_c = a1_cerrar(trab, filas, g26)
+    if res_c:
+        textos.append(texto_a1(res_c))
+    else:
+        textos.append(f"Vigía-alineador de Claude: no corrió ({claude_cupo(ahora)[1] or 'ver el log'}).")
+    enviar_tg("\n\n".join(textos), args.sin_telegram)
+    print(f"/vigia: {len(juegos)} juego{'s' if len(juegos) != 1 else ''} simulado{'s' if len(juegos) != 1 else ''} y consultado"
+          f"{'s' if len(juegos) != 1 else ''} (a pedido, no cuenta) · Gemini {'sí' if res_v else 'no'} · Claude {'sí' if res_c else 'no'}"
+          f" · /vigia hoy {usado.get(hoy, 0)} de {VIGIA_MANUAL_MAX_DIA}")
+
+
+CLAUDE_MAX_PRUEBA_DIA = 2
+
+
+def claude_prueba_real(g26, ahora, estado):
+    """Una consulta REAL del vigía-alineador (búsqueda y extracción) sobre el próximo juego, para ver que la API acepta
+    los pedidos. No escribe en los registros del vigía ni cuenta para nada; sí queda en claude_llamadas.csv (origen
+    'prueba'). Tope aparte de 2 por día."""
+    import polars as pl
+    resto, motivo = claude_cupo(ahora)
+    if motivo.startswith(("sin", "apagado")):
+        return f"Claude: {motivo}."
+    prox = g26.filter(pl.col("inicio") > e2_momento(ahora)).sort("inicio").head(1)
+    if prox.height == 0:
+        return "No hay juegos por jugar en el calendario."
+    hoy = ahora.astimezone(CARACAS).date().isoformat()
+    usado = estado.setdefault("claude_prueba", {})
+    for k in [k for k in usado if k != hoy]:
+        usado.pop(k)
+    if usado.get(hoy, 0) >= CLAUDE_MAX_PRUEBA_DIA:
+        return f"Tope de pruebas reales del día ({CLAUDE_MAX_PRUEBA_DIA}): prueba mañana."
+    if resto < A1_USD_JUEGO:
+        return f"Claude: {motivo or 'no queda cupo hoy'}."
+    usado[hoy] = usado.get(hoy, 0) + 1
+    r = prox.row(0, named=True)
+    j = dict(game_id=r["game_id"], semana=int(r["week"]), game_type=r["game_type"], visita=r["away_team"], local=r["home_team"],
+             inicio=r["inicio"])
+    momento = e2_momento(ahora)
+    x = a1_consultar(j, momento, time.time() + A1_PLAZO_S, "prueba")
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    lim = {}
+    for f in reversed(_leer_csv(CLAUDE_LLAMADAS)):
+        if f.get("origen") == "prueba" and f.get("game_id") == j["game_id"]:
+            lim = f
+            break
+    lin = [f"Prueba REAL del vigía-alineador (no cuenta): {j['visita']} @ {j['local']} · {fecha_cc(j['inicio'])} Caracas · "
+           f"{CLAUDE_MODELO} · huella {a1_huella()}",
+           f"  estado {x['estado']}" + (f" (HTTP {x['http']})" if x.get("http") not in (None, "", 200) else "")
+           + f" · {x['latencia_s']} s · {x['busquedas']} búsquedas · USD {x['costo_usd']:.4f} · {len(x['urls'])} URL en los resultados"
+           + (f" · {x['detalle']}" if x.get("detalle") else ""),
+           "  límites de la API (pedidos/min, tokens de entrada/min, de salida/min): "
+           f"{lim.get('lim_pedidos') or '—'} · {lim.get('lim_entrada') or '—'} · {lim.get('lim_salida') or '—'}"]
+    for eq, e in x["equipos"].items():
+        val_f = [h for h in e["fuera"] if not vigia_validar(h, momento) and _url_norm(h["url"]) in x["urls"]]
+        val_a = [a for a in e["alineacion"] if not _a1_validar_alin(a, momento) and _url_norm(a["url"]) in x["urls"]]
+        cruz = [a for a in val_a if ind.gsis_por_nombre(eq, a["nombre"], a["posicion"])[0]]
+        lin.append(f"  {eq}: inactivos oficiales {'sí' if e['inactivos'] == 1 else 'no'} · fuera {len(e['fuera'])} ({len(val_f)} válidos)"
+                   f" · alineación {len(e['alineacion'])} ({len(val_a)} válidos, {len(cruz)} cruzados con el roster)")
+        for h in e["fuera"][:4]:
+            m = vigia_validar(h, momento) or ("" if _url_norm(h["url"]) in x["urls"] else "URL fuera de los resultados")
+            lin.append(f"    fuera: {h['posicion']} {h['nombre']} · {h['estado_jugador']} · {h['tipo_fuente']} · {h['publicada'] or 'sin fecha'}"
+                       + (f" · INVÁLIDO: {m}" if m else ""))
+    return "\n".join(lin)
+
+
+def _revisar_esquema(s, ruta="raíz"):
+    """Lista de problemas que la API rechazaría en un esquema de output_config.format (vacía si está bien)."""
+    malos = []
+    if isinstance(s, dict):
+        if s.get("type") == "object" and s.get("additionalProperties") is not False:
+            malos.append(f"{ruta}: objeto sin additionalProperties false")
+        for k in ("maxItems", "minLength", "maxLength", "minimum", "maximum", "multipleOf"):
+            if k in s:
+                malos.append(f"{ruta}: {k} no se acepta")
+        if s.get("minItems", 0) not in (0, 1):
+            malos.append(f"{ruta}: minItems solo 0 o 1")
+        for k, v in s.items():
+            malos += _revisar_esquema(v, f"{ruta}.{k}")
+    elif isinstance(s, list):
+        for i, v in enumerate(s):
+            malos += _revisar_esquema(v, f"{ruta}[{i}]")
+    return malos
+
+
+class _RespuestaFalsa:
+    def __init__(self, codigo, datos, cab=None):
+        self.status_code, self._d, self.headers = codigo, datos, cab or {}
+
+    def json(self):
+        if isinstance(self._d, Exception):
+            raise self._d
+        return self._d
+
+
+def claude_autoprueba(g26):
+    """Prueba sin consultar a Claude (la usa el instalador): pedidos y esquemas que la API acepta, continuación pause_turn,
+    reintento 429, tope de gasto, lectura de una respuesta de ejemplo, validación por URL de los resultados, cruce con el
+    roster y los snaps reales, causas de H41 sobre un juego real y el ranking del analista. No escribe registros."""
+    ok = []
+    j = dict(game_id="2026_07_GB_CHI", semana=7, game_type="REG", visita="GB", local="CHI",
+             inicio=dt.datetime(2026, 10, 25, 17, 0, tzinfo=dt.timezone.utc))
+    momento = j["inicio"] - dt.timedelta(minutes=84)
+    cu = a1_cuerpo(j, momento)
+    assert cu["model"] == "claude-opus-5-5" and cu["tools"][0]["type"] == "web_search_20260318"
+    assert len(cu["tools"][0]["allowed_domains"]) == 34 and "84 minutes before kickoff" in cu["messages"][0]["content"]
+    for nombre, esq in (("A1", a1_esquema("GB", "CHI")), ("A4", a4_esquema(["X", "Y"]))):
+        assert not _revisar_esquema(esq), (nombre, _revisar_esquema(esq))
+    ce = a1_cuerpo_extraer(j, "texto", {"https://www.packers.com/x"})
+    assert "tools" not in ce and ce["output_config"]["format"]["type"] == "json_schema"
+    ok.append("pedidos y esquemas")
+    # claude_post con respuestas falsas: pause_turn → fin; 429 con retry-after; tope de gasto (429 sin retry-after)
+    global CLAUDE_LLAVE, CLAUDE_LLAMADAS
+    llave0, reg0 = CLAUDE_LLAVE, CLAUDE_LLAMADAS
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        CLAUDE_LLAVE, CLAUDE_LLAMADAS = Path(tmp) / "k", Path(tmp) / "l.csv"
+        CLAUDE_LLAVE.write_text("sk-ant-prueba", encoding="utf-8")
+        try:
+            seq = [_RespuestaFalsa(200, {"content": [{"type": "text", "text": "Busco. "},
+                                                     {"type": "web_search_tool_result", "content": [
+                                                         {"type": "web_search_result", "url": "https://www.packers.com/news/inactives"}]}],
+                                         "stop_reason": "pause_turn", "usage": {"input_tokens": 1000, "output_tokens": 100,
+                                                                                "server_tool_use": {"web_search_requests": 2}}}),
+                   _RespuestaFalsa(429, {"error": {"type": "rate_limit_error", "message": "x"}}, {"retry-after": "1"}),
+                   _RespuestaFalsa(200, {"content": [{"type": "text", "text": "TEAM GB", "citations": [
+                       {"type": "web_search_result_location", "url": "https://www.chicagobears.com/news/injury-report"}]}],
+                       "stop_reason": "end_turn", "usage": {"input_tokens": 2000, "output_tokens": 200}})]
+            vistos = []
+
+            def post(url, headers=None, json=None, timeout=None):
+                assert headers["x-api-key"] == "sk-ant-prueba" and url == CLAUDE_URL
+                vistos.append(json)
+                return seq.pop(0)
+            r = claude_post(cu, time.time() + 120, dict(agente="A1", origen="prueba", momento=momento), post, dormir=lambda s: None)
+            assert r["estado"] == "ok" and r["continuaciones"] == 1 and r["busquedas"] == 2, r
+            assert vistos[1]["messages"][-1]["role"] == "assistant" and len(vistos[2]["messages"][-1]["content"]) == 2
+            assert abs(r["costo_usd"] - (3000 * 4e-6 + 300 * 20e-6 + 2 * 0.01)) < 1e-9, r["costo_usd"]
+            assert {_url_norm(u) for u in _urls_de(r["contenido"])} == {"packers.com/news/inactives", "chicagobears.com/news/injury-report"}
+            r2 = claude_post(cu, time.time() + 120, dict(agente="A1", origen="prueba", momento=momento),
+                             lambda *a, **k: _RespuestaFalsa(429, {"error": {"type": "rate_limit_error", "message": "spend",
+                                                                             "details": {"error_code": "enforced_spend_limit_reached"}}}),
+                             dormir=lambda s: None)
+            assert r2["estado"] == "error HTTP" and "enforced_spend_limit_reached" in r2["detalle"], r2
+            assert "sk-ant-prueba" not in CLAUDE_LLAMADAS.read_text(encoding="utf-8")
+            assert claude_gasto_hoy(momento.astimezone(CARACAS).date().isoformat()) > 0
+        finally:
+            CLAUDE_LLAVE, CLAUDE_LLAMADAS = llave0, reg0
+    ok.append("API simulada (pause_turn, 429, tope de gasto, costo, sin llave en el registro)")
+    # lectura, validación y cruce con roster y snaps reales
+    snaps, roster = vigia_datos()
+    ind = VigiaIndice(snaps, roster, g26)
+    con = [r for r in g26.sort("inicio").iter_rows(named=True) if r["game_id"] in ind.con_snaps]
+    n_tit = "sin snaps todavía"
+    if con:
+        u = con[-1]
+        eq = u["home_team"]
+        tit = ind.titulares(eq, u["inicio"] + dt.timedelta(days=1)) or {}
+        habit = [d["nombre"] for g, d in tit.items() if not g.startswith("pfr:") and ind.gsis_por_nombre(eq, d["nombre"], d["pos"])[0] == g][:1]
+        jug, exp = _a1_historia(ind, g26, roster)
+        novato = ""
+        for f in (roster.iter_rows(named=True) if roster is not None else []):
+            g = _texto(f.get("gsis_id"))
+            if f.get("team") == eq and g and exp.get(g) == 0 and not jug.get(ind.gsis_pfr.get(g, ""), []):
+                novato = _texto(f.get("full_name"))
+                break
+        obj = {"away": {"team": u["away_team"], "inactives_published": True, "out": [], "lineup": []},
+               "home": {"team": eq, "inactives_published": False, "out": [
+                   {"name": "Rumor Man", "position": "WR", "status": "out", "source_type": "official_injury_report",
+                    "source_url": "https://www.nfl.com/fuera-de-resultados",
+                    "source_published": (u["inicio"] - dt.timedelta(days=1)).date().isoformat(), "evidence": "x"}],
+                   "lineup": [{"name": n, "position": "", "unit": "offense", "source_type": "official_depth_chart",
+                               "source_url": "https://www.nfl.com/depth", "source_published": ""} for n in habit + ([novato] if novato else [])]}}
+        jj = dict(game_id=u["game_id"], semana=int(u["week"]), game_type="REG", visita=u["away_team"], local=eq, inicio=u["inicio"])
+        eqs = a1_leer(obj, jj)
+        assert set(eqs) == {u["away_team"], eq} and len(eqs[eq]["fuera"]) == 1
+        h = eqs[eq]["fuera"][0]
+        assert not vigia_validar(h, u["inicio"]) and _url_norm(h["url"]) not in {"nfl.com/depth"}
+        for a in eqs[eq]["alineacion"][:len(habit)]:
+            g, _c = ind.gsis_por_nombre(eq, a["nombre"], a["posicion"])
+            assert g, a["nombre"]
+        n_tit = f"{len(tit)} titulares habituales de {eq}; habitual reconocido; novato {'sin snaps: ' + novato if novato else 'no hallado'}"
+    ok.append(f"lectura y cruce ({n_tit})")
+    # A3 sobre un juego real jugado (favorito de nflverse que perdió) y A4
+    import polars as pl
+    perd = g26.filter(pl.col("result").is_not_null() & pl.col("spread_line").is_not_null()
+                      & (((pl.col("spread_line") > 0) & (pl.col("result") < 0)) | ((pl.col("spread_line") < 0) & (pl.col("result") > 0))))
+    txt3 = "sin juegos"
+    if perd.height:
+        r = perd.sort("inicio").row(-1, named=True)
+        p = _pbp_columnas(A3_COLS, [r["game_id"]])
+        if p is not None and p.height:
+            fav = r["home_team"] if r["spread_line"] > 0 else r["away_team"]
+            dog = r["away_team"] if fav == r["home_team"] else r["home_team"]
+            c = _a3_causas(p, fav, dog)
+            assert c["neto_sin"] is not None and c["ultima_serie"] is not None, c
+            txt3 = f"{r['game_id']}: pérdidas {c['perdidas_dif']:+d}, EE {c['ee_epa']:+.1f}, neto {c['neto_sin']:+.3f}"
+    ok.append(f"causas de H41 ({txt3})")
+    eqs4 = a4_equipos(g26, dt.datetime.now(dt.timezone.utc))
+    if eqs4:
+        assert sorted(e["rank"] for e in eqs4.values()) == list(range(1, len(eqs4) + 1))
+    ok.append(f"ranking del analista ({len(eqs4)} equipos)")
+    return (f"claude OK ({'; '.join(ok)}) · {CLAUDE_MODELO} · huellas A1 {a1_huella()}, A3 {a3_huella()}, A4 {a4_huella()} · "
+            f"llave {'presente' if CLAUDE_LLAVE.exists() else 'ausente'}")
 
 
 # --------------------------------------------------------------------------------------
@@ -4684,6 +6463,13 @@ def informe_semana(g26, semana, bot_dir, ahora):
         vg_tel, vg_txt, vg_filas = f"Vigía (55): no se pudo verificar ({type(e).__name__}).", [], []
     if vg_tel:
         tel.append(vg_tel)
+    # ---- v9 (65.1): verificación del vigía-alineador de Claude ----
+    try:
+        vc_tel, vc_txt = seccion_vigia_claude(g26)
+    except Exception as e:  # noqa: BLE001
+        vc_tel, vc_txt = f"Vigía-alineador Claude (65.1): no se pudo verificar ({type(e).__name__}).", []
+    if vc_tel:
+        tel.append(vc_tel)
     # ---- v8.4 (57): bandera de sesgo dentro de la semana (solo registro) ----
     try:
         bd_tel, bd_txt = seccion_bandera(semana, senal)
@@ -4714,7 +6500,7 @@ def informe_semana(g26, semana, bot_dir, ahora):
                         f" ({sino(a.get('prueba2'))}) · prueba 3 suerte: {sino(a.get('prueba3'))} · {a['caja']}")
     if falta_pbp:
         completo.append("Sin jugada por jugada todavía: " + ", ".join(falta_pbp))
-    completo += [""] + fu_txt + [""] + vg_txt + ([""] + bd_txt if bd_txt else [])
+    completo += [""] + fu_txt + [""] + vg_txt + ([""] + bd_txt if bd_txt else []) + ([""] + vc_txt if vc_txt else [])
     completo.append(f"Generado {iso(ahora)} · {VERSION_SEMANA}")
     return "\n".join(tel), "\n".join(completo), sels, auto, {"fuera": fu_sem, "vigia": vg_filas}
 
@@ -4934,7 +6720,7 @@ def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe",
-                                     "vigia-prueba", "tablero"])
+                                     "vigia-prueba", "tablero", "vigia-manual", "autopsia", "briefing", "claude-prueba"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
@@ -4942,6 +6728,7 @@ def main():
     ap.add_argument("--ahora")
     ap.add_argument("--sin-telegram", action="store_true")
     ap.add_argument("--real", action="store_true")     # v8.3: vigia-prueba --real hace 1 consulta real por modelo (no cuenta)
+    ap.add_argument("--equipo")                         # v9 (63): vigia-manual --equipo KC
     ap.add_argument("--sin-hoja", action="store_true")
     ap.add_argument("--bot-dir", default=str(Path.home() / "nfl_ev"))
     ap.add_argument("--n-sims", type=int, default=N_SIMS)
@@ -5042,6 +6829,10 @@ def main():
                 print(texto_vigia_estado(ahora, estado))
             except Exception as e:  # noqa: BLE001
                 print(f"Vigía (55): no pude leer su registro ({type(e).__name__})")
+        try:
+            print(texto_claude_estado(ahora, estado))      # v9 (65.1)
+        except Exception as e:  # noqa: BLE001
+            print(f"Agentes de Claude (65): no pude leer su registro ({type(e).__name__})")
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -5066,6 +6857,31 @@ def main():
             guardar_estado(estado)
         else:
             print(vigia_autoprueba(g26))
+        return
+
+    if args.modo == "claude-prueba":                   # v9 (65.1): sin consultar; --real: 1 consulta real (no cuenta)
+        if args.real:
+            print(claude_prueba_real(g26, ahora, estado))
+            guardar_estado(estado)
+        else:
+            print(claude_autoprueba(g26))
+        return
+
+    if args.modo in ("vigia-manual", "autopsia", "briefing"):   # v9: órdenes largas, nunca antes de una automática
+        cerca = automatica_cerca(g26, ahora, estado)
+        if cerca and args.modo != "vigia-manual":
+            print(f"No corro ahora: en menos de {ANTES_AUTOMATICA_MIN} min toca la corrida automática "
+                  f"({NOMBRE_CORRIDA.get(cerca[0], cerca[0])}), que es la que cuenta. Pídelo después de esa corrida.")
+            return
+        if args.modo == "vigia-manual":              # 63 (/vigia): la protección y los topes van dentro
+            vigia_manual(g26, args, ahora, estado, hoja)
+        elif args.modo == "autopsia":                # A3 a pedido (/autopsia [N])
+            sem = args.semana or semana_reciente(g26)
+            print("Todavía no hay juegos jugados." if sem is None else
+                  autopsia_enviar(g26, sem, args.bot_dir, ahora, estado, "pedido", args.sin_telegram))
+        else:                                        # A4 a pedido (/briefing)
+            print(briefing_correr(g26, ahora, estado, "pedido", args.sin_telegram))
+        guardar_estado(estado)
         return
 
     if args.modo == "informe":                         # v8.1 (45): informe de CLV y autopsia de una semana jugada
@@ -5133,6 +6949,19 @@ def main():
                     log(f"Informe: error ({type(e).__name__}: {str(e)[:300]})")
                     estado["ultima_falla_informe"] = iso(ahora)
                     guardar_estado(estado)
+            # v9 (65, A3): autopsia del lunes de cada semana cuyo informe ya salió (desde la semana 7), una vez por semana;
+            # si falla, reintenta cada 30 min y nunca frena el temporizador
+            falla_a3 = t_utc(estado.get("ultima_falla_autopsia"))
+            if CLAUDE_LLAVE.exists() and claude_cfg()[0] and (falla_a3 is None or (ahora - falla_a3).total_seconds() > 1800):
+                try:
+                    for s_ in autopsias_pendientes(estado):
+                        autopsia_enviar(g26, s_, args.bot_dir, ahora, estado, "auto", args.sin_telegram)
+                        estado.pop("ultima_falla_autopsia", None)
+                        guardar_estado(estado)
+                except Exception as e:  # noqa: BLE001
+                    log(f"Autopsia (A3): error ({type(e).__name__}: {str(e)[:300]})")
+                    estado["ultima_falla_autopsia"] = iso(ahora)
+                    guardar_estado(estado)
             return                                         # nada que hacer: sale sin escribir en el log
     else:
         import polars as pl
@@ -5172,6 +7001,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             log(f"Boleto: no se pudo resumir para Telegram ({type(e).__name__})")
         s2.telegram(txt)
+    # v9 (65.1): el vigía-alineador de Claude arranca en un hilo aparte y corre en paralelo con g1, el vigía y e2
+    trab_c = a1_lanzar([j for j, _ in sombra], ahora, "t85") if sombra and args.modo == "auto" else None
     if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
         gemini_sombra(sombra, ahora, estado)
         guardar_estado(estado)
@@ -5196,7 +7027,22 @@ def main():
     if sombra and args.modo == "auto":                # v8.2 (49): registro en vivo e2, aparte de g1 y después de él
         e2_vivo(sombra, ahora, estado)
         guardar_estado(estado)
+    if trab_c:                                        # v9 (65.1): resultado del vigía-alineador (Telegram aparte, piloto)
+        res_c = a1_cerrar(trab_c, [f for _, _, filas, _ in resumenes for f in filas], g26)
+        if res_c and not args.sin_telegram:
+            try:
+                enviar_tg(texto_a1(res_c))
+            except Exception as e:  # noqa: BLE001
+                log(f"Vigía-alineador Claude: no pude mandar el Telegram ({type(e).__name__})")
     actualizar_tablero(", ".join(sorted({t for t, _, _ in lista})))   # v8.4 (58): al final, sin frenar nada
+    if (args.modo == "auto" and any(t == "sabado" for t, _, _ in lista) and CLAUDE_LLAVE.exists() and claude_cfg()[0]):
+        try:                                          # v9 (65, A4): analista del sábado, una vez por semana
+            sem_b = semana_actual(g26, ahora)
+            if sem_b is not None and str(sem_b) not in estado.get("briefing", {}):
+                briefing_correr(g26, ahora, estado, "sabado", args.sin_telegram)
+                guardar_estado(estado)
+        except Exception as e:  # noqa: BLE001
+            log(f"Analista (A4): error ({type(e).__name__}: {str(e)[:300]})")
     log("== LISTO")
 
 

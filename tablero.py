@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-VERSION = "tablero-v1 (13-oct-2026)"
+VERSION = "tablero-v1.1 (20-oct-2026)"  # v1.1: etiqueta única por jugador y grupo (58) y puesto estable en los empates
 TEMPORADA = 2026
 
 BASE = Path(os.environ.get("NFL_SIM_BASE", str(Path.home() / "nfl_sim")))
@@ -497,7 +497,7 @@ def tabla_grupos(p: pl.DataFrame, g: pl.DataFrame, valores_eq: dict, nom: dict, 
     info = {gr[0]: gr for gr in GRUPOS}
     for grupo, _u, minimo, orden, *_ in GRUPOS:
         filas = [x for x in lideres if x[0] == grupo and x[5] >= minimo and x[6] is not None]
-        filas.sort(key=lambda x: x[6], reverse=(orden == "desc"))
+        filas.sort(key=lambda x: ((-x[6] if orden == "desc" else x[6]), x[1]))   # v1.1: empates por clave (antes, al azar)
         for i, x in enumerate(filas, 1):
             x.append(i)
             x.append(len(filas))
@@ -507,8 +507,35 @@ def tabla_grupos(p: pl.DataFrame, g: pl.DataFrame, valores_eq: dict, nom: dict, 
     for x in lideres:
         etiqueta = f"{x[2]} · {x[3]} · {x[4] or x[0]}" if info[x[0]][6] == "no" else f"{x[2]} ({x[0]})"
         x.append(etiqueta)
+    unicas(lideres, info)
     juegos.sort(key=lambda x: (x[0], x[1]))
     return lideres, juegos
+
+
+def unicas(lideres: list, info: dict) -> None:
+    """v1.1 (58): una etiqueta por jugador y grupo. Si la misma etiqueta sale en varias filas de jugadores (un QB que
+    también corre, un receptor que también corre), la conserva la fila con más jugadas (la que ya mostraba la pantalla
+    Jugador) y las demás suman « · <grupo>». Si aun así se repite (dos jugadores con el mismo nombre, equipo y posición),
+    se agrega la clave. Las pantallas no cambian: buscan la fila por la etiqueta."""
+    por_et = {}
+    for x in lideres:
+        if info[x[0]][6] == "no":
+            por_et.setdefault(x[14], []).append(x)
+    orden_g = {g[0]: i for i, g in enumerate(GRUPOS)}
+    for et, filas in por_et.items():
+        if len(filas) < 2:
+            continue
+        filas.sort(key=lambda x: (-(x[5] or 0), orden_g[x[0]], x[1]))
+        for x in filas[1:]:
+            x[14] = f"{et} · {x[0]}"
+    vistas = {}
+    for x in lideres:
+        if info[x[0]][6] == "no":
+            vistas.setdefault(x[14], []).append(x)
+    for et, filas in vistas.items():
+        if len(filas) > 1:
+            for x in filas[1:]:
+                x[14] = f"{et} ({x[1]})"
 
 
 def bloque_juego(jr: pl.DataFrame, lado: str) -> pl.DataFrame:

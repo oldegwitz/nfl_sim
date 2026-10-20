@@ -47,7 +47,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.5 (20-oct-2026)"  # v1.5: lector de Claude en paralelo con Gemini (65) y pago con empates y tope (v1.3.3) · v1.4: props de jugador (42n) · v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
+VERSION = "parlay-v1.6 (20-oct-2026)"  # v1.6: el lector de Claude pasa a Opus 5.5 (65.1) y el piloto de lectores empieza de cero · v1.5: lector de Claude en paralelo con Gemini (65) y pago con empates y tope (v1.3.3) · v1.4: props de jugador (42n) · v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -63,8 +63,9 @@ LOG_LECTORES = SAL / "lectores.csv"               # v1.5 (65-D1 a): comparación
 CLAUDE_LLAVE = BASE / "credenciales" / "anthropic.key"   # la carga cargar_anthropic.sh (entrada oculta, 600)
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_VERSION_API = "2023-06-01"
-CLAUDE_MODELO = "claude-sonnet-5-5"               # 65-A2: fijo y versionado
-CLAUDE_PRECIO = (2.0e-6, 10.0e-6)                 # USD por token de entrada y de salida de Sonnet 5.5 (precios verificados el 18-oct-2026)
+CLAUDE_MODELO = "claude-opus-5-5"                 # 65.1 (Ozz, 20-oct, «Opus en todo»); en v1.5 era claude-sonnet-5-5
+CLAUDE_PRECIO = (4.0e-6, 20.0e-6)                 # USD por token de entrada y de salida de Opus 5.5 (precios verificados el 18-oct-2026)
+PILOTO_LECTORES_DESDE = "parlay-v1.6"               # 65.1: el piloto (2 semanas o 10 boletos) cuenta desde esta versión
 CLAUDE_TOPE_USD_DIA = 2.0                         # semana.ini [claude] tope_usd_dia (además del tope mensual de la Console)
 CLAUDE_MAX_IMAGEN = 5 * 1024 * 1024               # la API de Claude no acepta imágenes de más de 5 MB
 TOPE_PAGO = 150000.0                              # premisa 3: ningún parlay de BetOnline paga más de USD 150.000
@@ -2701,8 +2702,32 @@ def _procesar_con_los_dos(datos, mime, copia, ahora, hoy, P=None, post=None, nom
                 f"({type(e).__name__}). En un minuto manda /si: lo cruzo y te lo muestro antes de guardar (no vuelve a leerlo).")
 
 
+def resumen_lectores():
+    """65.1: piloto de lectores desde v1.6 (Claude Opus contra Gemini): boletos, pagos reproducidos y lectura mostrada.
+    Descriptivo: decide Ozz a las 2 semanas o a los 10 boletos."""
+    filas = []
+    try:
+        with open(LOG_LECTORES, encoding="utf-8") as f:
+            filas = [r for r in csv.DictReader(f) if str(r.get("version", "")).startswith(PILOTO_LECTORES_DESDE)]
+    except (FileNotFoundError, csv.Error):
+        pass
+    if not filas:
+        return "Piloto de lectores (65.1, Opus contra Gemini, desde v1.6): todavía sin boletos; se decide a las 2 semanas o a los 10 boletos"
+    n = len(filas)
+    c = sum(1 for r in filas if r.get("claude_cuadra") == "sí")
+    g = sum(1 for r in filas if r.get("gemini_cuadra") == "sí")
+    ver = sum(1 for r in filas if r.get("claude_cuadra") in ("sí", "no") or r.get("gemini_cuadra") in ("sí", "no"))
+    mc = sum(1 for r in filas if r.get("elegida") == "Claude")
+    mg = sum(1 for r in filas if r.get("elegida") == "Gemini")
+    desde = min(r.get("fecha_ccs", "") for r in filas)
+    return (f"Piloto de lectores (65.1, Opus contra Gemini, desde {desde}): {n} boleto{'s' if n != 1 else ''} · pago reproducido: "
+            f"Claude {c}, Gemini {g} (de {ver} verificables) · lectura mostrada: Claude {mc}, Gemini {mg} · "
+            f"se decide a las 2 semanas o a los 10 boletos")
+
+
 def claude_prueba(post=None):
-    """v1.5: prueba real del lector de Claude con un boleto de texto corto (≈USD 0,002). No cuenta para el tope de boletos."""
+    """v1.5: prueba real del lector de Claude con un boleto de texto corto (v1.6, Opus: ≈USD 0,005). No cuenta para el tope
+    de boletos ni para el piloto."""
     if not CLAUDE_LLAVE.exists():
         return "No encuentro la llave de Claude (credenciales/anthropic.key). Cárgala con: bash cargar_anthropic.sh"
     ahora = ahora_utc()
@@ -2839,6 +2864,7 @@ def prueba_instalacion():
     gasto_c, tope_c = f"{claude_gasto_hoy(hoy_c):.4f}".replace(".", ","), f"{tope_claude_usd():.2f}".replace(".", ",")
     out.append(f"{'OK' if CLAUDE_LLAVE.exists() else 'AVISO'} llave de Claude {'presente' if CLAUDE_LLAVE.exists() else 'ausente (los boletos se leen solo con Gemini, como en v1.4)'}; "
                f"modelo {CLAUDE_MODELO}; gasto de hoy ≈USD {gasto_c} de un tope de {tope_c}")
+    out.append("OK " + resumen_lectores())
     SAL.mkdir(parents=True, exist_ok=True)
     out.append(f"OK carpeta {SAL.relative_to(BASE)}")
     try:                                     # v1.3.1: registro con la numeración por semana (solo lectura)
