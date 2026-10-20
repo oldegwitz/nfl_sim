@@ -4,7 +4,8 @@
 parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/registro_42_parlays.md).
 
   leer RUTA [--nombre NOMBRE] [--formato pdf|texto|imagen]
-                   lee el boleto de BetOnline con Gemini (foto, PDF o texto; puede traer varios boletos), lo cruza con
+                   lee el boleto de BetOnline con Claude y Gemini a la vez (v1.5, 65: se muestra la lectura que reproduce el
+                   pago impreso) (foto, PDF o texto; puede traer varios boletos), lo cruza con
                    el calendario y lo deja pendiente. --nombre: cómo se llamará (con varios boletos: NOMBRE 1, NOMBRE 2…);
                    sin nombre, al guardarlo se llama «Parlay N». --formato: el que eligió Ozz; si el archivo es de otro
                    tipo, se rechaza sin gastar Gemini (código 3). «foto RUTA» sigue funcionando (orden-v4)
@@ -21,6 +22,8 @@ parlay.py — parlays de Ozz por Telegram (decisión 42, registro en claude/regi
   prueba           comprobación de la instalación (no gasta Gemini)
   diagnostico [RUTA]  prueba contra Google cada forma de la cadena del bot con la última imagen, el último PDF y un texto,
                    y muestra lo que leyó; los 400 no se cobran; ≈USD 0,05 como máximo; no cuenta para el tope
+  claude-prueba    (v1.5) lee un boleto de texto corto con Claude y muestra la lectura, el tiempo y el costo
+                   (≈USD 0,002; no cuenta para el tope de boletos del día)
 
 Lo llama orden.py (bot del motor) como proceso aparte, igual que a semana.py. Es descriptivo: no cuenta para 31A ni para
 el CLV de 29A y no toca s2-v1 (no importa sprint2.py). No escribe en la hoja del motor: solo en su hoja propia de
@@ -44,7 +47,7 @@ import unicodedata
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "parlay-v1.4 (15-oct-2026)"  # v1.4: props de jugador (42n) · v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
+VERSION = "parlay-v1.5 (20-oct-2026)"  # v1.5: lector de Claude en paralelo con Gemini (65) y pago con empates y tope (v1.3.3) · v1.4: props de jugador (42n) · v1.1: foto, PDF o texto · v1.2: respaldo ante el 400 · v1.3: esquema que Google acepta, nombres, formato elegido · v1.3.1: semanas, históricos, por qué falló, hoja · v1.3.2: colores por marcador (42m) y aciertos desde las patas
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 import semana as S  # noqa: E402  (funciones del proyecto; semana.py solo corre su main() si se ejecuta directo)
@@ -55,6 +58,17 @@ REGISTRO = SAL / "parlays_2026.json"
 PENDIENTE = SAL / "pendiente.json"
 LOG_GEMINI = SAL / "gemini_lecturas.csv"          # v1.1 (columnas nuevas); el de v1 sigue contando para el tope del día
 LOG_GEMINI_V1 = SAL / "gemini_fotos.csv"
+LOG_CLAUDE = SAL / "claude_lecturas.csv"          # v1.5 (65): cada lectura de Claude (mismas columnas que la de Gemini)
+LOG_LECTORES = SAL / "lectores.csv"               # v1.5 (65-D1 a): comparación Claude / Gemini por boleto
+CLAUDE_LLAVE = BASE / "credenciales" / "anthropic.key"   # la carga cargar_anthropic.sh (entrada oculta, 600)
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_VERSION_API = "2023-06-01"
+CLAUDE_MODELO = "claude-sonnet-5-5"               # 65-A2: fijo y versionado
+CLAUDE_PRECIO = (2.0e-6, 10.0e-6)                 # USD por token de entrada y de salida de Sonnet 5.5 (precios verificados el 18-oct-2026)
+CLAUDE_TOPE_USD_DIA = 2.0                         # semana.ini [claude] tope_usd_dia (además del tope mensual de la Console)
+CLAUDE_MAX_IMAGEN = 5 * 1024 * 1024               # la API de Claude no acepta imágenes de más de 5 MB
+TOPE_PAGO = 150000.0                              # premisa 3: ningún parlay de BetOnline paga más de USD 150.000
+CUADRA_TOL = 0.01                                 # 65-A2: «reproduce el pago impreso» = diferencia ≤ 1 %
 FOTOS = SAL / "boletos"                            # copia de cada entrada (imagen, PDF o texto)
 MAX_BOLETOS = 6
 CCS = ZoneInfo("America/Caracas")
@@ -921,16 +935,50 @@ def ev_boleto(b, probs):
                         nuevo[k + 1] += dp[k] * pq
             dp = nuevo
         D_n = (b["pago"] / b["monto"]) if b.get("pago") and b.get("monto") else S.decimal(S.TEASER_PAGOS.get(n, 600))
+        cap = TOPE_PAGO / b["monto"] if b.get("monto") else float("inf")     # v1.5: tope de pago (premisa 3)
         R = 0.0
         for k, pk in enumerate(dp):
             m = n - k
-            R += pk * (D_n if k == 0 else 1.0 if (n == 2 or m <= 1) else S.decimal(S.TEASER_PAGOS[m]))
+            R += pk * min(cap, D_n if k == 0 else 1.0 if (n == 2 or m <= 1) else S.decimal(S.TEASER_PAGOS[m]))
         return R - 1
     if all(p.get("cuota") for p in patas):
-        return S.parlay([(pg, pp, S.decimal(p["cuota"])) for (pg, pp), p in zip(probs, patas)])["ev"]
+        return ev_parlay_tope(probs, [S.decimal(p["cuota"]) for p in patas], b.get("monto"))
     if b.get("pago") and b.get("monto"):
-        return p_cobrar([(pg, 0.0) for pg, _ in probs]) * b["pago"] / b["monto"] - 1
+        return p_cobrar([(pg, 0.0) for pg, _ in probs]) * min(b["pago"], TOPE_PAGO) / b["monto"] - 1
     return None
+
+
+def ev_parlay_tope(probs, decs, monto):
+    """v1.5: EV por unidad de un parlay con las cuotas de cada pata: Π(p·D + push) − 1 (una pata empatada sale del parlay),
+    con el tope de pago de BetOnline (premisa 3). Si el pago completo no llega al tope, es exactamente semana.parlay."""
+    base = S.parlay([(pg, pp, d) for (pg, pp), d in zip(probs, decs)])["ev"]
+    total = 1.0
+    for d in decs:
+        total *= d
+    if not monto or monto * total <= TOPE_PAGO:
+        return base
+    cap = TOPE_PAGO / monto
+    con_push = [i for i, (_, pp) in enumerate(probs) if (pp or 0) > 0]
+    if len(con_push) > 14:                     # demasiadas combinaciones: el empate se cuenta como ganada (aproximación)
+        p_pata, con_push = [pg + (pp or 0) for pg, pp in probs], []
+    else:
+        p_pata = [pg for pg, _ in probs]
+    p0, d0 = 1.0, 1.0
+    for i in range(len(probs)):
+        if i not in con_push:
+            p0 *= p_pata[i]
+            d0 *= decs[i]
+    R = 0.0
+    for mascara in range(1 << len(con_push)):
+        p, d = p0, d0
+        for j, i in enumerate(con_push):
+            if mascara >> j & 1:
+                p *= probs[i][1]
+            else:
+                p *= probs[i][0]
+                d *= decs[i]
+        R += p * min(d, cap)
+    return R - 1
 
 
 def cuadra_pago(b):
@@ -943,6 +991,43 @@ def cuadra_pago(b):
         prod *= S.decimal(p["cuota"])
     esp = b["monto"] * prod
     return min(abs(esp - b["pago"]), abs(esp - b["monto"] - b["pago"])) / esp
+
+
+def pago_vigente(b):
+    """v1.5 (v1.3.3): el pago que corresponde hoy. Con patas empatadas (res «E») BetOnline las saca del boleto (premisa 3):
+    el parlay paga pago ÷ Π(cuota decimal de las empatadas); el teaser baja un nivel de la tabla (en 2 patas, o si queda
+    una, devuelve lo apostado). Siempre con el tope de USD 150.000. Devuelve (pago, nota); nota vacía si no cambió."""
+    pago, monto = b.get("pago"), b.get("monto")
+    if not pago:
+        return pago, ""
+    emp = [p for p in b.get("patas", []) if p.get("res") == "E"]
+    nota = ""
+    if emp:
+        n, m = len(b["patas"]), len(b["patas"]) - len(emp)
+        if b.get("tipo") == "TEASER":
+            nuevo = monto if (n == 2 or m <= 1) else (monto * S.decimal(S.TEASER_PAGOS.get(m, 600)) if monto else None)
+        elif m == 0:
+            nuevo = monto
+        elif all(p.get("cuota") for p in emp):
+            nuevo = pago
+            for p in emp:
+                nuevo /= S.decimal(p["cuota"])
+        else:
+            nuevo = None
+        e = f"{len(emp)} empate{'s' if len(emp) != 1 else ''}"
+        if nuevo:
+            nota, pago = f"bajó por {e}; era {dinero(b.get('pago'))}", nuevo
+        else:
+            nota = f"baja por {e}; no leí la cuota para calcularlo"
+    if pago and pago > TOPE_PAGO:
+        nota = (nota + "; " if nota else "") + f"tope de BetOnline USD 150.000; el boleto dice {dinero(b.get('pago'))}"
+        pago = TOPE_PAGO
+    return pago, nota
+
+
+def pago_txt(b):
+    pago, nota = pago_vigente(b)
+    return dinero(pago) + (f" ({nota})" if nota else "")
 
 
 def _menciona(txt, eq):
@@ -1296,7 +1381,7 @@ class Parlays:
 
     def texto_pendiente(self, b, avisos, fil, rotulo=None):
         cab = (f"{rotulo}: " if rotulo else f"Leí «{b['nombre']}»: " if b.get("nombre") else "Leí este boleto: ") + \
-            f"{b['tipo'].lower()} de {len(b['patas'])} patas, {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
+            f"{b['tipo'].lower()} de {len(b['patas'])} patas, {dinero(b.get('monto'))} → paga {pago_txt(b)}"
         out = [cab + (f" (n.º {b['numero']})" if b.get("numero") else "") + ":"]
         for f in fil:
             p = f["p"]
@@ -1527,7 +1612,7 @@ class Parlays:
         vivas = len(fa) - gan - push - per
         estado = "PERDIDO" if per else ("COBRADO" if vivas == 0 else "vivo")
         out = [f"🎟 {nombre_de(b)} ({nombre_semana(clave_semana(b)).lower()}, n.º {b.get('n')}) · {b.get('tipo', 'parlay').lower()} de "
-               f"{len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}"
+               f"{len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {pago_txt(b)}"
                + (f" · boleto {b['numero']}" if b.get("numero") else ""),
                f"{estado}: {gan} ganadas · {per} perdidas · {push} push · {vivas} por decidir"]
         if estado == "vivo":
@@ -1579,7 +1664,7 @@ class Parlays:
             else:
                 fin = b.get("resultado") or f"en juego · /parlay {self.ref_corta(b, actual)}"
             out.append(f"{b.get('n')} · «{nombre_de(b)}» · {hora_ccs(b.get('cargado'))} · {len(b['patas'])} patas · {dinero(b.get('monto'))} → "
-                       f"{dinero(b.get('pago'))} · P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
+                       f"{pago_txt(b)} · P(cobrar) al cargar {pct(pr.get('p_cobrar'), 1)} · {fin}")
         r = resumen_semana(lista)
         if r["decididas"]:
             out += ["", f"Patas ya jugadas: acertaste {r['aciertos']} de {r['decididas']}; según el cierre se esperaban {fi(round(r['esperados'], 1))}."]
@@ -1627,7 +1712,7 @@ class Parlays:
             ci = b.get("cierre") or {}
             est = {"cobrado": "✅ COBRADO", "perdido": "❌ PERDIDO"}.get(b.get("estado"), "⏳ en juego")
             out += ["", f"{b.get('n')} · «{nombre_de(b)}» · {b.get('tipo', 'parlay').lower()} de {len(b['patas'])} patas · "
-                        f"{dinero(b.get('monto'))} → {dinero(b.get('pago'))} · {est}"]
+                        f"{dinero(b.get('monto'))} → {pago_txt(b)} · {est}"]
             if ci:
                 out.append(f"   P(cobrar) al cierre {pct(ci.get('p_cobrar'), 2)} · EV contra el cierre {pct(ci.get('ev'), 1)} · {costo_txt(ci.get('costo'))}")
             for p in b["patas"]:
@@ -1980,7 +2065,7 @@ def filas_hoja(P, clave, todos=None):
                      "El EV contra el cierre sale cuando se decida.")
         t_carga = S.t_utc(b.get("cargado"))
         filas.append([(nombre_de(b), "parlay"),
-                      (f"{(b.get('tipo') or 'parlay').capitalize()} de {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {dinero(b.get('pago'))}", "parlay"),
+                      (f"{(b.get('tipo') or 'parlay').capitalize()} de {len(b['patas'])} patas · {dinero(b.get('monto'))} → paga {pago_txt(b)}", "parlay"),
                       (("cargado " + S.fecha_cc(t_carga)) if t_carga else "", "parlay_texto"),
                       ({"cobrado": "Cobrado", "perdido": "Perdido"}.get(est, "En juego"), {"cobrado": "G", "perdido": "P"}.get(est, "parlay")),
                       (e_txt, "parlay_texto"), ("", "parlay_tec"), ("", "parlay_tec"),
@@ -2289,6 +2374,191 @@ def gemini_leer_boleto(contenido, mime, post=None):
                   "detalle": " | ".join(detalles)[:600], "motivo": (ultimo.get("detalle") or "")[:200]}
 
 
+# ---------------------------------------------------------------- v1.5 (65): lector de Claude, en paralelo con Gemini
+def claude_cuerpo(contenido, mime):
+    """Cuerpo de la API de Mensajes de Claude: el boleto (imagen, PDF o texto) y las mismas instrucciones que Gemini, con
+    el JSON pedido en el texto (sin esquema, como la cadena de Gemini que funcionó: registro 42)."""
+    import base64
+    if mime == "text/plain":
+        bloque = {"type": "text", "text": "TICKET TEXT:\n" + contenido.decode("utf-8").strip()}
+    elif mime == "application/pdf":
+        bloque = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                 "data": base64.b64encode(contenido).decode("ascii")}}
+    else:
+        bloque = {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(contenido).decode("ascii")}}
+    return {"model": CLAUDE_MODELO, "max_tokens": 4096,
+            "messages": [{"role": "user", "content": [bloque, {"type": "text", "text": PROMPT_BOLETO + PROMPT_JSON}]}]}
+
+
+def motivo_claude(r):
+    """Tipo y mensaje de error de la API de Claude (nunca trae la llave)."""
+    try:
+        err = (r.json() or {}).get("error") or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    return f"{err.get('type') or ''}: {err.get('message') or ''}".strip(": ")[:300]
+
+
+def claude_leer_boleto(contenido, mime, post=None):
+    """Lectura con Claude: una llamada; si responde sin un boleto legible, un segundo intento. Un error HTTP o de red
+    corta. Devuelve (lectura {"boletos": [...]} o None, registro con tokens, costo y motivo). Nunca registra la llave."""
+    import requests
+    reg = dict(modelo=CLAUDE_MODELO, version=VERSION, variante="texto-json",
+               entrada={"application/pdf": "pdf", "text/plain": "texto"}.get(mime, "imagen"))
+    if not CLAUDE_LLAVE.exists():
+        return None, dict(reg, estado="sin llave")
+    if mime.startswith("image/") and len(contenido) > CLAUDE_MAX_IMAGEN:
+        return None, dict(reg, estado="imagen grande", detalle="más de 5 MB: la API de Claude no la acepta")
+    llave = CLAUDE_LLAVE.read_text(encoding="utf-8").strip()
+    pe, ps = CLAUDE_PRECIO
+    costo, ultimo, intento = 0.0, {}, 0
+    for intento in (1, 2):
+        t0 = time.time()
+        try:
+            r = (post or requests.post)(CLAUDE_URL, headers={"x-api-key": llave, "anthropic-version": CLAUDE_VERSION_API,
+                                                             "content-type": "application/json"},
+                                        json=claude_cuerpo(contenido, mime), timeout=(10, 90))
+        except Exception as e:  # noqa: BLE001 — solo el tipo
+            ultimo = dict(estado="error de red", detalle=type(e).__name__, latencia_s=round(time.time() - t0, 2))
+            break
+        out = dict(http=r.status_code, latencia_s=round(time.time() - t0, 2))
+        if r.status_code != 200:
+            ultimo = dict(out, estado="error HTTP", detalle=motivo_claude(r))
+            break
+        try:
+            datos = r.json()
+        except ValueError:
+            ultimo = dict(out, estado="respuesta inválida", detalle="no es JSON")
+            break
+        u = datos.get("usage") or {}
+        te, ts = int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
+        costo += te * pe + ts * ps
+        texto = "".join(b.get("text", "") for b in (datos.get("content") or []) if isinstance(b, dict) and b.get("type") == "text")
+        obj = S._objeto_json(texto)
+        if isinstance(obj, dict) and isinstance(obj.get("patas"), list):      # un solo boleto sin la envoltura
+            obj = {"boletos": [obj]}
+        boletos = [b for b in ((obj or {}).get("boletos") or []) if isinstance(b, dict) and isinstance(b.get("patas"), list) and b["patas"]]
+        ultimo = dict(out, tok_entrada=te, tok_salida=ts, tok_razonamiento=0)
+        if boletos:
+            boletos = boletos[:MAX_BOLETOS]
+            return {"boletos": boletos}, {**reg, **ultimo, "estado": "ok", "intentos": intento, "costo_usd": round(costo, 6),
+                                          "boletos": len(boletos), "patas": sum(len(b["patas"]) for b in boletos)}
+        ultimo = dict(ultimo, estado="respuesta inválida", detalle=(texto or "sin texto")[:200])
+    return None, {**reg, **ultimo, "intentos": intento, "costo_usd": round(costo, 6), "motivo": (ultimo.get("detalle") or "")[:200]}
+
+
+def tope_claude_usd():
+    import configparser
+    c = configparser.ConfigParser()
+    if S.CONFIG.exists():
+        c.read(S.CONFIG)
+    try:
+        return float(c.get("claude", "tope_usd_dia", fallback=str(CLAUDE_TOPE_USD_DIA)))
+    except ValueError:
+        return CLAUDE_TOPE_USD_DIA
+
+
+def claude_gasto_hoy(hoy):
+    """USD que costaron hoy (Caracas) las llamadas de Claude, según claude_lecturas*.csv (incluye claude-prueba)."""
+    total = 0.0
+    for ruta in sorted(SAL.glob("claude_*.csv")):
+        try:
+            with open(ruta, encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if r.get("fecha_ccs") == hoy:
+                        try:
+                            total += float(r.get("costo_usd") or 0)
+                        except ValueError:
+                            pass
+        except (FileNotFoundError, csv.Error):
+            pass
+    return total
+
+
+def cuadra_lectura(lectura):
+    """'sí' si todos los boletos que se pueden verificar reproducen el pago impreso (≤ 1 %), 'no' si alguno no, None si
+    ninguno se puede verificar (teaser, props sin cuota, sin monto o sin pago)."""
+    if not lectura:
+        return None
+    marcas = []
+    for bo in lectura.get("boletos") or []:
+        patas = [p for p in (bo.get("patas") or []) if isinstance(p, dict)]
+        if "TEASER" in str(bo.get("tipo") or "").upper():
+            continue
+        b = dict(tipo="PARLAY", monto=_num(bo.get("monto")), pago=_num(bo.get("pago")), patas=[dict(cuota=_entero(p.get("cuota"))) for p in patas])
+        d = cuadra_pago(b)
+        if d is not None:
+            marcas.append(d <= CUADRA_TOL)
+    if not marcas:
+        return None
+    return "sí" if all(marcas) else "no"
+
+
+CAMPOS_LECTORES = ["hora_utc", "fecha_ccs", "version", "foto", "entrada", "elegida", "claude_estado", "claude_patas", "claude_cuadra",
+                   "claude_costo_usd", "claude_latencia_s", "gemini_estado", "gemini_patas", "gemini_cuadra", "gemini_costo_usd",
+                   "gemini_latencia_s"]
+
+
+def registrar_comparacion(fila):
+    SAL.mkdir(parents=True, exist_ok=True)
+    nuevo = not LOG_LECTORES.exists()
+    with open(LOG_LECTORES, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CAMPOS_LECTORES, extrasaction="ignore")
+        if nuevo:
+            w.writeheader()
+        w.writerow(fila)
+
+
+def _lector_txt(nombre, lect, r, c):
+    if lect:
+        n = sum(len(b["patas"]) for b in lect["boletos"])
+        return f"{nombre}: {n} patas, " + {"sí": "el pago cuadra", "no": "el pago NO cuadra"}.get(c, "pago sin verificar")
+    det = r.get("detalle") or r.get("motivo") or ""
+    return f"{nombre}: no leyó ({r.get('estado')}{': ' + det[:60] if det else ''})"
+
+
+def leer_en_paralelo(datos, mime, copia, ahora, hoy, post=None):
+    """v1.5 (65-D1 a): Claude y Gemini leen el mismo boleto a la vez. Se muestra la lectura que reproduce el pago impreso
+    (≤ 1 %); si las dos, la de Claude; si ninguna cuadra o no se puede verificar, la de Claude (si leyó). Registra cada
+    lectura y la comparación (lectores.csv). Devuelve (lectura elegida o None, nota para el mensaje, reg_claude, reg_gemini)."""
+    from concurrent.futures import ThreadPoolExecutor
+    gasto, tope = claude_gasto_hoy(hoy), tope_claude_usd()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fg = ex.submit(gemini_leer_boleto, datos, mime, post)
+        fc = ex.submit(claude_leer_boleto, datos, mime, post) if gasto < tope else None
+        lg, rg = fg.result()
+        if fc is not None:
+            lc, rc = fc.result()
+        else:
+            lc, rc = None, dict(modelo=CLAUDE_MODELO, version=VERSION, estado="tope del día",
+                                detalle=f"gasto de hoy USD {gasto:.2f} (tope {tope:.2f})")
+    for r_, log in ((rg, LOG_GEMINI), (rc, LOG_CLAUDE)):
+        r_.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, foto=copia)
+        registrar_llamada(r_, log)
+    cc, cg = cuadra_lectura(lc), cuadra_lectura(lg)
+    if lc and cc == "sí":
+        elegida, quien = lc, "Claude"
+    elif lg and cg == "sí":
+        elegida, quien = lg, "Gemini"
+    elif lc:
+        elegida, quien = lc, "Claude"
+    elif lg:
+        elegida, quien = lg, "Gemini"
+    else:
+        elegida, quien = None, ""
+    registrar_comparacion(dict(hora_utc=S.iso(ahora), fecha_ccs=hoy, version=VERSION, foto=copia, entrada=rc.get("entrada") or rg.get("entrada"),
+                               elegida=quien or "ninguna", claude_estado=rc.get("estado"), claude_patas=rc.get("patas", ""),
+                               claude_cuadra=cc or ("—" if not lc else "no se puede"), claude_costo_usd=rc.get("costo_usd", 0),
+                               claude_latencia_s=rc.get("latencia_s", ""), gemini_estado=rg.get("estado"), gemini_patas=rg.get("patas", ""),
+                               gemini_cuadra=cg or ("—" if not lg else "no se puede"), gemini_costo_usd=rg.get("costo_usd", 0),
+                               gemini_latencia_s=rg.get("latencia_s", "")))
+    nota = ""
+    if elegida:
+        nota = (f"📖 Muestro la lectura de {quien} (piloto 65). " + _lector_txt("Claude", lc, rc, cc) + " · " +
+                _lector_txt("Gemini", lg, rg, cg))
+    return elegida, nota, rc, rg
+
+
 def tope_fotos():
     import configparser
     c = configparser.ConfigParser()
@@ -2308,26 +2578,36 @@ def fotos_hoy(hoy):
             return r.get("estado") == "ok" or float(r.get("costo_usd") or 0) > 0
         except ValueError:
             return False
-    n = 0
-    for ruta in sorted(SAL.glob("gemini_*.csv")):
+    n, vistas = 0, set()          # v1.5: una foto leída por Claude y por Gemini cuenta una sola vez
+    for ruta in sorted(SAL.glob("gemini_*.csv")) + sorted(SAL.glob("claude_*.csv")):
         try:
             with open(ruta, encoding="utf-8") as f:
-                n += sum(1 for r in csv.DictReader(f) if r.get("fecha_ccs") == hoy and cobrada(r) and r.get("entrada") != "diagnostico")
+                for r in csv.DictReader(f):
+                    if r.get("fecha_ccs") != hoy or not cobrada(r) or r.get("entrada") in ("diagnostico", "prueba"):
+                        continue
+                    foto = r.get("foto") or ""
+                    if foto:
+                        if foto in vistas:
+                            continue
+                        vistas.add(foto)
+                    n += 1
         except (FileNotFoundError, csv.Error):
             pass
     return n
 
 
-def registrar_llamada(reg):
-    """Agrega una fila; si el registro existente tiene otras columnas (versión anterior), lo guarda aparte y empieza uno."""
+def registrar_llamada(reg, log=None):
+    """Agrega una fila; si el registro existente tiene otras columnas (versión anterior), lo guarda aparte y empieza uno.
+    log: LOG_GEMINI (por omisión) o LOG_CLAUDE (v1.5)."""
+    log = log or LOG_GEMINI
     SAL.mkdir(parents=True, exist_ok=True)
-    if LOG_GEMINI.exists():
-        with open(LOG_GEMINI, encoding="utf-8") as f:
+    if log.exists():
+        with open(log, encoding="utf-8") as f:
             cab = f.readline().strip().split(",")
         if cab != CAMPOS_LOG:
-            LOG_GEMINI.rename(SAL / f"gemini_lecturas_hasta_{ahora_utc():%Y%m%d_%H%M%S}.csv")
-    nuevo = not LOG_GEMINI.exists()
-    with open(LOG_GEMINI, "a", encoding="utf-8", newline="") as f:
+            log.rename(SAL / f"{log.stem}_hasta_{ahora_utc():%Y%m%d_%H%M%S}.csv")
+    nuevo = not log.exists()
+    with open(log, "a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CAMPOS_LOG, extrasaction="ignore")
         if nuevo:
             w.writeheader()
@@ -2368,6 +2648,8 @@ def procesar_entrada(ruta, P=None, post=None, nombre=None, formato=None):
     copia = ahora.strftime("%Y%m%d_%H%M%S_%f") + {"image/png": ".png", "image/webp": ".webp", "application/pdf": ".pdf",
                                                  "text/plain": ".txt"}.get(mime, ".jpg")
     (FOTOS / copia).write_bytes(datos)
+    if CLAUDE_LLAVE.exists():                         # v1.5 (65): Claude y Gemini a la vez
+        return _procesar_con_los_dos(datos, mime, copia, ahora, hoy, P=P, post=post, nombre=nombre)
     lectura, reg = gemini_leer_boleto(datos, mime, post=post)
     reg.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, foto=copia)
     registrar_llamada(reg)
@@ -2397,6 +2679,50 @@ def procesar_entrada(ruta, P=None, post=None, nombre=None, formato=None):
 
 
 procesar_foto = procesar_entrada        # nombre de v1
+
+
+def _procesar_con_los_dos(datos, mime, copia, ahora, hoy, P=None, post=None, nombre=None):
+    """v1.5: lee con Claude y Gemini (leer_en_paralelo), cruza la lectura elegida y antepone la nota del piloto."""
+    lectura, nota, rc, rg = leer_en_paralelo(datos, mime, copia, ahora, hoy, post=post)
+    if not lectura:
+        que = {"application/pdf": "el PDF", "text/plain": "el texto"}.get(mime, "la foto")
+        costo = (rc.get("costo_usd") or 0) + (rg.get("costo_usd") or 0)
+        cobro = (f"Costó ≈USD {costo:.4f} y cuenta para el tope del día.".replace(".", ",", 1) if costo > 0 else
+                 "No se cobró: no cuenta para el tope del día.")
+        extra = " Si el PDF no se deja leer, mándame una captura de pantalla." if mime == "application/pdf" else ""
+        return (f"No pude leer {que} del boleto. {_lector_txt('Claude', None, rc, None)} · {_lector_txt('Gemini', None, rg, None)}."
+                f"{extra} {cobro}")
+    try:
+        return nota + "\n\n" + (P or Parlays()).preparar(lectura, archivo=copia, nombre=nombre)
+    except Exception as e:  # noqa: BLE001 — la lectura ya se pagó: se guarda y se cruza con /si
+        _guardar_json(PENDIENTE, dict(crudo=lectura, archivo=copia, nombre=limpiar_nombre(nombre) or None, creado=S.iso(ahora)))
+        n = len(lectura.get("boletos") or [])
+        return (nota + "\n\n" + f"Leí {n} boleto{'s' if n != 1 else ''}, pero no pude cruzarlo{'s' if n != 1 else ''} con los juegos "
+                f"({type(e).__name__}). En un minuto manda /si: lo cruzo y te lo muestro antes de guardar (no vuelve a leerlo).")
+
+
+def claude_prueba(post=None):
+    """v1.5: prueba real del lector de Claude con un boleto de texto corto (≈USD 0,002). No cuenta para el tope de boletos."""
+    if not CLAUDE_LLAVE.exists():
+        return "No encuentro la llave de Claude (credenciales/anthropic.key). Cárgala con: bash cargar_anthropic.sh"
+    ahora = ahora_utc()
+    hoy = ahora.astimezone(CCS).date().isoformat()
+    lectura, reg = claude_leer_boleto(b"Parlay $10 to pay $36.45: BUF -7 -110, CHI -3 -110", "text/plain", post=post)
+    reg.update(hora_utc=S.iso(ahora), fecha_ccs=hoy, entrada="prueba", foto="")
+    registrar_llamada(reg, LOG_CLAUDE)
+    out = [f"Prueba del lector de Claude · {CLAUDE_MODELO} · {VERSION}"]
+    if not lectura:
+        det = reg.get("detalle") or reg.get("motivo") or ""
+        out.append(f"FALLA: {reg.get('estado')}{' ' + str(reg.get('http')) if reg.get('http') else ''}{': ' + det if det else ''}")
+        return "\n".join(out)
+    bo = lectura["boletos"][0]
+    lat, usd = f"{reg.get('latencia_s') or 0:.1f}".replace(".", ","), f"{reg.get('costo_usd') or 0:.4f}".replace(".", ",")
+    out.append(f"OK: leyó {len(bo['patas'])} patas · monto {bo.get('monto') or '?'} · pago {bo.get('pago') or '?'} · {lat} s · ≈USD {usd}")
+    for i, p in enumerate(bo["patas"], 1):
+        out.append(f"  {i}) {str(p.get('texto') or p.get('equipo') or '?')[:70]} · {p.get('tipo') or '?'} {p.get('linea') or ''} {p.get('cuota') or ''}".rstrip())
+    c = cuadra_lectura(lectura)
+    out.append({"sí": "El pago cuadra con las cuotas (≤ 1 %).", "no": "El pago NO cuadra con las cuotas."}.get(c, "No se pudo verificar el pago."))
+    return "\n".join(out)
 
 
 def leer_cli(resto, post=None):
@@ -2509,6 +2835,10 @@ def prueba_instalacion():
         out.append(f"FALLA líneas: {type(e).__name__}: {str(e)[:120]}")
     out.append(f"{'OK' if S.GEMINI_LLAVE.exists() else 'FALLA'} llave de Gemini {'presente' if S.GEMINI_LLAVE.exists() else 'ausente'}; "
                f"lecturas de boletos por día (foto, PDF o texto): tope {tope_fotos()}, usadas hoy {fotos_hoy(ahora_utc().astimezone(CCS).date().isoformat())}")
+    hoy_c = ahora_utc().astimezone(CCS).date().isoformat()
+    gasto_c, tope_c = f"{claude_gasto_hoy(hoy_c):.4f}".replace(".", ","), f"{tope_claude_usd():.2f}".replace(".", ",")
+    out.append(f"{'OK' if CLAUDE_LLAVE.exists() else 'AVISO'} llave de Claude {'presente' if CLAUDE_LLAVE.exists() else 'ausente (los boletos se leen solo con Gemini, como en v1.4)'}; "
+               f"modelo {CLAUDE_MODELO}; gasto de hoy ≈USD {gasto_c} de un tope de {tope_c}")
     SAL.mkdir(parents=True, exist_ok=True)
     out.append(f"OK carpeta {SAL.relative_to(BASE)}")
     try:                                     # v1.3.1: registro con la numeración por semana (solo lectura)
@@ -2570,6 +2900,8 @@ def main(argv):
             print(prueba_instalacion())
         elif cmd == "diagnostico":
             print(diagnostico(resto[0] if resto else None))
+        elif cmd == "claude-prueba":
+            print(claude_prueba())
         else:
             print("Orden no reconocida. " + __doc__)
             return 2
