@@ -60,6 +60,8 @@ Uso
   (v9) venv/bin/python semana.py autopsia [--semana N]        (/autopsia: por qué perdieron los favoritos del cierre)
   (v9) venv/bin/python semana.py briefing                     (/briefing: analista de los juegos que faltan)
   (v9) venv/bin/python semana.py claude-prueba [--real]       (prueba de los agentes de Claude; --real: 1 consulta real)
+  (v9.2) En cada T−85 automática, clima.py guarda el pronóstico del clima (60d) en un proceso aparte; sus modos de
+         prueba están en clima.py (prueba, prueba --real, coordenadas, estado, informe --semana N).
 Opciones de prueba: --ahora 2026-10-07T14:20:00Z · --sin-telegram · --sin-hoja · --bot-dir RUTA · --n-sims N
 
 Solo lee ~/nfl_ev (líneas del bot y config.ini para Telegram); escribe solo en ~/nfl_sim y en la hoja.
@@ -80,7 +82,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v9.1 (20-oct-2026)"
+VERSION_SEMANA = "semana-v9.2 (30-oct-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -172,6 +174,14 @@ VERSION_SEMANA = "semana-v9.1 (20-oct-2026)"
 #     8.000 tokens de salida): tope de salida 16.000 en el vigía-alineador (4.000 en la autopsia, 20.000 en el analista),
 #     reservas de costo con lo medido (USD 1,30 por juego) y la prueba real muestra tokens y fin de cada paso. Antes de la
 #     primera T−85 del vigía-alineador: el piloto empieza con la huella de v9.1. Nada más cambia.
+# v9.2 (30-oct, decisión 60 de Ozz: D1 = a, D2 = a; especificación en claude/registro_60_clima.md, escrita antes):
+#     · 60d: en cada T−85 automática lanza clima.py en un proceso aparte (como el tablero: nunca frena ni cambia la
+#       corrida) para guardar el pronóstico de NWS y Open-Meteo de cada juego; si algún partido al aire libre tiene
+#       viento ≥ 15 mph, lluvia ≥ 60 % o ≤ 0 °C, manda un Telegram corto («#9 en registro, sin dinero»).
+#     · El informe semanal suma la sección «Clima» (consultas, conteos de #9 a ciegas, error del viento contra el
+#       gamebook) y el conteo del movimiento tardío de la decisión 56 (solo cuántos casos; nunca la tasa).
+#     · El modo estado suma la línea del clima.
+#     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2, los vigías ni sus huellas.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -183,6 +193,8 @@ CONFIG = BASE / "semana.ini"
 MD5_SPRINT2 = "baad72c6a5dc0054a7de22a79c88616f"     # s2-v1 congelado (31A)
 TABLERO = BASE / "tablero.py"                        # v8.4 (58): tablero tipo PFF Pro (descriptivo), hoja aparte
 TABLERO_TIMEOUT = 150                                # segundos; si se pasa, se corta y la corrida sigue
+CLIMA = BASE / "clima.py"                            # v9.2 (60d): pronóstico del clima a T−85 (descriptivo)
+CLIMA_TIMEOUT = 100                                  # segundos desde que se lanza (clima.py se corta solo a los 90)
 CARACAS = ZoneInfo("America/Caracas")
 NUEVA_YORK = ZoneInfo("America/New_York")
 TEMPORADA = 2026
@@ -6324,6 +6336,194 @@ def actualizar_tablero(motivo):
     return txt
 
 
+# --------------------------------------------------------------------------------------
+# v9.2 (60d): clima a T−85 (clima.py en un proceso aparte) y conteo del movimiento tardío (56)
+# --------------------------------------------------------------------------------------
+def clima_lanzar(sombra, ahora):
+    """Lanza clima.py con los juegos de la T−85 en un proceso aparte. Nunca frena ni cambia la corrida: si no está
+    instalado o no arranca, se anota en el log y todo sigue igual. → dict de seguimiento o None."""
+    import subprocess
+    if not CLIMA.exists():
+        return None
+    ids = sorted({j["game_id"] for j, _ in sombra})
+    if not ids:
+        return None
+    try:
+        p = subprocess.Popen([sys.executable, str(CLIMA), "registrar", "--corrida", iso(ahora), "--juegos", ",".join(ids)],
+                             cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as e:  # noqa: BLE001
+        log(f"clima: no pude lanzarlo ({type(e).__name__})")
+        return None
+    return {"p": p, "t0": time.time(), "listo": False}
+
+
+def clima_revisar(trab, esperar=False, sin_telegram=False):
+    """Si clima.py ya terminó (con esperar: hasta CLIMA_TIMEOUT desde que se lanzó), anota su resumen en el log y manda
+    su Telegram si hay clima notable (D2 = a). Una sola vez por corrida; cualquier falla queda en el log."""
+    import subprocess
+    if not trab or trab["listo"]:
+        return
+    p = trab["p"]
+    if not esperar and p.poll() is None:
+        return
+    trab["listo"] = True
+    try:
+        out, _ = p.communicate(timeout=max(1.0, CLIMA_TIMEOUT - (time.time() - trab["t0"])))
+    except subprocess.TimeoutExpired:
+        try:                                          # primero le pide que termine; si no, lo corta
+            p.terminate()
+            p.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+                p.communicate(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        log(f"clima: tiempo agotado ({CLIMA_TIMEOUT} s); la corrida sigue")
+        return
+    except Exception as e:  # noqa: BLE001
+        log(f"clima: no pude leer su resultado ({type(e).__name__})")
+        return
+    res = None
+    for lin in (out or "").splitlines():
+        if lin.startswith("CLIMA_JSON "):
+            try:
+                res = json.loads(lin[len("CLIMA_JSON "):])
+            except ValueError:
+                res = None
+    if res is None:
+        ult = ((out or "").strip().splitlines() or [""])[-1]
+        log(f"clima: terminó sin resumen (código {p.returncode}) · {ult[:240]}")
+        return
+    log(f"clima: {res.get('estado')} · {res.get('juegos', 0)} juegos en {res.get('segundos', '?')} s · NWS "
+        f"{res.get('nws_ok', 0)}/{res.get('nws_total', 0)} · Open-Meteo {res.get('om_ok', 0)}/{res.get('om_total', 0)} · "
+        f"#9 {res.get('casos9', 0)} · notables {res.get('notables', 0)}")
+    for a in (res.get("avisos") or [])[:-1]:          # el último es el resumen que ya está arriba
+        log(f"clima (aviso): {a}")
+    if res.get("mensaje"):
+        try:
+            enviar_tg(res["mensaje"], sin_telegram)
+        except Exception as e:  # noqa: BLE001
+            log(f"clima: no pude mandar el Telegram ({type(e).__name__})")
+
+
+def _modulo_clima():
+    if not CLIMA.exists():
+        return None
+    sys.path.insert(0, str(BASE))
+    import clima as cl
+    return cl
+
+
+def seccion_clima(semana):
+    """Sección «Clima» del informe semanal (la arma clima.py; #9 a ciegas: solo conteos)."""
+    cl = _modulo_clima()
+    return ("", []) if cl is None else cl.seccion_informe(semana)
+
+
+def texto_clima_estado():
+    cl = _modulo_clima()
+    return "Clima (60d): clima.py no instalado" if cl is None else cl.texto_estado()
+
+
+M56_DESDE_ET = dt.date(2026, 10, 11)        # 56: juegos desde el domingo 11-oct-2026 (fecha del Este; semana 5)
+M56_UMBRAL = 1.0                            # |hándicap al cierre − hándicap temprano| ≥ 1,0 pt
+M56_TEMPRANA_H = (3.0, 8.0)                 # foto temprana: la más reciente de Pinnacle entre 3 y 8 h antes del inicio
+M56_CIERRE_MAX_MIN = 20                     # cierre del bot: la última foto de Pinnacle ≤ 20 min antes (escaneo de T−10)
+M56_REPROG_H = 6.0                          # reprogramado: el inicio que vio alguna proyección difiere > 6 h del final
+M56_REPROGRAMADOS = set()                   # para anotar a mano un caso que el registro no muestre
+
+
+def _cierres_legible(bot_dir):
+    """¿cierres.csv del bot existe y tiene las columnas de las fotos? (si no, el cierre sale solo de lineas_log.csv)"""
+    ruta = Path(bot_dir) / "cierres.csv"
+    try:
+        with open(ruta, newline="", encoding="utf-8") as fh:
+            enc = next(csv.reader(fh), [])
+        return all(c in enc for c in COLS_FOTO)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _inicios_registrados():
+    """Inicio de cada juego según cada proyección guardada en el registro (para ver si se reprogramó)."""
+    out = {}
+    try:
+        with open(REGISTRO, newline="", encoding="utf-8") as fh:
+            for f in csv.DictReader(fh):
+                t = t_utc(f.get("inicio_utc"))
+                if t is not None:
+                    out.setdefault(f.get("game_id"), []).append(t)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def conteo_56(g26, bot_dir):
+    """56 (regla registrada el 11-oct): SOLO conteos, nunca la tasa. Por semana, en temporada regular desde el 11-oct-2026,
+    cuántos juegos tienen las dos fotos de Pinnacle del bot (temprana 3-8 h antes y cierre ≤ 20 min antes) y en cuántos el
+    hándicap se movió ≥ 1,0 pt entre ellas. → {semana: dict(casos, con_fotos, sin_temprana, sin_cierre, reprogramados)}"""
+    import polars as pl
+    jug = g26.filter((pl.col("game_type") == "REG") & pl.col("result").is_not_null() & pl.col("inicio").is_not_null())
+    jug = [r for r in jug.iter_rows(named=True) if r["inicio"].astimezone(NUEVA_YORK).date() >= M56_DESDE_ET]
+    lg = log_bot(bot_dir, con_cierres=True)
+    fotos = {}
+    if lg is not None and jug:
+        for f in lg.filter((pl.col("fuente") == "pinnacle") & pl.col("game_id").is_in([r["game_id"] for r in jug])).iter_rows(named=True):
+            ts = t_utc(f["ts_utc"])
+            if ts is not None:
+                fotos.setdefault(f["game_id"], []).append((ts, _num(f.get("hcp_local"))))
+    reg = _inicios_registrados()
+    out = {}
+    for r in jug:
+        d = out.setdefault(int(r["week"]), dict(casos=0, con_fotos=0, sin_temprana=0, sin_cierre=0, sin_handicap=0,
+                                                reprogramados=0))
+        gid, ini = r["game_id"], r["inicio"]
+        if gid in M56_REPROGRAMADOS or any(abs((t - ini).total_seconds()) > M56_REPROG_H * 3600 for t in reg.get(gid, [])):
+            d["reprogramados"] += 1
+            continue
+        fs = fotos.get(gid, [])
+        temp = [x for x in fs if M56_TEMPRANA_H[0] * 3600 <= (ini - x[0]).total_seconds() <= M56_TEMPRANA_H[1] * 3600]
+        cie = [x for x in fs if 0 < (ini - x[0]).total_seconds() <= M56_CIERRE_MAX_MIN * 60]
+        if not temp:
+            d["sin_temprana"] += 1
+        elif not cie:
+            d["sin_cierre"] += 1
+        else:
+            t_, c_ = max(temp, key=lambda x: x[0]), max(cie, key=lambda x: x[0])
+            if t_[1] is None or c_[1] is None:          # la foto que corresponde no trae hándicap: fuera (se cuenta)
+                d["sin_handicap"] += 1
+            else:
+                d["con_fotos"] += 1
+                d["casos"] += int(abs(c_[1] - t_[1]) >= M56_UMBRAL)
+    return out
+
+
+def seccion_56(g26, bot_dir, semana):
+    """Línea del informe semanal con el conteo de 56 (solo cuántos casos). ('', []) si todavía no hay juegos."""
+    c = conteo_56(g26, bot_dir)
+    if not c:
+        return "", []
+    vacio = dict(casos=0, con_fotos=0, sin_temprana=0, sin_cierre=0, sin_handicap=0, reprogramados=0)
+    s = c.get(semana, vacio)
+    t = {k: sum(v[k] for v in c.values()) for k in vacio}
+    aviso = "" if _cierres_legible(bot_dir) else " · aviso: cierres.csv del bot no se pudo leer (el cierre sale de lineas_log.csv)"
+    tel = (f"Movimiento tardío (56, solo conteos): semana {semana}: {s['casos']} casos de {s['con_fotos']} juegos con las dos "
+           f"fotos · acumulado desde el 11-oct: {t['casos']} de {t['con_fotos']} (fuera: sin foto "
+           f"{t['sin_temprana'] + t['sin_cierre']}, sin hándicap {t['sin_handicap']}, reprogramados {t['reprogramados']})"
+           f"{aviso} · veredicto una sola vez al cerrar la semana 18 de 2027 si hay ≥ 40 casos")
+    lin = ["MOVIMIENTO TARDÍO (56): casos = |Pinnacle al cierre − Pinnacle 3-8 h antes| ≥ 1,0 pt; solo conteos, nunca la tasa",
+           f"  Semana {semana}: casos {s['casos']} · con las dos fotos {s['con_fotos']} · sin foto temprana {s['sin_temprana']} · "
+           f"sin cierre del bot (≤ {M56_CIERRE_MAX_MIN} min) {s['sin_cierre']} · sin hándicap {s['sin_handicap']} · "
+           f"reprogramados {s['reprogramados']}",
+           f"  Acumulado desde el 11-oct-2026: casos {t['casos']} · con las dos fotos {t['con_fotos']} · sin foto temprana "
+           f"{t['sin_temprana']} · sin cierre {t['sin_cierre']} · sin hándicap {t['sin_handicap']} · reprogramados {t['reprogramados']}",
+           "  Cierre = la última foto de Pinnacle del bot (lineas_log.csv o cierres.csv) tomada ≤ 20 min antes del inicio, como el "
+           "cierre que usa 29A." + aviso,
+           "  Regla (56): veredicto una sola vez al cerrar la semana 18 de 2027 con ≥ 40 casos (si no, la de 2028)."]
+    return tel, lin
+
+
 def informe_semana(g26, semana, bot_dir, ahora):
     """Informe semanal (45): CLV de las selecciones de 29A con la señal que cuenta y autopsia de cada juego (38, prueba 1
     en probabilidad sin vig). Devuelve (texto para Telegram, texto completo, filas de selecciones, filas de autopsia)."""
@@ -6488,6 +6688,20 @@ def informe_semana(g26, semana, bot_dir, ahora):
     except Exception as e:  # noqa: BLE001
         bd_tel, bd_txt = f"Bandera de sesgo (57): no se pudo contar ({type(e).__name__}).", []
     tel.append(bd_tel)
+    # ---- v9.2 (60d): clima a T−85 (#9 a ciegas: solo conteos) ----
+    try:
+        cl_tel, cl_txt = seccion_clima(semana)
+    except Exception as e:  # noqa: BLE001
+        cl_tel, cl_txt = f"Clima (60d): no se pudo armar ({type(e).__name__}).", []
+    if cl_tel:
+        tel.append(cl_tel)
+    # ---- v9.2 (56): movimiento tardío, solo conteos ----
+    try:
+        m56_tel, m56_txt = seccion_56(g26, bot_dir, semana)
+    except Exception as e:  # noqa: BLE001
+        m56_tel, m56_txt = f"Movimiento tardío (56): no se pudo contar ({type(e).__name__}).", []
+    if m56_tel:
+        tel.append(m56_tel)
     tel.append("Exceso = CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo (no favorito o "
                "favorito), mercado y semana (decide 29A, decisión 52). CLV sin vig = cuánto se movió la probabilidad justa de "
                "Pinnacle hacia el lado elegido, de la señal al cierre (46). Descriptivo: el veredicto se da al final de la "
@@ -6513,6 +6727,7 @@ def informe_semana(g26, semana, bot_dir, ahora):
     if falta_pbp:
         completo.append("Sin jugada por jugada todavía: " + ", ".join(falta_pbp))
     completo += [""] + fu_txt + [""] + vg_txt + ([""] + bd_txt if bd_txt else []) + ([""] + vc_txt if vc_txt else [])
+    completo += ([""] + cl_txt if cl_txt else []) + ([""] + m56_txt if m56_txt else [])      # v9.2
     completo.append(f"Generado {iso(ahora)} · {VERSION_SEMANA}")
     return "\n".join(tel), "\n".join(completo), sels, auto, {"fuera": fu_sem, "vigia": vg_filas}
 
@@ -6845,6 +7060,10 @@ def main():
             print(texto_claude_estado(ahora, estado))      # v9 (65.1)
         except Exception as e:  # noqa: BLE001
             print(f"Agentes de Claude (65): no pude leer su registro ({type(e).__name__})")
+        try:
+            print(texto_clima_estado())                # v9.2 (60d)
+        except Exception as e:  # noqa: BLE001
+            print(f"Clima (60d): no pude leer su registro ({type(e).__name__})")
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -6991,6 +7210,8 @@ def main():
         elif tipo == "t85":
             estado["grupos"][clave] = iso(ahora)
     guardar_estado(estado)
+    # v9.2 (60d): el clima arranca en un proceso aparte, ya guardada la proyección; nunca la frena ni la cambia
+    trab_clima = clima_lanzar(sombra, ahora) if sombra and args.modo == "auto" else None
     boletos = []                                      # v7: boleto informativo, solo en las corridas que cuentan
     for tipo, _, filas, _ in resumenes:
         for s_ in sorted({f["semana"] for f in filas}):
@@ -7018,6 +7239,7 @@ def main():
     if sombra:                                        # 35A: el agente en sombra corre después de guardar y enviar
         gemini_sombra(sombra, ahora, estado)
         guardar_estado(estado)
+    clima_revisar(trab_clima, sin_telegram=args.sin_telegram)      # v9.2: si ya terminó, su Telegram sale ahora
     if sombra and args.modo == "auto":                # v8.3 (55): el vigía, después de g1 y antes de e2
         res_v = vigia_t85(sombra, [f for _, _, filas, _ in resumenes for f in filas], ahora, estado, g26)
         guardar_estado(estado)
@@ -7036,6 +7258,7 @@ def main():
                     s2.telegram(texto_vigia(res_v))
                 except Exception as e:  # noqa: BLE001
                     log(f"Vigía: no pude mandar el Telegram ({type(e).__name__})")
+    clima_revisar(trab_clima, sin_telegram=args.sin_telegram)      # v9.2
     if sombra and args.modo == "auto":                # v8.2 (49): registro en vivo e2, aparte de g1 y después de él
         e2_vivo(sombra, ahora, estado)
         guardar_estado(estado)
@@ -7046,6 +7269,7 @@ def main():
                 enviar_tg(texto_a1(res_c))
             except Exception as e:  # noqa: BLE001
                 log(f"Vigía-alineador Claude: no pude mandar el Telegram ({type(e).__name__})")
+    clima_revisar(trab_clima, esperar=True, sin_telegram=args.sin_telegram)   # v9.2: a más tardar a los 100 s
     actualizar_tablero(", ".join(sorted({t for t, _, _ in lista})))   # v8.4 (58): al final, sin frenar nada
     if (args.modo == "auto" and any(t == "sabado" for t, _, _ in lista) and CLAUDE_LLAVE.exists() and claude_cfg()[0]):
         try:                                          # v9 (65, A4): analista del sábado, una vez por semana
