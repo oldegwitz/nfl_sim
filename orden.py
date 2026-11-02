@@ -19,6 +19,12 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /autopsia [N] → por qué perdieron los favoritos del cierre de la semana N (o la más reciente) (semana.py autopsia)
   /briefing → analista de los juegos que faltan de la semana (semana.py briefing). Tope 3 por día.
   Las tres no corren si en ≤ 12 min toca una corrida automática (la que cuenta).
+  v4.5 (decisión 68; semana.py v9.3):
+  /briefing [EQUIPO] → briefing nuevo: portada, 2 imágenes y el texto de cada partido, y la matriz (con EQUIPO, solo ese
+             partido: /briefing KC). El tope de 3 por día cuenta solo si consulta a Opus.
+  /matriz  → matriz de decisión con los precios de ahora (semana.py matriz; solo lee, segundos). Tampoco corre si en
+             ≤ 12 min toca una automática.
+  /presupuesto [N] → presupuesto semanal de la matriz en USD (D7); sin N muestra el vigente.
   Parlays (v4, decisión 42; parlay.py, descriptivo, no cuenta para nada):
   «Parlay» (v4.2, también «Teaser» o «Boleto») → el bot pregunta el nombre y el formato (botones PDF, Texto, Imagen) y
              espera ese formato: otro tipo de archivo se rechaza y sigue esperando; /cancelar sale. Se olvida a los 15 min.
@@ -53,7 +59,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4.4 (20-oct-2026)"  # v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto · v4.4: /vigia, /autopsia, /briefing
+VERSION = "orden-v4.5 (2-nov-2026)"  # v4.5: /briefing EQUIPO, /matriz, /presupuesto (68) · v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto · v4.4: /vigia, /autopsia, /briefing
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -84,10 +90,12 @@ ORDENES = {
     "/piloto": (["gemini-piloto"], "Piloto de Gemini: una consulta por juego pendiente, en paralelo (≈1-2 min). No cuenta para el piso."),
     "/vigia": (["vigia-manual"], "Simulo y consulto a los dos vigías (Gemini y Claude), hasta ~9 min. A pedido: no cuenta."),
     "/autopsia": (["autopsia"], "Autopsia de los favoritos que perdieron (≈1-3 min)."),
-    "/briefing": (["briefing"], "Analista de los juegos que faltan (≈3-8 min)."),
+    "/briefing": (["briefing"], "Briefing de los juegos que faltan: imágenes, texto y matriz (≈1-2 min; con Opus, hasta ~12 min)."),
+    "/matriz": (["matriz"], "Matriz de decisión con los precios de ahora (segundos)."),
+    "/presupuesto": (["presupuesto"], None),
 }
 VARIANTES = ("g1", "g1-low", "g1-texto", "g1-high")
-SALIDA_COMPLETA = ("/qb", "/estado", "/piloto")
+SALIDA_COMPLETA = ("/qb", "/estado", "/piloto", "/presupuesto")
 # v4: órdenes de parlay.py → (argumentos, ¿lleva número?, ¿lleva equipo?)
 ORDENES_PARLAY = {
     "/parlays": (["lista"], False, False),
@@ -107,7 +115,9 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/piloto — piloto del agente Gemini (P1-P4); /piloto g1-low para otra variante\n"
          "/vigia — simula el próximo grupo y consulta a los vigías (Gemini y Claude); /vigia KC para un equipo. No cuenta\n"
          "/autopsia — por qué perdieron los favoritos de la semana más reciente; /autopsia 7 para otra\n"
-         "/briefing — analista de los juegos que faltan (rankings de la prensa, bajas y opinión)\n"
+         "/briefing — briefing de los juegos que faltan: imágenes, texto y matriz; /briefing KC para un partido\n"
+         "/matriz — matriz de decisión con los precios de ahora (ML, spread y puntos comprados contra Pinnacle)\n"
+         "/presupuesto — presupuesto semanal de la matriz; /presupuesto 66 para cambiarlo\n"
          "Parlays (cada semana NFL empieza otra vez en «Parlay 1»):\n"
          "/parlay — cargar uno nuevo: te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
          "   También escribiendo «Parlay», o mandando el boleto directo como foto, PDF o texto. /si lo guarda, /no lo descarta\n"
@@ -124,7 +134,8 @@ COMANDOS = [("parlay", "Cargar un boleto nuevo (o /parlay 2 para ver cómo va)")
             ("borrar_parlay", "Sacar un parlay de la lista"), ("estado", "Motor: qué toca y cuándo"), ("qb", "Motor: QB de cada juego"),
             ("correr", "Motor: proyectar ahora (no cuenta)"), ("hoja", "Motor: rehacer la hoja"), ("retro", "Motor: rehacer la retrospectiva"),
             ("piloto", "Motor: piloto del agente Gemini"), ("vigia", "Motor: vigías a pedido (o /vigia KC); no cuenta"),
-            ("autopsia", "Por qué perdieron los favoritos (o /autopsia 7)"), ("briefing", "Analista de los juegos que faltan"),
+            ("autopsia", "Por qué perdieron los favoritos (o /autopsia 7)"), ("briefing", "Briefing y matriz (o /briefing KC)"),
+            ("matriz", "Matriz de decisión con los precios de ahora"), ("presupuesto", "Presupuesto semanal (o /presupuesto 66)"),
             ("ayuda", "Todas las órdenes")]
 AUTO_CADA_S = 30 * 60                 # v4.3: parlay.py auto cada 30 min
 AUTO_PRIMERA_S = 120                  # la primera, 2 min después de arrancar el servicio
@@ -456,6 +467,15 @@ def preparar_orden(texto, extra):
         if not re.fullmatch(r"[a-z]{2,3}", extra[0]):
             return None, "Dime el equipo con su abreviatura: /vigia KC (o /vigia solo para el próximo grupo de juegos)."
         return args + ["--equipo", extra[0].upper()], aviso
+    if texto == "/briefing" and extra:                 # v4.5 (68)
+        if not re.fullmatch(r"[a-z]{2,3}", extra[0]):
+            return None, "Dime el equipo con su abreviatura: /briefing KC (o /briefing solo para todos los partidos)."
+        return args + ["--equipo", extra[0].upper()], "Briefing de ese partido: imágenes y texto (≈1-6 min)."
+    if texto == "/presupuesto" and extra:              # v4.5 (68)
+        v = extra[0].replace(",", ".").lstrip("$")
+        if not re.fullmatch(r"\d{1,4}(\.\d{1,2})?", v) or not 1 <= float(v) <= 5000:
+            return None, "Dime el monto en USD por semana con un número: /presupuesto 66 (entre 1 y 5000)."
+        return args + ["--valor", v], aviso
     if texto == "/autopsia" and extra:
         if not re.fullmatch(r"\d{1,2}", extra[0]) or not 1 <= int(extra[0]) <= 22:
             return None, "Dime la semana con un número: /autopsia 7 (o /autopsia sola para la más reciente)."

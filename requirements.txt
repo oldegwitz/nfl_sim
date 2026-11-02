@@ -4,3 +4,5 @@ polars==1.44.2
 numba==0.68.0
 nflreadpy==0.1.5
 google-auth==2.59.1
+# v9.3 (2-nov-2026, decisión 68): la tarjeta del briefing
+matplotlib==3.11.2

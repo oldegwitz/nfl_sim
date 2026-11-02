@@ -24,6 +24,8 @@ Qué hace el modo 'registrar' (lo lanza semana.py en un proceso aparte, en cada 
 
 Uso
   venv/bin/python clima.py registrar --corrida 2026-11-01T16:35:00Z --juegos ID,ID   (lo usa semana.py)
+  venv/bin/python clima.py mostrar --juegos ID,ID   (v1.1, decisión 68: el clima del briefing del sábado; consulta igual
+                                                que registrar pero NO escribe el registro de #9 ni la caché de casos)
   venv/bin/python clima.py prueba              (sin red: NWS y Open-Meteo simulados, reglas de #9, registro temporal)
   venv/bin/python clima.py prueba --real       (1 consulta real a NWS y a Open-Meteo para un estadio de EE. UU. y uno
                                                 de fuera; no escribe en el registro)
@@ -51,7 +53,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_CLIMA = "clima-v1 (30-oct-2026)"
+VERSION_CLIMA = "clima-v1.1 (2-nov-2026)"   # v1.1 (68): modo mostrar (briefing, sin registro) y coordenadas a 0 km
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -647,10 +649,11 @@ def consultar_juego(cli, g, cache, ahora, corrida):
     return filas, est
 
 
-def registrar_juegos(juegos, corrida, ahora, cli, cache, ruta_pron=PRONOSTICO, ruta_casos=CASOS, plazo=PLAZO_TOTAL_S + 5):
+def registrar_juegos(juegos, corrida, ahora, cli, cache, ruta_pron=PRONOSTICO, ruta_casos=CASOS, plazo=PLAZO_TOTAL_S + 5,
+                     guardar=True):
     """Consulta todos los juegos (hasta HILOS a la vez, en hilos que no retienen el proceso), aplica la regla de #9 y
     guarda. A los 'plazo' segundos guarda lo que haya: los juegos sin respuesta quedan como «error: plazo». → (resumen,
-    mensaje)."""
+    mensaje). v1.1: con guardar=False (modo mostrar) no escribe nada y devuelve además los casos y las filas."""
     t0 = time.time()
     resultados, pendientes, candado = {}, list(juegos), threading.Lock()
 
@@ -690,8 +693,9 @@ def registrar_juegos(juegos, corrida, ahora, cli, cache, ruta_pron=PRONOSTICO, r
         c = decidir(g_, est, fs)
         c.update(corrida_utc=corrida, version=VERSION_CLIMA)
         casos.append(c)
-    _anexar(ruta_pron, CAMPOS_PRON, filas)
-    _anexar(ruta_casos, CAMPOS_CASOS, casos)
+    if guardar:
+        _anexar(ruta_pron, CAMPOS_PRON, filas)
+        _anexar(ruta_casos, CAMPOS_CASOS, casos)
     inicio = min(g["inicio"] for g in juegos)
     msg = mensaje_telegram(casos, por_juego, inicio)
     res = {"estado": "ok", "juegos": len(juegos), "segundos": round(time.time() - t0, 1),
@@ -703,7 +707,40 @@ def registrar_juegos(juegos, corrida, ahora, cli, cache, ruta_pron=PRONOSTICO, r
            "casos9": sum(c["caso9"] for c in casos if c["game_type"] == "REG"),
            "placebo9": sum(c["placebo9"] for c in casos if c["game_type"] == "REG"),
            "notables": sum(c["notable"] for c in casos), "mensaje": msg, "avisos": _AVISOS[-10:]}
-    return res, msg
+    return (res, msg) if guardar else (res, msg, casos, por_juego)
+
+
+def modo_mostrar(args):
+    """v1.1 (68): el clima de los juegos pedidos para el briefing. Misma consulta y misma decisión que registrar, pero
+    no escribe clima_pronostico.csv ni clima_casos.csv (#9 sigue siendo solo la T−85). Imprime «CLIMA_JSON {...}»."""
+    c = cfg()
+    if not c["activo"]:
+        print(JSON_MARCA + json.dumps({"estado": "apagado"}, ensure_ascii=False), flush=True)
+        return 0
+    ahora = t_utc(args.ahora) if args.ahora else dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    ids = [x.strip() for x in (args.juegos or "").split(",") if x.strip()]
+    juegos = [g for g in leer_juegos(ids) if g["inicio"] is not None]
+    if not juegos:
+        print(JSON_MARCA + json.dumps({"estado": "sin juegos", "pedidos": len(ids)}, ensure_ascii=False), flush=True)
+        return 0
+    cache = cargar_cache()
+    cli = Cliente(user_agent(c["contacto"]))
+    res, _, casos, por_juego = registrar_juegos(juegos, args.corrida or iso(ahora), ahora, cli, cache, guardar=False)
+    try:
+        guardar_cache(cache)                            # la caché de /points de NWS sí se guarda (no es el registro)
+    except Exception as e:  # noqa: BLE001
+        log(f"no pude guardar la caché de NWS ({type(e).__name__})")
+    salida = []
+    for cs in casos:
+        dec = next((f for f in por_juego.get(cs["game_id"], []) if f.get("fuente") and f.get("fuente") == cs["fuente_decide"]), {})
+        salida.append({k: cs.get(k) for k in ("game_id", "visita", "local", "estadio", "techo_tabla", "roof_t85", "al_aire_libre",
+                                              "fuente_decide", "viento_decide", "temp_c", "prob_lluvia", "notable")}
+                      | {"direccion": dec.get("direccion") or "", "cielo": dec.get("texto") or ""})
+    log(f"mostrar: {res['juegos']} juegos en {res['segundos']} s · NWS {res['nws_ok']}/{res['nws_total']} · "
+        f"Open-Meteo {res['om_ok']}/{res['om_total']} · notables {res['notables']} (sin registro)")
+    print(JSON_MARCA + json.dumps({"estado": "ok", "segundos": res["segundos"], "nws_ok": res["nws_ok"], "om_ok": res["om_ok"],
+                                   "juegos": salida}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 def modo_registrar(args):
@@ -869,7 +906,7 @@ def modo_coordenadas(args):
                 print(f"  REVISAR {e['stadium_id']} {e['nombre']}: NWS no respondió ({info['error']})")
                 continue
             okc = p["ciudad"] == e["ciudad"] or (p["ciudad"].split(", ")[-1] == e["ciudad"].split(", ")[-1]
-                                                  and (p.get("distancia_km") or 99) < 8)
+                                                  and (p["distancia_km"] if p.get("distancia_km") is not None else 99) < 8)
             mal += not okc
             print(f"  {'ok' if okc else 'REVISAR'} {e['stadium_id']} {e['nombre']}: NWS {p['ciudad']} a "
                   f"{_fmt(p.get('distancia_km'), 1)} km · rejilla {p['rejilla']} (esperado {e['ciudad']})")
@@ -1054,6 +1091,13 @@ def modo_prueba(args):
                   _juego_prueba("2026_08_X_DET", "Ford Field", "DET00", "dome", inicio),
                   _juego_prueba("2026_08_X_LON", "Wembley Stadium", "LON00", "outdoors", inicio, "Neutral"),
                   _juego_prueba("2026_08_X_NUEVO", "Estadio Desconocido", "ZZZ00", "outdoors", inicio, "Neutral")]
+        # v1.1 (68): el modo mostrar consulta y decide igual, pero no escribe nada
+        rp0, rc0 = Path(tmp) / "p0.csv", Path(tmp) / "c0.csv"
+        r0 = registrar_juegos(juegos, iso(ahora), ahora, Cliente(user_agent(), get=_ApiFalsa(inicio), dormir=lambda s: None),
+                              {}, rp0, rc0, guardar=False)
+        c0 = {c["game_id"]: c for c in r0[2]}
+        chk("mostrar (v1.1): no escribe el registro y decide igual (SEA notable)", len(r0) == 4 and not rp0.exists()
+            and not rc0.exists() and c0["2026_08_CHI_SEA"]["notable"] == 1 and c0["2026_08_X_DET"]["notable"] == 0)
         res, msg = registrar_juegos(juegos, iso(ahora), ahora, cli, cache, rp, rc)
         casos = {c["game_id"]: c for c in _leer(rc)}
         pron = _leer(rp)
@@ -1199,7 +1243,7 @@ def modo_prueba(args):
 # --------------------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Pronóstico del clima a T−85 (60d) y registro de #9 (60c)")
-    ap.add_argument("modo", choices=["registrar", "prueba", "coordenadas", "estado", "informe"])
+    ap.add_argument("modo", choices=["registrar", "mostrar", "prueba", "coordenadas", "estado", "informe"])
     ap.add_argument("--corrida")
     ap.add_argument("--juegos")
     ap.add_argument("--ahora")
@@ -1213,6 +1257,8 @@ def main(argv=None):
         pass
     if args.modo == "registrar":
         return modo_registrar(args)
+    if args.modo == "mostrar":                         # v1.1 (68)
+        return modo_mostrar(args)
     if args.modo == "prueba":
         return modo_prueba(args)
     if args.modo == "coordenadas":

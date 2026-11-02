@@ -82,7 +82,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v9.2 (30-oct-2026)"
+VERSION_SEMANA = "semana-v9.3 (2-nov-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -182,6 +182,18 @@ VERSION_SEMANA = "semana-v9.2 (30-oct-2026)"
 #       gamebook) y el conteo del movimiento tardío de la decisión 56 (solo cuántos casos; nunca la tasa).
 #     · El modo estado suma la línea del clima.
 #     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2, los vigías ni sus huellas.
+# v9.3 (2-nov, decisión 68 de Ozz, «Aprobado todo lo recomendado»: D1-D8; especificación en claude/registro_68_briefing_matriz.md):
+#     · Briefing nuevo (briefing.py): portada, por partido 2 imágenes a color y el texto (precios de Pinnacle sin vig contra
+#       BetOnline con EV y tope, la máquina, récord, casa y visita, racha, descanso, clima, choque, pérdidas, equipos
+#       especiales, QB mezclado y la prensa de Opus) y la matriz de decisión. Sale después de la corrida del sábado aunque
+#       Opus esté apagado, y con /briefing [EQUIPO].
+#     · A4 nuevo (huella nueva): opinión de 60 palabras y «qué mirar». El clima del briefing se consulta solo para mostrar
+#       (clima.py mostrar: no escribe el registro de #9), en paralelo con Opus.
+#     · Matriz final del domingo después de la primera T−85 automática de un grupo de las 13:00 ET o más tarde (solo lee:
+#       no gasta créditos de The Odds API ni toca 29A); modos matriz (/matriz) y presupuesto (/presupuesto N).
+#     · El informe semanal suma «Matriz contra lo apostado» (68). El modo estado suma la línea del briefing y la matriz.
+#     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2, A1, A3, los vigías ni sus
+#     huellas; si briefing.py falla, sale el texto del analista de v9.2.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -195,6 +207,8 @@ TABLERO = BASE / "tablero.py"                        # v8.4 (58): tablero tipo P
 TABLERO_TIMEOUT = 150                                # segundos; si se pasa, se corta y la corrida sigue
 CLIMA = BASE / "clima.py"                            # v9.2 (60d): pronóstico del clima a T−85 (descriptivo)
 CLIMA_TIMEOUT = 100                                  # segundos desde que se lanza (clima.py se corta solo a los 90)
+BRIEFING = BASE / "briefing.py"                      # v9.3 (68): briefing ampliado y matriz de decisión (descriptivo)
+BRIEFING_OPUS_MIN = 20                               # v9.3: /briefing con Opus no corre si toca una automática en ≤ 20 min
 CARACAS = ZoneInfo("America/Caracas")
 NUEVA_YORK = ZoneInfo("America/New_York")
 TEMPORADA = 2026
@@ -4983,17 +4997,19 @@ A4_SISTEMA = """You are an NFL analyst preparing a Saturday briefing in Spanish 
 For every game listed: (1) each team's position in this week's NFL.com power rankings and in this week's Pro Football
 Talk (PFT, nbcsports.com) power rankings; (2) the players ruled Out, Doubtful or placed on injured reserve in the final
 official injury report or official roster moves, and the starting quarterback's status if he is Questionable; (3) an
-opinion in Spanish of at most 35 words saying which team is more likely to win and why, using the lab data given and what
-you found. Rules: only facts from pages in your search results, each with its URL; never guess a ranking; never recommend
-a bet; the betting market already prices official injuries, so never present an injury as an edge. Write a plain report,
-one block per game, plus the URLs of the two power rankings."""
+opinion in Spanish of at most 60 words saying which team is more likely to win and why, using the lab data given and what
+you found; (4) "what to watch": in Spanish, at most 25 words, the one matchup or fact that will matter most in the game.
+Rules: only facts from pages in your search results, each with its URL; never guess a ranking; never recommend a bet; the
+betting market already prices official injuries, so never present an injury as an edge. Write a plain report, one block
+per game, plus the URLs of the two power rankings."""
 A4_USUARIO = """Today: {hoy} ET. NFL {temporada}, week {semana}.
 Lab data per game (our rank 1-32 = net EPA per play this season; form = last 2 games against the season average; market =
 Pinnacle no-vig win probability):
 {tabla}"""
 A4_EXTRAE = """Convert the briefing report below into JSON following the schema exactly. Copy rankings, names and URLs exactly as
 in the report; use 0 for a ranking the report does not give; keep a URL only if it appears in the SEARCH RESULT URLS list
-(otherwise leave it empty); opinions in Spanish, at most 35 words; do not add anything that is not in the report."""
+(otherwise leave it empty); opinions in Spanish, at most 60 words; "watch" in Spanish, at most 25 words; do not add
+anything that is not in the report."""
 A4_ESTADOS = ("out", "doubtful", "injured_reserve", "questionable", "suspended")
 FLECHAS = [(0.15, "↑↑"), (0.05, "↑"), (-0.05, "="), (-0.15, "↓")]
 
@@ -5008,8 +5024,9 @@ def a4_esquema(ids):
                          "injuries": {"type": "array", "items": baja}},
           "required": ["rank_nflcom", "rank_pft", "injuries"]}
     juego = {"type": "object", "additionalProperties": False,
-             "properties": {"game_id": {"type": "string", "enum": list(ids)}, "away": eq, "home": eq, "opinion": s},
-             "required": ["game_id", "away", "home", "opinion"]}
+             "properties": {"game_id": {"type": "string", "enum": list(ids)}, "away": eq, "home": eq, "opinion": s,
+                            "watch": s},
+             "required": ["game_id", "away", "home", "opinion", "watch"]}
     fuente = {"type": "object", "additionalProperties": False,
               "properties": {"outlet": {"type": "string", "enum": ["NFL.com", "PFT"]}, "url": s}, "required": ["outlet", "url"]}
     return {"type": "object", "additionalProperties": False,
@@ -5141,7 +5158,8 @@ def a4_leer(obj, ids, urls_n):
                     return None
                 return v if 1 <= v <= 32 and medio in fuentes else None
             d[lado] = dict(nflcom=rk(e.get("rank_nflcom"), "NFL.com"), pft=rk(e.get("rank_pft"), "PFT"), bajas=bajas)
-        d["opinion"] = re.sub(r"\s+", " ", _texto(g.get("opinion")))[:320]
+        d["opinion"] = re.sub(r"\s+", " ", _texto(g.get("opinion")))[:520]
+        d["mirar"] = re.sub(r"\s+", " ", _texto(g.get("watch")))[:220]                 # v9.3 (68)
         out[g["game_id"]] = d
     return out, fuentes, descartadas
 
@@ -5185,54 +5203,149 @@ def texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen):
     return "\n".join(lin)
 
 
-def briefing_correr(g26, ahora, estado, origen, sin_telegram=False, post=None):
-    """A4: datos del código + prensa y bajas con Opus (búsqueda y extracción con esquema). Solo juegos que no empezaron.
-    origen 'sabado' (automática, una vez por semana) o 'pedido' (/briefing, tope por día). Devuelve una línea de resumen."""
+def _modulo_briefing():
+    """v9.3 (68): briefing.py (en la misma carpeta). Sus funciones reciben este módulo como S."""
+    sys.path.insert(0, str(BASE))
+    import briefing as B
+    return B
+
+
+def clima_mostrar_lanzar(ids, momento):
+    """v9.3 (68): clima.py mostrar (NWS y Open-Meteo solo para el briefing; no escribe el registro de #9), en un proceso
+    aparte que corre en paralelo con Opus. Nunca frena ni cambia nada: si no arranca, el briefing sale sin clima."""
+    import subprocess
+    if not CLIMA.exists() or not ids:
+        return None
+    try:
+        p = subprocess.Popen([sys.executable, str(CLIMA), "mostrar", "--juegos", ",".join(ids), "--ahora", iso(momento)],
+                             cwd=str(BASE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except Exception as e:  # noqa: BLE001
+        log(f"clima (briefing): no pude lanzarlo ({type(e).__name__})")
+        return None
+    return {"p": p, "t0": time.time()}
+
+
+def clima_mostrar_leer(trab):
+    """Resultado de clima.py mostrar ({'estado': 'ok', 'juegos': [...]}) o None; espera a lo sumo CLIMA_TIMEOUT."""
+    import subprocess
+    if not trab:
+        return None
+    p = trab["p"]
+    try:
+        out, _ = p.communicate(timeout=max(1.0, CLIMA_TIMEOUT - (time.time() - trab["t0"])))
+    except subprocess.TimeoutExpired:
+        for fn in (p.terminate, p.kill):
+            try:
+                fn()
+                p.communicate(timeout=5)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        log(f"clima (briefing): tiempo agotado ({CLIMA_TIMEOUT} s); el briefing sale sin clima")
+        return {"estado": "tiempo agotado"}
+    except Exception as e:  # noqa: BLE001
+        log(f"clima (briefing): no pude leer su resultado ({type(e).__name__})")
+        return None
+    for lin in (out or "").splitlines():
+        if lin.startswith("CLIMA_JSON "):
+            try:
+                return json.loads(lin[len("CLIMA_JSON "):])
+            except ValueError:
+                break
+    log(f"clima (briefing): terminó sin resumen (código {p.returncode})")
+    return {"estado": "sin resumen"}
+
+
+def briefing_correr(g26, ahora, estado, origen, sin_telegram=False, post=None, equipo=None, sin_ia=False, bot_dir=None):
+    """A4 + briefing de 68: datos del código (briefing.py) + prensa y bajas con Opus (búsqueda y extracción con esquema).
+    Solo juegos que no empezaron. origen 'sabado' (automática, una vez por semana, aunque Opus esté apagado) o 'pedido'
+    (/briefing [EQUIPO], tope por día si consulta a Opus). sin_ia: sin Opus (prueba sin costo). Devuelve un resumen."""
     import polars as pl
     momento = e2_momento(ahora)
+    bot_dir = bot_dir or str(Path.home() / "nfl_ev")
     sem = semana_actual(g26, momento)
     if sem is None:
         return "No hay juegos por jugar."
     juegos = g26.filter((pl.col("week") == sem) & (pl.col("inicio") > momento)).sort(["inicio", "game_id"])
+    eq = (equipo or "").strip().upper() or None
+    if eq:
+        if eq not in EQUIPOS:
+            return f"No conozco el equipo {eq}. Usa la abreviatura de nflverse: KC, BUF, LA, WAS…"
+        juegos = juegos.filter((pl.col("home_team") == eq) | (pl.col("away_team") == eq))
+        if juegos.height == 0:
+            return f"{eq} no tiene un partido por empezar en la semana {sem}."
     if juegos.height == 0:
         return f"Semana {sem}: no quedan juegos por empezar."
+    usar_ia = not sin_ia and CLAUDE_LLAVE.exists() and claude_cfg()[0]
     hoy = momento.astimezone(CARACAS).date().isoformat()
-    if origen != "sabado":
+    if origen != "sabado" and usar_ia:
         usado = estado.setdefault("briefing_dia", {})
         for k in [k for k in usado if k != hoy]:
             usado.pop(k)
         if usado.get(hoy, 0) >= A4_MAX_DIA:
-            return f"Ya van {A4_MAX_DIA} /briefing hoy (tope por día). Prueba mañana."
+            return f"Ya van {A4_MAX_DIA} /briefing hoy con Opus (tope por día). Prueba mañana."
         usado[hoy] = usado.get(hoy, 0) + 1
     eqs = a4_equipos(g26, momento)
     filas = a4_tabla(sem, juegos, eqs, ultimas_proyecciones(sem), g26)
     ids = [f["game_id"] for f in filas]
+    trab_clima = clima_mostrar_lanzar(ids, momento)            # en paralelo con Opus
     ia, fuentes, costo, estado_ia, desc = {}, {}, 0.0, "no corrió", 0
-    resto, motivo = claude_cupo(ahora)
-    if resto >= A4_USD:
-        limite = time.time() + A4_PLAZO_S
-        reg = dict(agente="A4", origen=origen, huella=a4_huella(), game_id=f"semana-{sem}", momento=momento)
-        b = claude_post(a4_cuerpo(sem, filas, momento), limite - 120, {**reg, "paso": "busqueda", "reserva_usd": 1.5}, post)
-        costo = b["costo_usd"]
-        estado_ia = b["estado"]
-        if b["estado"] in ("ok", "cortada", "pausada") and b["texto"].strip():
-            urls = _urls_de(b["contenido"])
-            e = claude_post(a4_cuerpo_extraer(b["texto"], urls, ids), limite, {**reg, "paso": "extraccion", "reserva_usd": 0.4}, post)
-            costo += e["costo_usd"]
-            estado_ia = e["estado"] if e["estado"] != "ok" else ("ok" if b["estado"] == "ok" else f"búsqueda {b['estado']}")
-            if e["estado"] == "ok":
-                ia, fuentes, desc = a4_leer(_objeto_json(e["texto"]), set(ids), {_url_norm(u) for u in urls} - {""})
+    if usar_ia:
+        resto, motivo = claude_cupo(ahora)
+        if resto >= A4_USD:
+            limite = time.time() + A4_PLAZO_S
+            reg = dict(agente="A4", origen=origen, huella=a4_huella(), game_id=f"semana-{sem}" + (f"-{eq}" if eq else ""),
+                       momento=momento)
+            b = claude_post(a4_cuerpo(sem, filas, momento), limite - 120, {**reg, "paso": "busqueda", "reserva_usd": 1.5}, post)
+            costo = b["costo_usd"]
+            estado_ia = b["estado"]
+            if b["estado"] in ("ok", "cortada", "pausada") and b["texto"].strip():
+                urls = _urls_de(b["contenido"])
+                e = claude_post(a4_cuerpo_extraer(b["texto"], urls, ids), limite, {**reg, "paso": "extraccion", "reserva_usd": 0.4}, post)
+                costo += e["costo_usd"]
+                estado_ia = e["estado"] if e["estado"] != "ok" else ("ok" if b["estado"] == "ok" else f"búsqueda {b['estado']}")
+                if e["estado"] == "ok":
+                    ia, fuentes, desc = a4_leer(_objeto_json(e["texto"]), set(ids), {_url_norm(u) for u in urls} - {""})
+        else:
+            estado_ia = motivo or f"tope del día (quedan USD {resto:.2f})"
     else:
-        estado_ia = motivo or f"tope del día (quedan USD {resto:.2f})"
-    txt = texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen)
-    BRIEFINGS.mkdir(parents=True, exist_ok=True)
-    (BRIEFINGS / f"briefing_semana_{sem}_{momento.astimezone(CARACAS):%Y%m%d_%H%M}.txt").write_text(txt + "\n", encoding="utf-8")
-    enviar_tg(txt, sin_telegram)
+        estado_ia = "sin consulta (prueba sin costo)" if sin_ia else "apagado (sin llave de Claude o [claude_motor] activo = no)"
+    clima_res = clima_mostrar_leer(trab_clima)
+    try:
+        B = _modulo_briefing()
+        resumen, ruta, _env = B.briefing_enviar(sys.modules[__name__], g26, ahora, momento, sem, ids, ia, fuentes, costo,
+                                                estado_ia, origen, clima_res, bot_dir, sin_telegram, eq)
+    except Exception as e:  # noqa: BLE001
+        log(f"Briefing (68): error ({type(e).__name__}: {str(e)[:300]}); mando el texto del analista de v9.2")
+        txt = texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen)
+        BRIEFINGS.mkdir(parents=True, exist_ok=True)
+        (BRIEFINGS / f"briefing_semana_{sem}_{momento.astimezone(CARACAS):%Y%m%d_%H%M}.txt").write_text(txt + "\n", encoding="utf-8")
+        enviar_tg(txt, sin_telegram)
+        resumen = f"texto simple (briefing.py falló: {type(e).__name__})"
     if origen == "sabado":
         estado.setdefault("briefing", {})[str(sem)] = iso(ahora)
-    log(f"Analista (A4) semana {sem} ({origen}): {len(filas)} juegos · Opus {estado_ia} · {len(ia)} juegos con prensa · "
-        f"{desc} bajas descartadas sin URL · USD {costo:.4f}")
-    return f"Analista de la semana {sem}: {len(filas)} juegos; mensaje enviado (Opus: {estado_ia})."
+    log(f"Briefing (68) semana {sem} ({origen}{', ' + eq if eq else ''}): {resumen} · Opus {estado_ia} · {len(ia)} juegos con "
+        f"prensa · {desc} bajas descartadas sin URL · USD {costo:.4f}")
+    return f"Briefing de la semana {sem}{' (' + eq + ')' if eq else ''}: {resumen} (Opus: {estado_ia})."
+
+
+def matriz_correr(g26, ahora, estado, origen, bot_dir, sin_telegram=False):
+    """v9.3 (68): matriz sola ('final' del domingo o 'pedido' con /matriz). Solo lee el bot y los archivos del motor."""
+    B = _modulo_briefing()
+    txt, ruta = B.matriz_enviar(sys.modules[__name__], g26, ahora, origen, bot_dir, sin_telegram)
+    log(txt + (f" → {ruta.name}" if ruta else ""))
+    return txt
+
+
+def es_t85_domingo_tarde(lista):
+    """True si alguna T−85 de la lista es de un grupo del domingo que empieza a las 13:00 ET o más tarde."""
+    for tipo, clave, _ in lista:
+        t = t_utc(clave) if tipo == "t85" else None
+        if t is not None:
+            et = t.astimezone(NUEVA_YORK)
+            if et.weekday() == 6 and et.hour >= 13:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------- /vigia (63) y pruebas
@@ -6702,6 +6815,13 @@ def informe_semana(g26, semana, bot_dir, ahora):
         m56_tel, m56_txt = f"Movimiento tardío (56): no se pudo contar ({type(e).__name__}).", []
     if m56_tel:
         tel.append(m56_tel)
+    # ---- v9.3 (68): la matriz contra lo apostado (solo registro) ----
+    try:
+        sg_tel, _ = _modulo_briefing().seccion_seguimiento(sys.modules[__name__], g26, semana)
+    except Exception as e:  # noqa: BLE001
+        sg_tel = f"Matriz contra lo apostado (68): no se pudo armar ({type(e).__name__})."
+    if sg_tel:
+        tel.append(sg_tel)
     tel.append("Exceso = CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo (no favorito o "
                "favorito), mercado y semana (decide 29A, decisión 52). CLV sin vig = cuánto se movió la probabilidad justa de "
                "Pinnacle hacia el lado elegido, de la señal al cierre (46). Descriptivo: el veredicto se da al final de la "
@@ -6947,7 +7067,8 @@ def enviar_informe(g26, semana, bot_dir, ahora, estado, sin_telegram=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe",
-                                     "vigia-prueba", "tablero", "vigia-manual", "autopsia", "briefing", "claude-prueba"])
+                                     "vigia-prueba", "tablero", "vigia-manual", "autopsia", "briefing", "claude-prueba",
+                                     "matriz", "presupuesto"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
@@ -6959,6 +7080,8 @@ def main():
     ap.add_argument("--sin-hoja", action="store_true")
     ap.add_argument("--bot-dir", default=str(Path.home() / "nfl_ev"))
     ap.add_argument("--n-sims", type=int, default=N_SIMS)
+    ap.add_argument("--valor")                          # v9.3 (68): presupuesto --valor 66
+    ap.add_argument("--sin-ia", action="store_true")    # v9.3 (68): briefing sin consultar a Opus (prueba sin costo)
     args = ap.parse_args()
     if os.nice(0) < 10:
         os.nice(10 - os.nice(0))
@@ -7064,6 +7187,16 @@ def main():
             print(texto_clima_estado())                # v9.2 (60d)
         except Exception as e:  # noqa: BLE001
             print(f"Clima (60d): no pude leer su registro ({type(e).__name__})")
+        try:                                           # v9.3 (68)
+            B = _modulo_briefing()
+            monto, fuente_m = B.presupuesto(sys.modules[__name__])
+            cm = B.config_matriz(sys.modules[__name__])
+            print(f"Briefing y matriz (68): {B.VERSION_BRIEFING} · presupuesto USD {monto:.0f} ({fuente_m}) · "
+                  f"{'puntos comprados dentro del boleto' if cm['con_compras'] else 'puntos comprados aparte (precio estimado)'}"
+                  f" · briefing del sábado: semanas {sorted(estado.get('briefing', {}), key=int) or 'ninguna'} · matriz final: "
+                  f"semanas {sorted(estado.get('matriz_final', {}), key=int) or 'ninguna'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Briefing y matriz (68): no pude leer briefing.py ({type(e).__name__})")
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -7098,10 +7231,21 @@ def main():
             print(claude_autoprueba(g26))
         return
 
-    if args.modo in ("vigia-manual", "autopsia", "briefing"):   # v9: órdenes largas, nunca antes de una automática
-        cerca = automatica_cerca(g26, ahora, estado)
+    if args.modo == "presupuesto":                     # v9.3 (68): /presupuesto N (sin N: el vigente)
+        B = _modulo_briefing()
+        if args.valor:
+            print(B.fijar_presupuesto(sys.modules[__name__], args.valor.replace(",", "."), ahora))
+        else:
+            monto, fuente_m = B.presupuesto(sys.modules[__name__])
+            print(f"Presupuesto semanal de la matriz: USD {monto:.0f} ({fuente_m}). Para cambiarlo: /presupuesto 80")
+        return
+
+    if args.modo in ("vigia-manual", "autopsia", "briefing", "matriz"):   # v9: órdenes largas, nunca antes de una automática
+        con_opus = args.modo == "briefing" and not args.sin_ia and CLAUDE_LLAVE.exists() and claude_cfg()[0]
+        cerca = automatica_cerca(g26, ahora, estado, BRIEFING_OPUS_MIN if con_opus else None)   # v9.3: /briefing con Opus
+                                                                                              # dura hasta ~13 min
         if cerca and args.modo != "vigia-manual":
-            print(f"No corro ahora: en menos de {ANTES_AUTOMATICA_MIN} min toca la corrida automática "
+            print(f"No corro ahora: en menos de {BRIEFING_OPUS_MIN if con_opus else ANTES_AUTOMATICA_MIN} min toca la corrida automática "
                   f"({NOMBRE_CORRIDA.get(cerca[0], cerca[0])}), que es la que cuenta. Pídelo después de esa corrida.")
             return
         if args.modo == "vigia-manual":              # 63 (/vigia): la protección y los topes van dentro
@@ -7110,8 +7254,11 @@ def main():
             sem = args.semana or semana_reciente(g26)
             print("Todavía no hay juegos jugados." if sem is None else
                   autopsia_enviar(g26, sem, args.bot_dir, ahora, estado, "pedido", args.sin_telegram))
-        else:                                        # A4 a pedido (/briefing)
-            print(briefing_correr(g26, ahora, estado, "pedido", args.sin_telegram))
+        elif args.modo == "matriz":                  # v9.3 (68): /matriz (solo lee; segundos)
+            print(matriz_correr(g26, ahora, estado, "pedido", args.bot_dir, args.sin_telegram))
+        else:                                        # A4 a pedido (/briefing [EQUIPO]); v9.3: briefing de 68
+            print(briefing_correr(g26, ahora, estado, "pedido", args.sin_telegram, equipo=args.equipo, sin_ia=args.sin_ia,
+                                  bot_dir=args.bot_dir))
         guardar_estado(estado)
         return
 
@@ -7271,14 +7418,23 @@ def main():
                 log(f"Vigía-alineador Claude: no pude mandar el Telegram ({type(e).__name__})")
     clima_revisar(trab_clima, esperar=True, sin_telegram=args.sin_telegram)   # v9.2: a más tardar a los 100 s
     actualizar_tablero(", ".join(sorted({t for t, _, _ in lista})))   # v8.4 (58): al final, sin frenar nada
-    if (args.modo == "auto" and any(t == "sabado" for t, _, _ in lista) and CLAUDE_LLAVE.exists() and claude_cfg()[0]):
-        try:                                          # v9 (65, A4): analista del sábado, una vez por semana
-            sem_b = semana_actual(g26, ahora)
+    if args.modo == "auto" and any(t == "sabado" for t, _, _ in lista):
+        try:                                          # v9 (65, A4) y v9.3 (68): briefing del sábado, una vez por semana
+            sem_b = semana_actual(g26, ahora)         # (v9.3: sale aunque Opus esté apagado, sin la parte de la prensa)
             if sem_b is not None and str(sem_b) not in estado.get("briefing", {}):
-                briefing_correr(g26, ahora, estado, "sabado", args.sin_telegram)
+                briefing_correr(g26, ahora, estado, "sabado", args.sin_telegram, bot_dir=args.bot_dir)
                 guardar_estado(estado)
         except Exception as e:  # noqa: BLE001
-            log(f"Analista (A4): error ({type(e).__name__}: {str(e)[:300]})")
+            log(f"Briefing (68): error ({type(e).__name__}: {str(e)[:300]})")
+    if args.modo == "auto" and es_t85_domingo_tarde(lista):
+        try:                                          # v9.3 (68, D8 = a): matriz final del domingo, una vez por semana
+            sem_m = semana_actual(g26, ahora)
+            if sem_m is not None and str(sem_m) not in estado.get("matriz_final", {}):
+                matriz_correr(g26, ahora, estado, "final", args.bot_dir, args.sin_telegram)
+                estado.setdefault("matriz_final", {})[str(sem_m)] = iso(ahora)
+                guardar_estado(estado)
+        except Exception as e:  # noqa: BLE001
+            log(f"Matriz final (68): error ({type(e).__name__}: {str(e)[:300]})")
     log("== LISTO")
 
 

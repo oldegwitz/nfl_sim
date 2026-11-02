@@ -14,6 +14,9 @@ Uso (en ~/nfl_sim):
   venv/bin/python tablero.py --local DIR  calcula y deja las tablas en DIR (CSV), sin tocar Google
   venv/bin/python tablero.py estado       configuración y última corrida
 Lo llama semana.py (v8.4) al final de cada corrida, en un proceso aparte con límite de tiempo.
+v1.2 (decisión 68): datos_equipos suma las métricas del briefing (briefing.py, las mismas de H44) con claves «eq_*» y su
+puesto 1-32, más una fila «H44|eq_*» por métrica con su estabilidad (r y «se repite / a medias / casi suerte»). Si
+briefing.py no está o falla, el tablero sale igual que en v1.1.
 """
 from __future__ import annotations
 
@@ -33,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-VERSION = "tablero-v1.1 (20-oct-2026)"  # v1.1: etiqueta única por jugador y grupo (58) y puesto estable en los empates
+VERSION = "tablero-v1.2 (2-nov-2026)"  # v1.2: métricas del briefing (68) en datos_equipos · v1.1: etiqueta única por jugador y grupo (58) y puesto estable en los empates
 TEMPORADA = 2026
 
 BASE = Path(os.environ.get("NFL_SIM_BASE", str(Path.home() / "nfl_sim")))
@@ -701,11 +704,38 @@ PESTANAS = ["datos_meta", "datos_equipos", "datos_equipos_lista", "datos_partido
             "datos_juegos", "datos_jugadores_lista"]
 
 
+def filas_briefing() -> list:
+    """v1.2 (68): métricas del briefing en formato largo para datos_equipos (no cambia ninguna fila de v1.1)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import briefing as B
+    except Exception as e:  # noqa: BLE001
+        log(f"aviso: sin las métricas del briefing (no pude importar briefing.py: {type(e).__name__})")
+        return []
+    try:
+        ruta = bajar("pbp")
+        esquema = pl.read_parquet_schema(ruta)
+        p = pl.read_parquet(ruta, columns=[c for c in B.COLS_PBP if c in esquema])
+        vals, rk = B.metricas_equipos(p)
+    except Exception as e:  # noqa: BLE001
+        log(f"aviso: sin las métricas del briefing ({type(e).__name__}: {str(e)[:160]})")
+        return []
+    filas = []
+    for clave in B.SENTIDO:
+        k = f"eq_{clave}"
+        for t in EQUIPOS:
+            v = (vals.get(t) or {}).get(clave)
+            filas.append([f"{t}|{k}", t, k, r(v, 4), (rk.get(t) or {}).get(clave), B.valor_t(clave, v)])
+        filas.append([f"H44|{k}", "H44", k, B.ESTABILIDAD.get(clave), None, B.estab_txt(clave)])
+    return filas
+
+
 def tablas() -> dict:
     t0 = time.time()
     p, g = leer_pbp(), leer_games()
     nom, pos, pfr2gsis = nombres_jugadores()
     eq_largo, eq_lista, valores = tabla_equipos(p, g, nom)
+    eq_largo = eq_largo + filas_briefing()            # v1.2 (68)
     lideres, juegos = tabla_grupos(p, g, valores, nom, pos, pfr2gsis)
     partidos = tabla_partidos(g)
     semanas = sorted(int(w) for w in p["week"].unique().to_list() if w is not None)
