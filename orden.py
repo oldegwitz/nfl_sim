@@ -25,6 +25,11 @@ Escucha con long polling los mensajes del bot del motor y responde SOLO al chat 
   /matriz  → matriz de decisión con los precios de ahora (semana.py matriz; solo lee, segundos). Tampoco corre si en
              ≤ 12 min toca una automática.
   /presupuesto [N] → presupuesto semanal de la matriz en USD (D7); sin N muestra el vigente.
+  v4.6 (decisión 69; semana.py v9.4):
+  /bola    → cómo va la bola de nieve del boleto de 4 patas (escalón, lo que rueda, la temporada y el reparto del
+             presupuesto entre los boletos de 14, 12, 7 y 4 patas) (semana.py bola; segundos)
+  /bola nueva N → solo la próxima bola empieza con N USD · /bola cobrar → retiras lo que rueda y cierras la bola.
+             Los boletos de 12, 7 y 4 salen solos después de cada matriz; el de 4 se carga con un nombre «Bola…».
   Parlays (v4, decisión 42; parlay.py, descriptivo, no cuenta para nada):
   «Parlay» (v4.2, también «Teaser» o «Boleto») → el bot pregunta el nombre y el formato (botones PDF, Texto, Imagen) y
              espera ese formato: otro tipo de archivo se rechaza y sigue esperando; /cancelar sale. Se olvida a los 15 min.
@@ -59,7 +64,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "orden-v4.5 (2-nov-2026)"  # v4.5: /briefing EQUIPO, /matriz, /presupuesto (68) · v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto · v4.4: /vigia, /autopsia, /briefing
+VERSION = "orden-v4.6 (5-nov-2026)"  # v4.6: /bola (69) · v4.5: /briefing EQUIPO, /matriz, /presupuesto (68) · v2: /qb · v3: /piloto · v4: parlays · v4.1: PDF y texto · v4.2: «Parlay» con nombre y formato · v4.3: /parlay solo, /historico, menú, auto · v4.4: /vigia, /autopsia, /briefing
 BASE = Path(__file__).resolve().parent
 TOKEN = BASE / "credenciales" / "telegram_motor.token"
 CONFIG_BOT = Path.home() / "nfl_ev" / "config.ini"
@@ -93,9 +98,10 @@ ORDENES = {
     "/briefing": (["briefing"], "Briefing de los juegos que faltan: imágenes, texto y matriz (≈1-2 min; con Opus, hasta ~12 min)."),
     "/matriz": (["matriz"], "Matriz de decisión con los precios de ahora (segundos)."),
     "/presupuesto": (["presupuesto"], None),
+    "/bola": (["bola"], None),               # v4.6 (69)
 }
 VARIANTES = ("g1", "g1-low", "g1-texto", "g1-high")
-SALIDA_COMPLETA = ("/qb", "/estado", "/piloto", "/presupuesto")
+SALIDA_COMPLETA = ("/qb", "/estado", "/piloto", "/presupuesto", "/bola")
 # v4: órdenes de parlay.py → (argumentos, ¿lleva número?, ¿lleva equipo?)
 ORDENES_PARLAY = {
     "/parlays": (["lista"], False, False),
@@ -118,6 +124,7 @@ AYUDA = ("Motor nfl_sim · órdenes:\n"
          "/briefing — briefing de los juegos que faltan: imágenes, texto y matriz; /briefing KC para un partido\n"
          "/matriz — matriz de decisión con los precios de ahora (ML, spread y puntos comprados contra Pinnacle)\n"
          "/presupuesto — presupuesto semanal de la matriz; /presupuesto 66 para cambiarlo\n"
+         "/bola — boletos 12 · 7 · 4 y la bola del de 4: escalón y lo que rueda; /bola nueva 20 (solo la próxima) · /bola cobrar\n"
          "Parlays (cada semana NFL empieza otra vez en «Parlay 1»):\n"
          "/parlay — cargar uno nuevo: te pregunto el nombre y el formato (PDF, texto o imagen); /cancelar sale.\n"
          "   También escribiendo «Parlay», o mandando el boleto directo como foto, PDF o texto. /si lo guarda, /no lo descarta\n"
@@ -136,6 +143,7 @@ COMANDOS = [("parlay", "Cargar un boleto nuevo (o /parlay 2 para ver cómo va)")
             ("piloto", "Motor: piloto del agente Gemini"), ("vigia", "Motor: vigías a pedido (o /vigia KC); no cuenta"),
             ("autopsia", "Por qué perdieron los favoritos (o /autopsia 7)"), ("briefing", "Briefing y matriz (o /briefing KC)"),
             ("matriz", "Matriz de decisión con los precios de ahora"), ("presupuesto", "Presupuesto semanal (o /presupuesto 66)"),
+            ("bola", "Bola de nieve del boleto de 4 (o /bola cobrar)"),
             ("ayuda", "Todas las órdenes")]
 AUTO_CADA_S = 30 * 60                 # v4.3: parlay.py auto cada 30 min
 AUTO_PRIMERA_S = 120                  # la primera, 2 min después de arrancar el servicio
@@ -476,6 +484,15 @@ def preparar_orden(texto, extra):
         if not re.fullmatch(r"\d{1,4}(\.\d{1,2})?", v) or not 1 <= float(v) <= 5000:
             return None, "Dime el monto en USD por semana con un número: /presupuesto 66 (entre 1 y 5000)."
         return args + ["--valor", v], aviso
+    if texto == "/bola" and extra:                     # v4.6 (69): /bola nueva N · /bola cobrar
+        if extra[0] == "cobrar":
+            return args + ["--accion", "cobrar"], aviso
+        if extra[0] == "nueva":
+            v = (extra[1] if len(extra) > 1 else "").replace(",", ".").lstrip("$")
+            if not re.fullmatch(r"\d{1,4}(\.\d{1,2})?", v) or not 1 <= float(v) <= 5000:
+                return None, "Dime el monto en USD con un número: /bola nueva 10 (entre 1 y 5000)."
+            return args + ["--accion", "nueva", "--valor", v], aviso
+        return None, "Usa /bola (cómo va), /bola nueva 10 (monto de la próxima bola) o /bola cobrar (cerrar la bola)."
     if texto == "/autopsia" and extra:
         if not re.fullmatch(r"\d{1,2}", extra[0]) or not 1 <= int(extra[0]) <= 22:
             return None, "Dime la semana con un número: /autopsia 7 (o /autopsia sola para la más reciente)."
@@ -542,7 +559,7 @@ def main():
             crudo = (msg.get("text") or "").strip()
             partes = crudo.split()
             texto = partes[0].split("@")[0].lower() if partes else ""
-            extra = [x.lower() for x in partes[1:2]]
+            extra = [x.lower() for x in partes[1:3 if texto == "/bola" else 2]]   # v4.6: /bola nueva N lleva dos
             if not texto:
                 if msg.get("document") or msg.get("sticker") or msg.get("video"):
                     tg.enviar(chat, "Para un boleto, mándamelo como foto (JPG o PNG), PDF o texto. /ayuda muestra las órdenes.")

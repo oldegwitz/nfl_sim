@@ -11,6 +11,9 @@ Lo usa semana.py (v9.3); no es un modelo: no cambia s2-v1, la proyección, 31A, 
     comparado con «todo ML» y «todo más barato» (probabilidad de cobrar, pago, EV y costo esperado en USD).
   · Tarjeta a color en 2 imágenes por partido (matplotlib) y textos HTML para Telegram (solo el primero suena).
   · Seguimiento para el informe del lunes: lo que sugería la matriz frente a lo apostado (parlays_2026.json).
+  · v1.1 (decisión 69, 4-nov-2026): el presupuesto semanal (D7) se reparte entre 4 boletos: 14, 12, 7 y 4 patas
+    (Ozz: «Más al de 4» = 10 : 10 : 16 : 30). El boleto de 14 usa su parte; los de 12, 7 y 4 los arma bola.py.
+    Con semana.ini [matriz] reparto = no, todo queda como en briefing-v1 (los 66 / el presupuesto entero en el de 14).
 
 Las funciones reciben el módulo de semana.py como S (sin importarlo aquí: así no se duplica ni se cruza la importación).
 
@@ -28,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION_BRIEFING = "briefing-v1 (2-nov-2026)"
+VERSION_BRIEFING = "briefing-v1.1 (5-nov-2026)"   # v1.1 (69): el presupuesto semanal se reparte entre los boletos de 14, 12, 7 y 4 patas
 
 # --------------------------------------------------------------------------------------------------------------------
 # H44 congelada (registro 68): r de Pearson entre las semanas 1-8 y 10-18 de la misma temporada, 2016-2025, n 320.
@@ -86,6 +89,7 @@ MAX_COMPRA = 4.5                              # puntos comprados como máximo
 MAX_COMPRAS_FAV, MAX_COMPRAS_DOG = 3, 1         # líneas con puntos comprados que se muestran por lado
 CENTAVOS_MEDIO_PUNTO = 10                     # ESTIMACIÓN de BetOnline (H47, 2 boletos); P7-bis la reemplaza (semana.ini)
 PRESUPUESTO_OMISION = 66.0                    # D7: USD por semana mientras Ozz no diga el monto
+REPARTO_PESOS = {14: 10, 12: 10, 7: 16, 4: 30}   # 69 (Ozz, 4-nov: «Más al de 4»); semana.ini [matriz] pesos = 14:10,12:10,7:16,4:30
 TOPE_PAGO = 150_000.0                         # tope de pago de BetOnline en parlays
 COLS_PBP = ["game_id", "play_id", "season_type", "week", "posteam", "defteam", "home_team", "away_team", "pass", "rush",
             "epa", "success", "yards_gained", "sack", "interception", "fumble", "fumble_lost", "fumble_out_of_bounds",
@@ -616,9 +620,17 @@ def config_matriz(S):
     pres = num(sec.get("presupuesto_usd", "")) if sec else None
     cent = num(sec.get("centavos_medio_punto", "")) if sec else None
     si = lambda k, d: str(sec.get(k, d)).strip().lower() in ("si", "sí", "1", "true", "yes") if sec else d == "si"  # noqa: E731
+    pesos = dict(REPARTO_PESOS)
+    if sec and sec.get("pesos"):                     # v1.1 (69): pesos = 14:10,12:10,7:16,4:30
+        try:
+            leidos = {int(k): float(v) for k, v in (x.split(":") for x in str(sec.get("pesos")).replace(" ", "").split(","))}
+            if set(leidos) == set(REPARTO_PESOS) and all(v >= 0 for v in leidos.values()) and sum(leidos.values()) > 0:
+                pesos = leidos
+        except Exception:  # noqa: BLE001
+            pass
     return dict(presupuesto_ini=pres, centavos=cent if cent is not None and 0 <= cent <= 50 else CENTAVOS_MEDIO_PUNTO,
                 activo=si("activo", "si"), con_compras=si("compras_en_boleto", "no"),
-                centavos_medidos=cent is not None)
+                centavos_medidos=cent is not None, reparto=si("reparto", "si"), pesos=pesos)
 
 
 def presupuesto(S):
@@ -636,6 +648,37 @@ def presupuesto(S):
     return PRESUPUESTO_OMISION, "por omisión: falta el monto de D7"
 
 
+def partes_de(total, pesos):
+    """USD enteros por boleto, proporcionales a los pesos y que suman el total (resto mayor)."""
+    s = sum(pesos.values())
+    crudo = {k: total * v / s for k, v in pesos.items()}
+    base = {k: math.floor(x + 1e-9) for k, x in crudo.items()}
+    falta = int(round(total - sum(base.values())))
+    for k in sorted(crudo, key=lambda k: (-(crudo[k] - base[k]), -k))[:max(0, falta)]:
+        base[k] += 1
+    return base
+
+
+def reparto(S):
+    """v1.1 (69): {'total', 'fuente', 'activo', 'partes': {14: USD, 12: USD, 7: USD, 4: USD}}. Con reparto = no, el
+    boleto de 14 lleva el presupuesto entero (como briefing-v1) y los demás 0."""
+    total, fuente = presupuesto(S)
+    cfg = config_matriz(S)
+    if not cfg["reparto"]:
+        return dict(total=total, fuente=fuente, activo=False, partes={14: total, 12: 0, 7: 0, 4: 0})
+    if abs(total - round(total)) > 1e-9:
+        s = sum(cfg["pesos"].values())
+        partes = {k: round(total * v / s, 2) for k, v in cfg["pesos"].items()}
+    else:
+        partes = partes_de(int(round(total)), cfg["pesos"])
+    return dict(total=total, fuente=fuente, activo=True, partes=partes)
+
+
+def reparto_txt(r):
+    p = r["partes"]
+    return " · ".join(f"{k} patas USD {coma(p[k], 0) if p[k] == int(p[k]) else coma(p[k], 2)}" for k in (14, 12, 7, 4))
+
+
 def fijar_presupuesto(S, valor, ahora):
     v = num(valor)
     if v is None or not 1 <= v <= 5000:
@@ -647,7 +690,9 @@ def fijar_presupuesto(S, valor, ahora):
                                "ts": S.iso(ahora)}, ensure_ascii=False), encoding="utf-8")
     tmp.replace(d / "presupuesto.json")
     S.log(f"Matriz: presupuesto semanal fijado en USD {v:.2f} (/presupuesto)")
-    return f"Listo: presupuesto semanal USD {coma(v, 2).replace(',00', '')}. La matriz lo usa desde ahora (costo esperado y pago)."
+    r = reparto(S)
+    return (f"Listo: presupuesto semanal USD {coma(v, 2).replace(',00', '')}. La matriz lo usa desde ahora (costo esperado y pago)"
+            + (f"; reparto (69): {reparto_txt(r)}." if r["activo"] else "."))
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1102,15 +1147,17 @@ def boleto_txt(nombre, b, monto):
             f"{usd(b['costo'], 2)} · {b['ok']} ✅ {b['aviso']} ⚠️ {b['mal']} ❌")
 
 
-def texto_matriz(W, ctxs, momento, monto, fuente_monto, cambios=None, sin_ref=()):
+def texto_matriz(W, ctxs, momento, monto, fuente_monto, cambios=None, sin_ref=(), total=None):
     S = W.S
     jm = [c for c in ctxs if c.get("F")]
     bol = boletos_matriz(jm, monto)
     hora = W.ahora.astimezone(S.CARACAS)
     lin = [f"<b>🧮 MATRIZ DE DECISIÓN · semana {W.sem} · {NOMBRE_MOMENTO.get(momento, momento)}</b>",
            f"Partidos de domingo y lunes que no empezaron · corrida de las {hora:%H:%M} (Caracas) con la última foto del bot "
-           f"(Pinnacle de ≤ 3 h y BetOnline de ≤ 12 h; cada partido avisa si no) · presupuesto USD {coma(monto, 0)} "
-           f"({h(fuente_monto)}; se cambia con /presupuesto N).",
+           f"(Pinnacle de ≤ 3 h y BetOnline de ≤ 12 h; cada partido avisa si no) · "
+           + (f"presupuesto USD {coma(monto, 0)} ({h(fuente_monto)}; se cambia con /presupuesto N)." if total is None else
+              f"a este boleto le tocan USD {coma(monto, 0)} de los USD {coma(total, 0)} de la semana ({h(fuente_monto)}; "
+              f"reparto de 69 entre los boletos de 14, 12, 7 y 4 patas; se cambia con /presupuesto N)."),
            "Regla (68, escrita antes): ✅ costo hasta 2 % · ⚠️ 2-3 % · ❌ más de 3 % · ⏳ alerta abierta: revisar en la T−85. Puntos "
            "comprados: solo si cruzan el 3, el 7 o el 10 (6 y 14 en favoritos grandes) y el boleto los paga al tope o mejor. "
            "Nunca dos patas del mismo partido. El costo decide; la máquina y los rankings pesan 0."]
@@ -1164,7 +1211,7 @@ def forma_json(f):
     return {k: (round(v, 5) if isinstance(v, float) else v) for k, v in f.items()}
 
 
-def guardar_matriz(W, ctxs, momento, monto, bol):
+def guardar_matriz(W, ctxs, momento, monto, bol, total=None):
     d = dir_matriz(W.S)
     d.mkdir(parents=True, exist_ok=True)
     nombre = (f"matriz_semana_{W.sem}_{momento}.json" if momento in ("sabado", "final")
@@ -1179,6 +1226,9 @@ def guardar_matriz(W, ctxs, momento, monto, bol):
                               clima_notable="clima notable" in c["alertas"])
                          for c in ctxs if c.get("F")],
                  boletos={k: v for k, v in bol.items() if k != "n"})
+    if total is not None:                               # v1.1 (69): presupuesto de la semana y el reparto
+        datos["presupuesto_semana"] = total
+        datos["reparto"] = {str(k): v for k, v in reparto(W.S)["partes"].items()}
     tmp = d / (nombre + ".tmp")
     tmp.write_text(json.dumps(datos, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(d / nombre)
@@ -1654,10 +1704,12 @@ def _briefing_cuerpo(S, W, ctxs, env, sem, momento, origen, estado_ia, fuentes, 
             jm = [c for c in ctxs if c.get("F") and S._dia_et({"weekday": None, "inicio": c["inicio"]}) in S.DIAS_BOLETO]
             if jm and W.cfg["activo"]:
                 monto, fuente_m = presupuesto(S)
+                rp = reparto(S)                            # v1.1 (69)
+                monto, total = (rp["partes"][14], rp["total"]) if rp["activo"] else (monto, None)
                 momento_m = "sabado" if origen == "sabado" else "pedido"
                 txt, bol = texto_matriz(W, jm, momento_m, monto, fuente_m,
-                                        sin_ref=[x for x in sin_ref if x in {c["gid"] for c in ctxs}])
-                ruta_m = guardar_matriz(W, jm, momento_m, monto, bol)
+                                        sin_ref=[x for x in sin_ref if x in {c["gid"] for c in ctxs}], total=total)
+                ruta_m = guardar_matriz(W, jm, momento_m, monto, bol, total)
                 textos.append(txt)
                 env.texto(txt)
         except Exception as e:  # noqa: BLE001
@@ -1705,11 +1757,13 @@ def matriz_enviar(S, g26, ahora, origen, bot_dir, sin_telegram=False, post=None)
             c["alertas"] = [x if x != "clima notable" else "clima notable (del sábado)" for x in c["alertas"]]
         ctxs.append(c)
     monto, fuente_m = presupuesto(S)
+    rp = reparto(S)                                        # v1.1 (69)
+    monto, total = (rp["partes"][14], rp["total"]) if rp["activo"] else (monto, None)
     cambios = cambios_desde(sab, ctxs) if origen == "final" else None
-    txt, bol = texto_matriz(W, ctxs, origen, monto, fuente_m, cambios, sin_ref)
+    txt, bol = texto_matriz(W, ctxs, origen, monto, fuente_m, cambios, sin_ref, total=total)
     env = Envio(S, sin_telegram, post)
     env.texto(txt)
-    ruta = guardar_matriz(W, ctxs, origen, monto, bol)
+    ruta = guardar_matriz(W, ctxs, origen, monto, bol, total)
     s = bol["sugerido"]
     return (f"Matriz {NOMBRE_MOMENTO.get(origen, origen)} de la semana {sem}: {len(ctxs)} juegos"
             + (f" · sugerido cobra {pct(s['p'])}, EV {ev_t(s['ev'])}" if s else "")
@@ -1851,6 +1905,9 @@ def prueba():
     bt = boleto(pat, 66)
     chequeo("EV con el tope de pago y empates (exacto)", bt["tope"] and abs(bt["ev"] - (exacto - 1)) < 1e-12, ev_t(bt["ev"]))
     chequeo("partir mensajes", all(len(x) <= 3900 for x in partir(("línea\n" * 2000) + "\n\n" + "x" * 5000)))
+    chequeo("reparto 69 con USD 150 (Más al de 4)", partes_de(150, REPARTO_PESOS) == {14: 23, 12: 23, 7: 36, 4: 68})
+    chequeo("reparto 69 con USD 66", partes_de(66, REPARTO_PESOS) == {14: 10, 12: 10, 7: 16, 4: 30})
+    chequeo("reparto suma el total (1 a 5000)", all(sum(partes_de(n, REPARTO_PESOS).values()) == n for n in range(1, 5001)))
     try:
         import matplotlib  # noqa: F401
         chequeo("matplotlib instalado", True, matplotlib.__version__)

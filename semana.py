@@ -82,7 +82,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION_SEMANA = "semana-v9.3 (2-nov-2026)"
+VERSION_SEMANA = "semana-v9.4 (5-nov-2026)"
 # v3: la pestaña semanal no combina celdas a través del borde de las columnas inmovilizadas A-B (Sheets lo
 #     rechazaba con 400 en la primera corrida real); el error de Sheets ahora trae el mensaje de Google;
 #     'hoja-prueba' crea y borra una pestaña de prueba con el mismo formato que las semanales.
@@ -194,6 +194,17 @@ VERSION_SEMANA = "semana-v9.3 (2-nov-2026)"
 #     · El informe semanal suma «Matriz contra lo apostado» (68). El modo estado suma la línea del briefing y la matriz.
 #     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2, A1, A3, los vigías ni sus
 #     huellas; si briefing.py falla, sale el texto del analista de v9.2.
+# v9.4 (5-nov, decisión 69 de Ozz, aprobada el 4-nov y ajustada el mismo día: «12-7-4», «Solo el de 4», reparto «Más al
+#     de 4» y presupuesto USD 150; especificación en claude/registro_69_bola_nieve.md):
+#     · Boletos de 12, 7 y 4 patas (bola.py): después de cada matriz (sábado, final del domingo, /matriz y /briefing) sale
+#       un mensaje aparte con las patas más probables que pasan la regla (✅ o ⚠️, misma forma que la matriz de 14) y los
+#       tres boletos anidados; el de 4 es la bola de nieve (escalera de 4, la base vuelve al primer cobro).
+#     · El presupuesto semanal se reparte entre los boletos de 14, 12, 7 y 4 patas (briefing-v1.1): el de 14 usa su parte.
+#       Con semana.ini [matriz] reparto = no, la matriz de 14 queda como en v9.3.
+#     · Estado reconstruido desde los boletos «Bola…» de Telegram y las órdenes /bola nueva N y /bola cobrar (modo bola).
+#     · El informe semanal suma «Bola de nieve» y el modo estado su línea.
+#     No cambian la proyección, s2-v1, el consenso del QB, las selecciones, el boleto, g1, e2, A1, A3, A4, los vigías ni
+#     sus huellas. Si bola.py falla, se anota en el log y nada más cambia.
 BASE = Path(__file__).resolve().parent
 DATOS = BASE / "datos"
 SAL = BASE / "salidas" / "semana"
@@ -209,6 +220,7 @@ CLIMA = BASE / "clima.py"                            # v9.2 (60d): pronóstico d
 CLIMA_TIMEOUT = 100                                  # segundos desde que se lanza (clima.py se corta solo a los 90)
 BRIEFING = BASE / "briefing.py"                      # v9.3 (68): briefing ampliado y matriz de decisión (descriptivo)
 BRIEFING_OPUS_MIN = 20                               # v9.3: /briefing con Opus no corre si toca una automática en ≤ 20 min
+BOLA = BASE / "bola.py"                              # v9.4 (69): bola de nieve de 3-4 patas (descriptivo)
 CARACAS = ZoneInfo("America/Caracas")
 NUEVA_YORK = ZoneInfo("America/New_York")
 TEMPORADA = 2026
@@ -5210,6 +5222,31 @@ def _modulo_briefing():
     return B
 
 
+def _modulo_bola():
+    """v9.4 (69): bola.py (en la misma carpeta). Sus funciones reciben este módulo como S y briefing.py como B."""
+    sys.path.insert(0, str(BASE))
+    import bola as BL
+    return BL
+
+
+def temporada_cerrada(g26, ahora):
+    """v9.4 (69): True si ya no quedan juegos de la temporada regular por empezar (la bola cierra lo que esté rodando)."""
+    sem = semana_actual(g26, ahora)
+    return sem is None or sem > 18
+
+
+def bola_tras_matriz(g26, ruta_matriz, ahora, sin_telegram=False):
+    """v9.4 (69): mensaje de la bola de nieve después de una matriz ya enviada y guardada. Nunca frena ni cambia nada:
+    si algo falla, se anota en el log."""
+    if not ruta_matriz or not Path(ruta_matriz).exists():
+        return
+    try:
+        BL = _modulo_bola()
+        log(f"Bola (69): {BL.tras_matriz(sys.modules[__name__], _modulo_briefing(), ruta_matriz, ahora, sin_telegram, cerrada_temporada=temporada_cerrada(g26, ahora))}")
+    except Exception as e:  # noqa: BLE001
+        log(f"Bola (69): error ({type(e).__name__}: {str(e)[:300]})")
+
+
 def clima_mostrar_lanzar(ids, momento):
     """v9.3 (68): clima.py mostrar (NWS y Open-Meteo solo para el briefing; no escribe el registro de #9), en un proceso
     aparte que corre en paralelo con Opus. Nunca frena ni cambia nada: si no arranca, el briefing sale sin clima."""
@@ -5311,10 +5348,12 @@ def briefing_correr(g26, ahora, estado, origen, sin_telegram=False, post=None, e
     else:
         estado_ia = "sin consulta (prueba sin costo)" if sin_ia else "apagado (sin llave de Claude o [claude_motor] activo = no)"
     clima_res = clima_mostrar_leer(trab_clima)
+    briefing_ok = False                                # v9.4 (69)
     try:
         B = _modulo_briefing()
         resumen, ruta, _env = B.briefing_enviar(sys.modules[__name__], g26, ahora, momento, sem, ids, ia, fuentes, costo,
                                                 estado_ia, origen, clima_res, bot_dir, sin_telegram, eq)
+        briefing_ok = True
     except Exception as e:  # noqa: BLE001
         log(f"Briefing (68): error ({type(e).__name__}: {str(e)[:300]}); mando el texto del analista de v9.2")
         txt = texto_briefing(sem, filas, ia, fuentes, eqs, costo, estado_ia, origen)
@@ -5322,6 +5361,14 @@ def briefing_correr(g26, ahora, estado, origen, sin_telegram=False, post=None, e
         (BRIEFINGS / f"briefing_semana_{sem}_{momento.astimezone(CARACAS):%Y%m%d_%H%M}.txt").write_text(txt + "\n", encoding="utf-8")
         enviar_tg(txt, sin_telegram)
         resumen = f"texto simple (briefing.py falló: {type(e).__name__})"
+    if briefing_ok and not eq:                         # v9.4 (69): la bola, después de la matriz que acaba de salir
+        try:
+            ruta_m = SAL / "matriz" / (f"matriz_semana_{sem}_sabado.json" if origen == "sabado" else
+                                       f"matriz_semana_{sem}_pedido_{ahora.astimezone(CARACAS):%Y%m%d_%H%M}.json")
+            if ruta_m.exists() and json.loads(ruta_m.read_text(encoding="utf-8")).get("corrida_utc") == iso(ahora):
+                bola_tras_matriz(g26, ruta_m, ahora, sin_telegram)
+        except Exception as e:  # noqa: BLE001
+            log(f"Bola (69): error ({type(e).__name__}: {str(e)[:300]})")
     if origen == "sabado":
         estado.setdefault("briefing", {})[str(sem)] = iso(ahora)
     log(f"Briefing (68) semana {sem} ({origen}{', ' + eq if eq else ''}): {resumen} · Opus {estado_ia} · {len(ia)} juegos con "
@@ -5334,6 +5381,7 @@ def matriz_correr(g26, ahora, estado, origen, bot_dir, sin_telegram=False):
     B = _modulo_briefing()
     txt, ruta = B.matriz_enviar(sys.modules[__name__], g26, ahora, origen, bot_dir, sin_telegram)
     log(txt + (f" → {ruta.name}" if ruta else ""))
+    bola_tras_matriz(g26, ruta, ahora, sin_telegram)   # v9.4 (69): mensaje aparte, después de la matriz; nunca la frena
     return txt
 
 
@@ -6822,6 +6870,14 @@ def informe_semana(g26, semana, bot_dir, ahora):
         sg_tel = f"Matriz contra lo apostado (68): no se pudo armar ({type(e).__name__})."
     if sg_tel:
         tel.append(sg_tel)
+    # ---- v9.4 (69): la bola de nieve (solo registro) ----
+    try:
+        bn_tel, bn_txt = _modulo_bola().seccion_informe(sys.modules[__name__], semana,
+                                                        cerrada_temporada=temporada_cerrada(g26, ahora))
+    except Exception as e:  # noqa: BLE001
+        bn_tel, bn_txt = f"Bola de nieve (69): no se pudo armar ({type(e).__name__}).", []
+    if bn_tel:
+        tel.append(bn_tel)
     tel.append("Exceso = CLV sin vig de la selección menos el CLV sin vig medio de los lados del mismo tipo (no favorito o "
                "favorito), mercado y semana (decide 29A, decisión 52). CLV sin vig = cuánto se movió la probabilidad justa de "
                "Pinnacle hacia el lado elegido, de la señal al cierre (46). Descriptivo: el veredicto se da al final de la "
@@ -7068,7 +7124,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("modo", choices=["auto", "estado", "correr", "retro", "hoja", "qb", "hoja-prueba", "gemini-piloto", "informe",
                                      "vigia-prueba", "tablero", "vigia-manual", "autopsia", "briefing", "claude-prueba",
-                                     "matriz", "presupuesto"])
+                                     "matriz", "presupuesto", "bola"])
     ap.add_argument("--variante", choices=sorted(GEMINI_VARIANTES))
     ap.add_argument("--semana", type=int)
     ap.add_argument("--juegos")
@@ -7082,6 +7138,7 @@ def main():
     ap.add_argument("--n-sims", type=int, default=N_SIMS)
     ap.add_argument("--valor")                          # v9.3 (68): presupuesto --valor 66
     ap.add_argument("--sin-ia", action="store_true")    # v9.3 (68): briefing sin consultar a Opus (prueba sin costo)
+    ap.add_argument("--accion", choices=["nueva", "cobrar"])   # v9.4 (69): bola --accion nueva --valor 10 / --accion cobrar
     args = ap.parse_args()
     if os.nice(0) < 10:
         os.nice(10 - os.nice(0))
@@ -7197,6 +7254,10 @@ def main():
                   f"semanas {sorted(estado.get('matriz_final', {}), key=int) or 'ninguna'}")
         except Exception as e:  # noqa: BLE001
             print(f"Briefing y matriz (68): no pude leer briefing.py ({type(e).__name__})")
+        try:                                           # v9.4 (69)
+            print(_modulo_bola().linea_estado(sys.modules[__name__]))
+        except Exception as e:  # noqa: BLE001
+            print(f"Bola de nieve (69): no pude leer bola.py ({type(e).__name__})")
         inf = estado.get("informes", {})
         print("Informes de CLV enviados (v8.1): " + (", ".join(f"semana {k} ({fecha_cc(t_utc(v))})" for k, v in sorted(inf.items(), key=lambda kv: int(kv[0])))
                                                      if inf else "ninguno todavía (el primero sale cuando cierre la semana 5)"))
@@ -7238,6 +7299,17 @@ def main():
         else:
             monto, fuente_m = B.presupuesto(sys.modules[__name__])
             print(f"Presupuesto semanal de la matriz: USD {monto:.0f} ({fuente_m}). Para cambiarlo: /presupuesto 80")
+            rp = B.reparto(sys.modules[__name__])          # v9.4 (69)
+            if rp["activo"]:
+                print(f"Reparto (69): {B.reparto_txt(rp)} (la bola).")
+        return
+
+    if args.modo == "bola":                            # v9.4 (69): /bola, /bola nueva N, /bola cobrar (segundos)
+        BL = _modulo_bola()
+        if args.accion:
+            print(BL.accion(sys.modules[__name__], args.accion, args.valor, ahora))
+        else:
+            print(BL.texto_estado(sys.modules[__name__], cerrada_temporada=temporada_cerrada(g26, ahora)))
         return
 
     if args.modo in ("vigia-manual", "autopsia", "briefing", "matriz"):   # v9: órdenes largas, nunca antes de una automática
