@@ -1,7 +1,7 @@
 # Unidad de USUARIO del bot de órdenes del motor (decisión 70: EC2 compartida, usuario nflbot, sin sudo).
 # La instala ~/nfl_sim/instalar_servicios.sh en ~/.config/systemd/user/ (se edita aquí, en Git, y se reinstala).
-# Tope: MemoryMax 1G sin swap (antes 1536M). Una corrida pedida por /correr corre dentro de esta unidad: medido en la
-# réplica (10-nov) ≤ 763 MiB la corrida más pesada y ≤ 165 MiB el tablero. El tope de todo NFL lo pone el slice del usuario.
+# Tope: MemoryMax 1200M sin swap (antes 1536M). Una corrida pedida por /correr corre dentro de esta unidad: medido en la
+# réplica (10-nov) ≤ 763 MiB la corrida más pesada y ≤ 165 MiB el tablero. El tope de todo NFL (1,5 GiB) lo pone el slice.
 # Ver:  systemctl --user status nfl-sim-orden   ·   tail -n 30 ~/nfl_sim/salidas/semana/orden.log
 [Unit]
 Description=Motor nfl_sim: órdenes por Telegram (bot del motor; responde solo al chat de Ozz) · usuario nflbot
@@ -14,7 +14,7 @@ Restart=always
 RestartSec=30
 Nice=10
 CPUWeight=20
-MemoryMax=1G
+MemoryMax=1200M
 MemorySwapMax=0
 StandardOutput=append:%h/nfl_sim/salidas/semana/orden.log
 StandardError=append:%h/nfl_sim/salidas/semana/orden.log

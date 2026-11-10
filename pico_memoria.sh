@@ -2,7 +2,7 @@
 # pico_memoria.sh — decisión 70: lo llama nfl-sim-semana.service al terminar cada corrida (ExecStopPost=-, así que si falla
 #   no afecta a la corrida). Anota en salidas/semana/semana.log el pico de memoria de la corrida tal como lo cuenta su tope
 #   (cgroup: el motor, el tablero, el clima y todo lo que lance), solo en las corridas reales (≥ 300 MiB) o si terminó mal
-#   (por ejemplo «oom-kill»). Sirve para medir con datos de la EC2 si el tope de 1 GB alcanza. No toca nada más.
+#   (por ejemplo «oom-kill»). Sirve para medir con datos de la EC2 si el tope de la unidad alcanza. No toca nada más.
 R="${NFL_CGROUP_RAIZ:-/sys/fs/cgroup}"
 cg="$(sed -n 's/^0:://p' /proc/self/cgroup)"
 [ -n "${NFL_CGROUP_RAIZ:-}" ] && cg=""

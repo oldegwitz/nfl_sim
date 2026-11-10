@@ -12,11 +12,12 @@ EV="${NFL_EV_DIR:-$HOME/nfl_ev}"
 UD="$HOME/.config/systemd/user"
 USUARIO="${NFL_USUARIO:-nflbot}"
 S2=baad72c6a5dc0054a7de22a79c88616f                     # s2-v1 congelado (31A)
-# Topes acordados (decisión 70): unidad → MemoryMax en bytes; slice del usuario: MemoryHigh 1,1G, MemoryMax 1,25G, 1 vCPU
-declare -A TOPE=([nfl-ev-bot.service]=367001600 [nfl-sim-orden.service]=1073741824 [nfl-sim-semana.service]=1073741824)
+# Topes acordados (decisión 70, 10-nov: «igual que Bot Binance»): unidad → MemoryMax en bytes; slice del usuario:
+# MemoryHigh 1380M, MemoryMax 1536M (1,5 GiB), 1 vCPU, CPUWeight 100. Valores múltiplos de 4 KiB: el kernel los guarda tal cual
+declare -A TOPE=([nfl-ev-bot.service]=367001600 [nfl-sim-orden.service]=1258291200 [nfl-sim-semana.service]=1258291200)
 # lo que el kernel debe tener en cada unidad activa: memory.max memory.high memory.swap.max cpu.weight
-declare -A KERNEL=([nfl-ev-bot.service]="367001600 262144000 157286400 50" [nfl-sim-orden.service]="1073741824 max 0 20")
-SLICE_HIGH=1181116006; SLICE_MAX=1342177280; SLICE_CPU=1s; SLICE_PESO=50
+declare -A KERNEL=([nfl-ev-bot.service]="367001600 262144000 157286400 50" [nfl-sim-orden.service]="1258291200 max 0 20")
+SLICE_HIGH=1447034880; SLICE_MAX=1610612736; SLICE_CPU=1s; SLICE_PESO=100
 ARRANCAN="nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer"
 
 FALLOS=0
@@ -160,7 +161,7 @@ SL="user-$UIDN.slice"
 h="$(systemctl show "$SL" -p MemoryHigh --value)"; m="$(systemctl show "$SL" -p MemoryMax --value)"; c="$(systemctl show "$SL" -p CPUQuotaPerSecUSec --value)"; w="$(systemctl show "$SL" -p CPUWeight --value)"
 kh="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.high" 2>/dev/null)"; km="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.max" 2>/dev/null)"
 [ "$h" = "$SLICE_HIGH" ] && [ "$m" = "$SLICE_MAX" ] && [ "$c" = "$SLICE_CPU" ] && [ "$w" = "$SLICE_PESO" ] && [ "$kh" = "$SLICE_HIGH" ] && [ "$km" = "$SLICE_MAX" ] \
-  && ok "tope de todo NFL ($SL, en el kernel): MemoryHigh $((h / 1048576)) MiB · MemoryMax $((m / 1048576)) MiB · CPU $c por segundo (1 vCPU) · peso $w" \
+  && ok "tope de todo NFL ($SL, en el kernel): MemoryHigh $((h / 1048576)) MiB · MemoryMax $((m / 1048576)) MiB · CPU $c por segundo (1 vCPU) · peso $w (igual que Bot Binance)" \
   || mal "$SL: MemoryHigh «$h»/«$kh» MemoryMax «$m»/«$km» CPU «$c» peso «$w» (esperado $SLICE_HIGH / $SLICE_MAX / $SLICE_CPU / $SLICE_PESO)"
 cur="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.current" 2>/dev/null || echo 0)"; pk="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.peak" 2>/dev/null || echo 0)"
 ok "memoria de NFL ahora $((cur / 1048576)) MiB · pico desde que arrancó $((pk / 1048576)) MiB"
