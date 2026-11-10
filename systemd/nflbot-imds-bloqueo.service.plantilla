@@ -1,0 +1,24 @@
+# Unidad del SISTEMA (la instala el administrador, no nflbot): bloquea al usuario nflbot el servicio de metadatos de la EC2
+# (el rol de IAM de la instancia es de IC y cualquier usuario local podría usarlo). Copia de bnbot-imds-bloqueo.service
+# (Bot Binance) con el usuario cambiado. NFLBOT_UID se reemplaza por  id -u nflbot  al instalarla.
+# En la EC2 se instaló así (paso B1 de la decisión 70), a partir de la de Bot Binance:
+#   sed -e 's/bnbot/nflbot/g' -e 's/Bot Binance/NFL/' -e "s/1001/$(id -u nflbot)/g" /etc/systemd/system/bnbot-imds-bloqueo.service | sudo tee /etc/systemd/system/nflbot-imds-bloqueo.service
+# Si algún día falta la de Bot Binance:
+#   sed "s/NFLBOT_UID/$(id -u nflbot)/g" ~/nfl_sim/systemd/nflbot-imds-bloqueo.service.plantilla | grep -v '^#' | sudo tee /etc/systemd/system/nflbot-imds-bloqueo.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nflbot-imds-bloqueo.service
+[Unit]
+Description=NFL: bloquea al usuario nflbot el servicio de metadatos de EC2
+After=network-pre.target
+Wants=network-pre.target
+Before=network.target user-runtime-dir@NFLBOT_UID.service user@NFLBOT_UID.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -w -C OUTPUT -d 169.254.169.254/32 -m owner --uid-owner nflbot -j REJECT 2>/dev/null || iptables -w -I OUTPUT 1 -d 169.254.169.254/32 -m owner --uid-owner nflbot -j REJECT'
+ExecStart=-/bin/sh -c 'ip6tables -w -C OUTPUT -d fd00:ec2::254/128 -m owner --uid-owner nflbot -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 -d fd00:ec2::254/128 -m owner --uid-owner nflbot -j REJECT'
+ExecStop=/bin/sh -c 'while iptables -w -D OUTPUT -d 169.254.169.254/32 -m owner --uid-owner nflbot -j REJECT 2>/dev/null; do :; done'
+ExecStop=-/bin/sh -c 'while ip6tables -w -D OUTPUT -d fd00:ec2::254/128 -m owner --uid-owner nflbot -j REJECT 2>/dev/null; do :; done'
+
+[Install]
+WantedBy=multi-user.target

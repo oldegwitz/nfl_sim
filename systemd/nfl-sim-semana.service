@@ -1,0 +1,19 @@
+# Unidad de USUARIO de la corrida del motor s2-v1 en modo registro (31A). La lanza nfl-sim-semana.timer cada 5 min;
+# semana.py decide si toca algo (miércoles y sábado 10:15 Caracas, T−85 de cada grupo, cierre de resultados).
+# Decisión 70: usuario nflbot, sin sudo. Tope MemoryMax 1G sin swap (antes 1536M): medido en la réplica (10-nov)
+# sábado de 13 juegos 763 MiB, T−85 de 8 juegos 694 MiB y tablero 165 MiB; nunca tocó un tope duro de 1 GiB.
+# Ver:  systemctl --user list-timers   ·   tail -n 30 ~/nfl_sim/salidas/semana/semana.log
+[Unit]
+Description=Motor nfl_sim s2-v1: corrida semanal en modo registro (31A) · usuario nflbot
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/nfl_sim
+ExecStart=%h/nfl_sim/venv/bin/python -u %h/nfl_sim/semana.py auto
+Nice=10
+CPUWeight=20
+MemoryMax=1G
+MemorySwapMax=0
+TimeoutStartSec=900
+StandardOutput=append:%h/nfl_sim/salidas/semana/semana.log
+StandardError=append:%h/nfl_sim/salidas/semana/semana.log

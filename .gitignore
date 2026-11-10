@@ -1,5 +1,6 @@
-# Lista blanca (Orden 4): solo código y documentación del motor.
-# venv/, datos/, salidas/, CSV, JSON (incluida la futura cuenta de servicio), logs fuera.
+# Lista blanca (Orden 4; anclada en la raíz desde la decisión 70): solo código, documentación y unidades de systemd.
+# Nunca entran: venv/, datos/, salidas/, respaldos/, credenciales/, semana.ini, CSV, JSON, logs, llaves.
+# Revisar con:  git check-ignore -v <archivo>   (todo lo que lee el servicio debe salir ignorado, salvo el código)
 *
 !*/
 !.gitignore
@@ -7,7 +8,12 @@
 !*.sh
 !*.md
 !requirements*.txt
-venv/
-datos/
-salidas/
+!/systemd/*.service
+!/systemd/*.timer
+!/systemd/*.plantilla
+/venv/
+/datos/
+/salidas/
+/respaldos/
+/credenciales/
 __pycache__/

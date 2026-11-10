@@ -1,0 +1,11 @@
+# Temporizador de USUARIO (decisión 70). Igual al anterior del sistema: cada 5 min (hora de la EC2, UTC).
+[Unit]
+Description=Cada 5 min: ¿toca correr el motor? (miércoles y sábado 10:15 Caracas, T-85 de cada grupo, reajustes)
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=20s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
