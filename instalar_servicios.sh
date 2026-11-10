@@ -14,7 +14,9 @@ USUARIO="${NFL_USUARIO:-nflbot}"
 S2=baad72c6a5dc0054a7de22a79c88616f                     # s2-v1 congelado (31A)
 # Topes acordados (decisión 70): unidad → MemoryMax en bytes; slice del usuario: MemoryHigh 1,1G, MemoryMax 1,25G, 1 vCPU
 declare -A TOPE=([nfl-ev-bot.service]=367001600 [nfl-sim-orden.service]=1073741824 [nfl-sim-semana.service]=1073741824)
-SLICE_HIGH=1181116006; SLICE_MAX=1342177280; SLICE_CPU=1s
+# lo que el kernel debe tener en cada unidad activa: memory.max memory.high memory.swap.max cpu.weight
+declare -A KERNEL=([nfl-ev-bot.service]="367001600 262144000 157286400 50" [nfl-sim-orden.service]="1073741824 max 0 20")
+SLICE_HIGH=1181116006; SLICE_MAX=1342177280; SLICE_CPU=1s; SLICE_PESO=50
 ARRANCAN="nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer"
 
 FALLOS=0
@@ -33,6 +35,17 @@ user_ok() {   # el administrador de servicios del usuario responde (linger + ses
   [ -n "${XDG_RUNTIME_DIR:-}" ] || export XDG_RUNTIME_DIR="/run/user/$(id -u)"
   loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes' || alto "falta el linger de $(id -un) (paso B1: sudo loginctl enable-linger $(id -un))."
   systemctl --user show-environment >/dev/null 2>&1 || alto "systemctl --user no responde (entra de nuevo con «EC2 nfl» y repite)."
+}
+
+viejas_ok() {   # las unidades VIEJAS del sistema (usuario ubuntu): paradas y que no vuelvan al reiniciar
+  VIEJAS_MAL=""
+  local u e
+  for u in nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer nfl-sim-semana.service; do
+    systemctl is-active --quiet "$u" 2>/dev/null && VIEJAS_MAL="$VIEJAS_MAL $u activa;"
+    e="$(systemctl is-enabled "$u" 2>/dev/null)"
+    case "$e" in enabled|enabled-runtime|alias|linked|linked-runtime) VIEJAS_MAL="$VIEJAS_MAL $u habilitada (volvería al reiniciar);" ;; esac
+  done
+  [ -z "$VIEJAS_MAL" ]
 }
 
 # ------------------------------------------------------------------------------------------ venvs
@@ -90,10 +103,8 @@ if [ "$MODO" = arrancar ]; then
     [ -s "$f" ] || alto "falta ${f#$HOME/}: primero el paso B3 (copiar los datos con migrar_datos.sh)."
   done
   ok "datos y secretos en su lugar"
-  for u in nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer nfl-sim-semana.service; do
-    systemctl is-active --quiet "$u" 2>/dev/null && alto "la unidad VIEJA del sistema $u sigue activa (dos bots leerían el mismo Telegram). Párala con «EC2 admin» (paso B3)."
-  done
-  ok "las unidades viejas del sistema están paradas"
+  viejas_ok || alto "$VIEJAS_MAL (dos bots leerían el mismo Telegram). Con «EC2 admin»: sudo systemctl disable --now nfl-sim-semana.timer nfl-sim-orden.service nfl-ev-bot.service"
+  ok "las unidades viejas del sistema están paradas y deshabilitadas"
   [ "$(md5 "$SIM/sprint2.py")" = "$S2" ] || alto "sprint2.py no es s2-v1."
   ok "s2-v1 intacto ($S2)"
   [ -x "$SIM/venv/bin/python" ] && [ -x "$EV/venv/bin/python" ] || alto "faltan los venvs: bash ~/nfl_sim/instalar_servicios.sh venvs"
@@ -116,40 +127,55 @@ fi
 user_ok
 UIDN="$(id -u)"
 echo "-- 1. usuario"
-sudo -n true 2>/dev/null && mal "$(id -un) tiene sudo" || ok "$(id -un) (uid $UIDN) sin sudo"
 G="$(id -nG)"
-echo " $G " | grep -Eq ' (sudo|admin|adm|wheel|docker|lxd|systemd-journal) ' && mal "grupos con poderes: $G" || ok "grupos: $G"
-echo "-- 2. servicios como $(id -un) y con su tope"
+echo " $G " | grep -Eq ' (sudo|admin|adm|wheel|docker|lxd|systemd-journal) ' && mal "grupos con poderes: $G" || ok "$(id -un) (uid $UIDN), grupos: $G (sin sudo ni docker)"
+hm="$(stat -c '%a' "$HOME")"
+case "$hm" in 700|750) ok "~ en $hm (nadie más entra)" ;; *) mal "~ en $hm (debe ser 750)" ;; esac
+viejas_ok && ok "unidades viejas del sistema paradas y deshabilitadas" || mal "unidades viejas:$VIEJAS_MAL"
+echo "-- 2. servicios como $(id -un) y con su tope (lo que aplica el kernel, no solo lo escrito)"
+CTRL="$(cat "/sys/fs/cgroup/user.slice/user-$UIDN.slice/user@$UIDN.service/cgroup.controllers" 2>/dev/null)"
+echo " $CTRL " | grep -q ' memory ' && echo " $CTRL " | grep -q ' cpu ' && ok "controladores delegados al usuario: $CTRL" || mal "controladores delegados: «$CTRL» (faltan memory o cpu: los topes de las unidades no se aplicarían)"
 for u in nfl-ev-bot.service nfl-sim-orden.service; do
   pid="$(systemctl --user show "$u" -p MainPID --value)"
   dueno="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
   [ "$(systemctl --user is-active "$u")" = active ] && [ "$dueno" = "$(id -un)" ] && ok "$u activa, proceso $pid de $dueno" || mal "$u: $(systemctl --user is-active "$u") · dueño «$dueno»"
-done
-[ "$(systemctl --user is-active nfl-sim-semana.timer)" = active ] && ok "nfl-sim-semana.timer activo · próxima $(systemctl --user list-timers nfl-sim-semana.timer --no-legend | awk '{print $2, $3}')" || mal "nfl-sim-semana.timer no está activo"
-r="$(systemctl --user show nfl-sim-semana.service -p Result --value)"
-[ "$r" = success ] && ok "última corrida del motor: $r" || mal "última corrida del motor: $r (mira el final de salidas/semana/semana.log)"
-for u in "${!TOPE[@]}"; do
   cg="$(systemctl --user show "$u" -p ControlGroup --value)"
-  puesto="$(systemctl --user show "$u" -p MemoryMax --value)"
-  en_kernel="$( [ -n "$cg" ] && cat "/sys/fs/cgroup$cg/memory.max" 2>/dev/null || echo "-")"
-  if [ "$puesto" = "${TOPE[$u]}" ] && { [ "$en_kernel" = "${TOPE[$u]}" ] || [ "$en_kernel" = "-" ]; }; then
-    ok "$u: MemoryMax $((puesto / 1048576)) MiB$( [ "$en_kernel" != "-" ] && echo " (aplicado por el kernel)" || echo " (se aplica en cada corrida)")"
+  if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.max" ]; then
+    k="$(cat "/sys/fs/cgroup$cg/memory.max" "/sys/fs/cgroup$cg/memory.high" "/sys/fs/cgroup$cg/memory.swap.max" "/sys/fs/cgroup$cg/cpu.weight" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    [ "$k" = "${KERNEL[$u]}" ] && ok "$u en el kernel: max $(( ${TOPE[$u]} / 1048576 )) MiB · high/swap/peso «$(echo "$k" | cut -d' ' -f2-)»" \
+      || mal "$u en el kernel: «$k» (esperado «${KERNEL[$u]}»: memory.max memory.high memory.swap.max cpu.weight)"
   else
-    mal "$u: MemoryMax «$puesto», kernel «$en_kernel», esperado ${TOPE[$u]}"
+    mal "$u: no encuentro su cgroup ($cg): el tope no se puede comprobar"
   fi
 done
+[ "$(systemctl --user show nfl-sim-semana.service -p MemoryMax --value)" = "${TOPE[nfl-sim-semana.service]}" ] && ok "nfl-sim-semana.service: MemoryMax $(( ${TOPE[nfl-sim-semana.service]} / 1048576 )) MiB (se aplica en cada corrida; el pico queda en semana.log)" \
+  || mal "nfl-sim-semana.service: MemoryMax «$(systemctl --user show nfl-sim-semana.service -p MemoryMax --value)»"
+[ "$(systemctl --user is-active nfl-sim-semana.timer)" = active ] && ok "nfl-sim-semana.timer activo · próxima $(systemctl --user list-timers nfl-sim-semana.timer --no-legend | awk '{print $2, $3}')" || mal "nfl-sim-semana.timer no está activo"
+ult="$(systemctl --user show nfl-sim-semana.service -p ExecMainExitTimestamp --value)"
+r="$(systemctl --user show nfl-sim-semana.service -p Result --value)"
+if [ -z "$ult" ] || [ "$ult" = n/a ]; then echo "AVISO el motor todavía no corrió como $(id -un) (el temporizador lo lanza cada 5 min; repite la prueba después)"
+elif [ "$r" = success ]; then ok "última corrida del motor: $ult · $r"
+else mal "última corrida del motor: $ult · $r (mira el final de salidas/semana/semana.log)"; fi
 SL="user-$UIDN.slice"
-h="$(systemctl show "$SL" -p MemoryHigh --value)"; m="$(systemctl show "$SL" -p MemoryMax --value)"; c="$(systemctl show "$SL" -p CPUQuotaPerSecUSec --value)"
-[ "$h" = "$SLICE_HIGH" ] && [ "$m" = "$SLICE_MAX" ] && [ "$c" = "$SLICE_CPU" ] && ok "tope de todo NFL ($SL): MemoryHigh $((h / 1048576)) MiB · MemoryMax $((m / 1048576)) MiB · CPU $c por segundo (1 vCPU)" \
-  || mal "$SL: MemoryHigh «$h» MemoryMax «$m» CPU «$c» (esperado $SLICE_HIGH / $SLICE_MAX / $SLICE_CPU)"
+h="$(systemctl show "$SL" -p MemoryHigh --value)"; m="$(systemctl show "$SL" -p MemoryMax --value)"; c="$(systemctl show "$SL" -p CPUQuotaPerSecUSec --value)"; w="$(systemctl show "$SL" -p CPUWeight --value)"
+kh="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.high" 2>/dev/null)"; km="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.max" 2>/dev/null)"
+[ "$h" = "$SLICE_HIGH" ] && [ "$m" = "$SLICE_MAX" ] && [ "$c" = "$SLICE_CPU" ] && [ "$w" = "$SLICE_PESO" ] && [ "$kh" = "$SLICE_HIGH" ] && [ "$km" = "$SLICE_MAX" ] \
+  && ok "tope de todo NFL ($SL, en el kernel): MemoryHigh $((h / 1048576)) MiB · MemoryMax $((m / 1048576)) MiB · CPU $c por segundo (1 vCPU) · peso $w" \
+  || mal "$SL: MemoryHigh «$h»/«$kh» MemoryMax «$m»/«$km» CPU «$c» peso «$w» (esperado $SLICE_HIGH / $SLICE_MAX / $SLICE_CPU / $SLICE_PESO)"
 cur="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.current" 2>/dev/null || echo 0)"; pk="$(cat "/sys/fs/cgroup/user.slice/$SL/memory.peak" 2>/dev/null || echo 0)"
 ok "memoria de NFL ahora $((cur / 1048576)) MiB · pico desde que arrancó $((pk / 1048576)) MiB"
+up="$(grep -a 'pico de memoria' "$SIM/salidas/semana/semana.log" 2>/dev/null | tail -n 1 | sed 's/^\[[^]]*\] //')"
+[ -n "$up" ] && ok "última corrida real: $up" || echo "AVISO todavía no hay una corrida real del motor como $(id -un) (al terminar, su pico queda en semana.log)"
 echo "-- 3. aislamiento"
-for d in /home/ubuntu /home/bnbot; do
-  if [ ! -e "$d" ]; then ok "$d no existe"; elif ls "$d" >/dev/null 2>&1; then mal "$(id -un) PUEDE leer $d"; else ok "$(id -un) no puede leer $d"; fi
+for d in /home/ubuntu /home/bnbot /home/traccar; do
+  if [ ! -e "$d" ]; then ok "$d no existe"
+  elif ls "$d" >/dev/null 2>&1 || [ -x "$d" ]; then mal "$(id -un) puede entrar o leer $d ($(stat -c '%a' "$d"))"
+  else ok "$(id -un) no puede entrar a $d"; fi
 done
 curl -s -m 4 -o /dev/null -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token; e=$?
-[ "$e" = 7 ] && ok "servicio de metadatos bloqueado (rechazado)" || mal "servicio de metadatos: curl salió con $e (7 = bloqueado)"
+[ "$e" = 7 ] && ok "servicio de metadatos (IPv4) bloqueado: rechazado" || mal "servicio de metadatos (IPv4): curl salió con $e (7 = bloqueado)"
+curl -s -g -m 4 -o /dev/null -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" "http://[fd00:ec2::254]/latest/api/token"; e=$?
+[ "$e" != 0 ] && ok "servicio de metadatos (IPv6): no responde (curl $e)" || mal "servicio de metadatos (IPv6) RESPONDE a $(id -un)"
 echo "-- 4. Git y secretos"
 for r in "$SIM" "$EV"; do
   n="$(basename "$r")"
@@ -174,19 +200,25 @@ for f in config.ini lineas_log.csv historico venv; do
   [ -e "$EV/$f" ] || continue
   git -C "$EV" check-ignore -q "$f" && ok "nfl_ev/$f fuera de Git" || mal "nfl_ev/$f NO está ignorado"
 done
-for f in "$EV/config.ini" "$SIM/semana.ini" "$SIM"/credenciales/*; do
+nsec=0
+for f in "$EV/config.ini" "$SIM/semana.ini" "$SIM"/credenciales/* "$SIM"/respaldos/*/semana.ini; do
   [ -e "$f" ] || continue
   pm="$(stat -c '%a %U' "$f")"
-  [ "$pm" = "600 $(id -un)" ] && ok "${f#$HOME/}: 600, de $(id -un)" || mal "${f#$HOME/}: $pm (debe ser 600 $(id -un))"
+  if [ "$pm" = "600 $(id -un)" ]; then nsec=$((nsec + 1)); else mal "${f#$HOME/}: $pm (debe ser 600 $(id -un))"; fi
 done
+ok "$nsec secretos en 600 y de $(id -un) (config.ini, semana.ini y sus copias en respaldos/, credenciales/)"
 [ "$(stat -c '%a' "$SIM/credenciales" 2>/dev/null)" = 700 ] && ok "credenciales/: 700" || mal "credenciales/: $(stat -c '%a' "$SIM/credenciales" 2>/dev/null)"
 echo "-- 5. el motor y Telegram"
 [ "$(md5 "$SIM/sprint2.py")" = "$S2" ] && ok "s2-v1 intacto ($S2)" || mal "sprint2.py no es s2-v1"
-est="$(cd "$SIM" && nice -n 10 venv/bin/python semana.py estado 2>&1)"
+for i in 1 2 3 4 5 6; do
+  est="$(cd "$SIM" && nice -n 10 venv/bin/python semana.py estado 2>&1)"
+  echo "$est" | grep -q "Ya hay una corrida" || break
+  sleep 15
+done
 echo "$est" | grep -q "Hoja: conectada" && ok "semana.py estado: $(echo "$est" | head -n 1 | cut -c1-90) · hoja conectada" || mal "semana.py estado: $(echo "$est" | grep -m1 -E 'Hoja|Error|Ya hay' | cut -c1-140)"
 tg="$("$SIM/venv/bin/python" - "$EV/config.ini" "$SIM/credenciales/telegram_motor.token" 2>&1 <<'PY'
 import configparser, sys, requests
-c = configparser.ConfigParser(); c.read(sys.argv[1])
+c = configparser.ConfigParser(inline_comment_prefixes=("#", ";")); c.read(sys.argv[1])
 toks = [("bot nfl-ev-bot", c.get("telegram", "token", fallback="").strip())]
 try:
     toks.append(("bot del motor", open(sys.argv[2]).read().strip()))

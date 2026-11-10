@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # migrar_datos.sh — decisión 70, paso B3: copia los DATOS y los SECRETOS de NFL de /home/ubuntu a /home/nflbot.
-#   Lo corre el administrador («EC2 admin»), con las unidades viejas YA paradas:   sudo bash /home/nflbot/nfl_sim/migrar_datos.sh
+#   Lo corre el administrador («EC2 admin»), con las unidades viejas YA paradas y deshabilitadas, desde una copia de root
+#   (así nflbot no puede cambiarlo mientras corre):
+#     sudo install -o root -g root -m 700 /home/nflbot/nfl_sim/migrar_datos.sh /root/migrar_datos.sh && sudo bash /root/migrar_datos.sh
 #   · El código NO se copia: llega con git clone/pull. Antes de copiar revisa que el código de /home/ubuntu sea el que
 #     subió a GitHub (v9.4 a909269 y el legado edf285d); si no, se perdería algo y para.
 #   · Copia todo lo demás (datos/, salidas/, respaldos/, credenciales/, semana.ini, config.ini, historico/, lineas_log.csv…)
-#     sin venv/, .git/ ni __pycache__/, con dueño nflbot y los permisos de origen (los secretos siguen en 600).
+#     sin venv/, .git/ ni __pycache__/, con dueño nflbot y los permisos de origen; los secretos quedan en 600 sí o sí.
 #   · Nunca pisa un archivo que ya esté en /home/nflbot (se puede correr otra vez sin daño).
 #   · Verifica con md5 cada archivo copiado y muestra solo nombres y cantidades, nunca el contenido de un secreto.
 #   · /home/ubuntu queda intacto (vuelta atrás: ver registro_70_migracion.md).
@@ -18,6 +20,7 @@ declare -A BASE=([nfl_sim]=a9092699c466e045ce1c30591e182dc5865639da [nfl_ev]=edf
 
 ok()   { echo "OK   $*"; }
 alto() { echo "ALTO $*"; echo "No se copió nada más. Pégale esta salida a Claude."; exit 1; }
+como() { runuser -u "$USUARIO" -- "$@"; }      # lo que se hace DENTRO de /home/nflbot va como nflbot, no como root
 md5()  { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
 echo "== migrar_datos.sh · $(date '+%d-%m-%Y %H:%M') · de $VIEJO a $NUEVO"
@@ -33,11 +36,14 @@ done
 if [ -z "${NFL_PRUEBA:-}" ]; then
   for u in nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer nfl-sim-semana.service; do
     systemctl is-active --quiet "$u" && alto "la unidad vieja $u sigue activa: sudo systemctl disable --now nfl-sim-semana.timer nfl-sim-orden.service nfl-ev-bot.service"
+    case "$(systemctl is-enabled "$u" 2>/dev/null)" in
+      enabled|enabled-runtime|alias|linked|linked-runtime) alto "la unidad vieja $u sigue habilitada (volvería al reiniciar): sudo systemctl disable nfl-sim-semana.timer nfl-sim-orden.service nfl-ev-bot.service" ;;
+    esac
   done
-  ok "unidades viejas paradas ($(systemctl is-enabled nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer 2>/dev/null | tr '\n' ' '))"
+  ok "unidades viejas paradas y deshabilitadas ($(systemctl is-enabled nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer 2>/dev/null | tr '\n' ' '))"
   NU="$(id -u "$USUARIO")"
   if [ -S "/run/user/$NU/bus" ]; then
-    act="$(sudo -u "$USUARIO" env XDG_RUNTIME_DIR="/run/user/$NU" systemctl --user is-active nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer 2>/dev/null | grep -c '^active')"
+    act="$(como env XDG_RUNTIME_DIR="/run/user/$NU" systemctl --user is-active nfl-ev-bot.service nfl-sim-orden.service nfl-sim-semana.timer 2>/dev/null | grep -c '^active')"
     [ "$act" = 0 ] || alto "hay $act unidad(es) NUEVAS de $USUARIO activas: no copio encima de servicios corriendo."
   fi
   ok "unidades nuevas de $USUARIO paradas"
@@ -46,7 +52,7 @@ if [ -z "${NFL_PRUEBA:-}" ]; then
 fi
 
 # 2. el código de /home/ubuntu es exactamente el que subió a GitHub (commit BASE); si no, se perdería algo
-g() { local p="$1"; shift; git -c safe.directory="$NUEVO/$p" -C "$NUEVO/$p" "$@"; }
+g() { local p="$1"; shift; como git -C "$NUEVO/$p" "$@"; }
 declare -A CODIGO      # archivos versionados en BASE: no se copian (los trae Git) ni se comparan con el clon
 declare -A QUITADOS    # los que el commit de migración borró: tampoco vuelven
 for p in nfl_ev nfl_sim; do
@@ -80,7 +86,10 @@ ok "s2-v1 intacto ($S2)"
 enl="$(find "$VIEJO/nfl_ev" "$VIEJO/nfl_sim" \( -path '*/venv' -o -path '*/.git' \) -prune -o -type l -print | head -n 5)"
 [ -z "$enl" ] && ok "sin enlaces simbólicos en los datos" || echo "AVISO enlaces simbólicos (se copian tal cual; Claude revisa si apuntan a $VIEJO): $(echo "$enl" | sed "s#$VIEJO/##g" | tr '\n' ' ')"
 
-# 3. copia (sin código, sin venv ni .git; dueño nflbot; nunca pisa)
+# 3. copia (sin código, sin venv ni .git; dueño nflbot; nunca pisa). Antes: ningún enlace simbólico en el destino
+#    (rsync como root los seguiría y escribiría fuera de /home/nflbot)
+enl="$(find "$NUEVO/nfl_ev" "$NUEVO/nfl_sim" -path '*/venv' -prune -o -type l -print | head -n 3)"
+[ -z "$enl" ] || alto "hay enlaces simbólicos en $NUEVO: $enl"
 for p in nfl_ev nfl_sim; do
   ex=(--exclude=/venv --exclude=/.git --exclude=__pycache__/)
   for f in ${CODIGO[$p]}; do ex+=("--exclude=/$f"); done
@@ -107,16 +116,22 @@ for f in nfl_sim/salidas/semana/proyecciones_2026.csv nfl_sim/salidas/semana/est
   [ -f "$VIEJO/$f" ] && ok "md5 $(md5 "$NUEVO/$f" | cut -c1-12) = $(md5 "$VIEJO/$f" | cut -c1-12)  $f"
 done
 
-# 5. permisos de los secretos y dueño
+# 5. secretos: 600 y de nflbot sí o sí (config.ini, semana.ini y sus copias en respaldos/, credenciales/ en 700)
 sec=0
 while IFS= read -r -d '' f; do
-  r="${f#$VIEJO/}"
-  a="$(stat -c '%a' "$f")"; b="$(stat -c '%a %U' "$NUEVO/$r")"
-  [ "$b" = "$a $USUARIO" ] || alto "$r: permisos $b (origen $a)"
+  r="${f#$NUEVO/}"
+  [ -L "$f" ] && alto "$r es un enlace simbólico"
+  a="$(stat -c '%a %U' "$f")"
+  if [ "$a" != "600 $USUARIO" ]; then
+    como chmod 600 "$f" || alto "no pude dejar $r en 600"
+    echo "AVISO $r estaba en ${a%% *}: quedó en 600"
+  fi
   sec=$((sec + 1))
-done < <(find "$VIEJO/nfl_ev/config.ini" "$VIEJO/nfl_sim/semana.ini" "$VIEJO/nfl_sim/credenciales" -type f -print0 2>/dev/null)
-[ "$(stat -c '%a' "$NUEVO/nfl_sim/credenciales")" = 700 ] || chmod 700 "$NUEVO/nfl_sim/credenciales"
-ok "$sec secretos con los mismos permisos (600) y dueño $USUARIO · credenciales/ en 700"
+done < <(find "$NUEVO/nfl_ev/config.ini" "$NUEVO/nfl_sim/semana.ini" "$NUEVO/nfl_sim/credenciales" "$NUEVO/nfl_sim/respaldos" \
+         -type f \( -path '*/credenciales/*' -o -name '*.ini' -o -name '*.key' -o -name '*.token' -o -name 'google_sa*.json' \) -print0 2>/dev/null)
+[ "$(stat -c '%a' "$NUEVO/nfl_sim/credenciales")" = 700 ] || como chmod 700 "$NUEVO/nfl_sim/credenciales"
+[ "$sec" -ge 6 ] || alto "solo encontré $sec secretos (esperaba al menos config.ini, semana.ini y las 4 llaves)"
+ok "$sec secretos en 600 y de $USUARIO · credenciales/ en 700"
 otros="$(find "$NUEVO/nfl_ev" "$NUEVO/nfl_sim" -path '*/venv' -prune -o ! -user "$USUARIO" -print | head -n 3)"
 [ -z "$otros" ] && ok "todo es de $USUARIO" || alto "archivos que no son de $USUARIO: $otros"
 
@@ -125,7 +140,7 @@ for f in "$NUEVO/nfl_sim/semana.ini" "$NUEVO/nfl_ev/config.ini"; do
   [ -f "$f" ] || continue
   c="$(grep -c "$VIEJO/" "$f")"
   if [ "$c" -gt 0 ]; then
-    sed -i "s#$VIEJO/#$NUEVO/#g" "$f" && chown "$USUARIO:$USUARIO" "$f" && chmod 600 "$f"
+    como sed -i "s#$VIEJO/#$NUEVO/#g" "$f" && como chmod 600 "$f" || alto "no pude cambiar las rutas de ${f#$NUEVO/}"
     ok "${f#$NUEVO/}: $c ruta(s) a $VIEJO cambiadas a $NUEVO"
   else
     ok "${f#$NUEVO/}: sin rutas fijas a $VIEJO"

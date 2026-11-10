@@ -2,6 +2,9 @@
 # semana.py decide si toca algo (miércoles y sábado 10:15 Caracas, T−85 de cada grupo, cierre de resultados).
 # Decisión 70: usuario nflbot, sin sudo. Tope MemoryMax 1G sin swap (antes 1536M): medido en la réplica (10-nov)
 # sábado de 13 juegos 763 MiB, T−85 de 8 juegos 694 MiB y tablero 165 MiB; nunca tocó un tope duro de 1 GiB.
+# Por qué 1G y no más: 1G del motor + ≈ 0,21 G del bot y del bot de órdenes < 1,25 G del slice, así un motor desbocado
+# se corta solo sin arrastrar a los otros dos. Cada corrida real deja su pico en semana.log (pico_memoria.sh) para
+# revisarlo con datos de la EC2 (fase C).
 # Ver:  systemctl --user list-timers   ·   tail -n 30 ~/nfl_sim/salidas/semana/semana.log
 [Unit]
 Description=Motor nfl_sim s2-v1: corrida semanal en modo registro (31A) · usuario nflbot
@@ -10,6 +13,7 @@ Description=Motor nfl_sim s2-v1: corrida semanal en modo registro (31A) · usuar
 Type=oneshot
 WorkingDirectory=%h/nfl_sim
 ExecStart=%h/nfl_sim/venv/bin/python -u %h/nfl_sim/semana.py auto
+ExecStopPost=-/bin/bash %h/nfl_sim/pico_memoria.sh
 Nice=10
 CPUWeight=20
 MemoryMax=1G
